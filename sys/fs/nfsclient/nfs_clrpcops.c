@@ -2092,12 +2092,37 @@ nfsrpc_writerpc(vnode_t vp, struct uio *uiop, int *iomode,
 			*tl++ = x;      /* total to this offset */
 			*tl = x;        /* size of this write */
 		}
+
+		/*
+		 * For RDMA, add an mbuf here to indicate DDP.
+		 * Also set ND_EXTPG so that M_EXTPG mbufs are used
+		 * for the data.
+		 * Use M_PROTO10 to indicate this is the start of a DDP
+		 * read chunk.
+		 */
+		if (NFSHASRDMA(nmp)) {
+			struct mbuf *ddpm;
+
+			NFSMGET(ddpm);
+			ddpm->m_flags |= M_PROTO10;
+			ddpm->m_len = len;	/* No actual data. */
+			nd->nd_flag |= ND_EXTPG;
+			nd->nd_bextpgsiz = 0;
+			nd->nd_mb->m_next = ddpm;
+			nd->nd_mb = ddpm;
+		}
+
 		error = nfsm_uiombuf(nd, uiop, len);
 		if (error != 0) {
 			m_freem(nd->nd_mreq);
 			free(nd, M_TEMP);
 			return (error);
 		}
+
+		/* For RDMA, go back to regular mbuf(s). */
+		if (NFSHASRDMA(nmp))
+			nd->nd_flag &= ~ND_EXTPG;
+
 		/*
 		 * Although it is tempting to do a normal Getattr Op in the
 		 * NFSv4 compound, the result can be a nearly hung client
