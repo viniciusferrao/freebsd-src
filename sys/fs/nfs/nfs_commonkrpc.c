@@ -252,7 +252,7 @@ static bool nfscl_use_gss[NFSV42_NPROCS] = {
 int
 newnfs_connect(struct nfsmount *nmp, struct nfssockreq *nrp,
     struct ucred *cred, NFSPROC_T *p, int callback_retry_mult, bool dotls,
-    struct __rpc_client **clipp)
+    bool dordma, struct __rpc_client **clipp)
 {
 	int rcvreserve, sndreserve;
 	int pktscale, pktscalesav;
@@ -287,7 +287,26 @@ newnfs_connect(struct nfsmount *nmp, struct nfssockreq *nrp,
 		td->td_ucred = nrp->nr_cred;
 	else
 		td->td_ucred = cred;
+
 	saddr = nrp->nr_nam;
+	/* For RDMA, just set nconf manually. */
+	if (dordma) {
+		/* SOCK_DGRAM indicates RoCE. */
+		if (saddr->sa_family == AF_INET) {
+			if (nrp->nr_sotype == SOCK_DGRAM)
+				nconf = getnetconfigent("roce");
+			else
+				nconf = getnetconfigent("iwarp");
+		} else {
+			if (nrp->nr_sotype == SOCK_DGRAM)
+				nconf = getnetconfigent("roce6");
+			else
+				nconf = getnetconfigent("iwarp6");
+		}
+		client = clnt_reconnect_create(nconf, saddr, nrp->nr_prog,
+		    nrp->nr_vers, 0, 0);
+		goto gotclient;
+	}
 
 	if (saddr->sa_family == AF_INET)
 		if (nrp->nr_sotype == SOCK_DGRAM)
@@ -512,6 +531,7 @@ newnfs_connect(struct nfsmount *nmp, struct nfssockreq *nrp,
 	 * connections, as well as nr_client in the nfssockreq
 	 * structure for the mount.
 	 */
+gotclient:
 	mtx_lock(&nrp->nr_mtx);
 	if (*clipp != NULL) {
 		mtx_unlock(&nrp->nr_mtx);
@@ -526,7 +546,8 @@ newnfs_connect(struct nfsmount *nmp, struct nfssockreq *nrp,
 		 * left unconnected for servers that reply from a port other
 		 * than NFS_PORT.
 		 */
-		if (nmp == NULL || (nmp->nm_flag & NFSMNT_NOCONN) == 0) {
+		if (!dordma && (nmp == NULL ||
+		    (nmp->nm_flag & NFSMNT_NOCONN) == 0)) {
 			mtx_unlock(&nrp->nr_mtx);
 			CLNT_CONTROL(client, CLSET_CONNECT, &one);
 		} else
@@ -723,7 +744,8 @@ newnfs_request(struct nfsrv_descript *nd, struct nfsmount *nmp,
 	 * If not already connected call newnfs_connect now.
 	 */
 	if (nrp->nr_client == NULL)
-		newnfs_connect(nmp, nrp, cred, td, 0, false, &nrp->nr_client);
+		newnfs_connect(nmp, nrp, cred, td, 0, false, false,
+		    &nrp->nr_client);
 
 	/*
 	 * If the "nconnect" mount option was specified and this RPC is
@@ -744,7 +766,7 @@ newnfs_request(struct nfsrv_descript *nd, struct nfsmount *nmp,
 		nextconn %= nmp->nm_aconnect;
 		nextconn_set = true;
 		if (nmp->nm_aconn[nextconn] == NULL)
-			newnfs_connect(nmp, nrp, cred, td, 0, false,
+			newnfs_connect(nmp, nrp, cred, td, 0, false, false,
 			    &nmp->nm_aconn[nextconn]);
 	}
 
