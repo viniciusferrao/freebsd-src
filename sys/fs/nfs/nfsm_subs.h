@@ -61,8 +61,12 @@ nfsm_build(struct nfsrv_descript *nd, int siz)
 	struct mbuf *mb2;
 
 	if ((nd->nd_flag & ND_EXTPG) == 0 &&
-	    siz > M_TRAILINGSPACE(nd->nd_mb)) {
-		NFSMCLGET(mb2, M_NOWAIT);
+	    ((nd->nd_mb->m_flags & M_EXTPG) != 0 ||
+	     siz > M_TRAILINGSPACE(nd->nd_mb))) {
+		if ((nd->nd_md->m_flags & M_EXTPG) == 0)
+			NFSMCLGET(mb2, M_NOWAIT);
+		else
+			NFSMGET(mb2);
 		if (siz > MLEN)
 			panic("build > MLEN");
 		mb2->m_len = 0;
