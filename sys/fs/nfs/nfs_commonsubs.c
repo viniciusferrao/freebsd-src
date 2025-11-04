@@ -4200,7 +4200,7 @@ nfsrv_nfsuserdport(struct nfsuserd_args *nargs, NFSPROC_T *p)
 	rp->nr_vers = RPCNFSUSERD_VERS;
 	if (error == 0)
 		error = newnfs_connect(NULL, rp, NFSPROCCRED(p), p, 0, false,
-		    &rp->nr_client);
+		    false, &rp->nr_client);
 	if (error == 0) {
 		NFSLOCKNAMEID();
 		VNET(nfsrv_nfsuserd) = RUNNING;

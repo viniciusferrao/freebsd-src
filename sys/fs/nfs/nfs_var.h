@@ -803,7 +803,7 @@ int newnfs_request(struct nfsrv_descript *, struct nfsmount *,
     struct nfsclsession *);
 void nfs_resetslots(struct nfsclsession *);
 int newnfs_connect(struct nfsmount *, struct nfssockreq *,
-    struct ucred *, NFSPROC_T *, int, bool, struct __rpc_client **);
+    struct ucred *, NFSPROC_T *, int, bool, bool, struct __rpc_client **);
 void newnfs_disconnect(struct nfsmount *, struct nfssockreq *);
 int newnfs_sigintr(struct nfsmount *, NFSPROC_T *);
 

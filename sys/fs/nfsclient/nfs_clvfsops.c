@@ -758,8 +758,8 @@ nfs_decode_args(struct mount *mp, struct nfsmount *nmp, struct nfs_args *argp,
 		    nmp->nm_sotype = argp->sotype;
 		    nmp->nm_soproto = argp->proto;
 		    if (nmp->nm_sotype == SOCK_DGRAM)
-			while (newnfs_connect(nmp, &nmp->nm_sockreq,
-			    cred, td, 0, false, &nmp->nm_sockreq.nr_client)) {
+			while (newnfs_connect(nmp, &nmp->nm_sockreq, cred, td,
+			    0, false, false, &nmp->nm_sockreq.nr_client)) {
 				printf("newnfs_args: retrying connect\n");
 				(void) nfs_catnap(PSOCK, 0, "nfscon");
 			}
@@ -1686,7 +1686,7 @@ mountnfs(struct nfs_args *argp, struct mount *mp, struct sockaddr *nam,
 		nmp->nm_sockreq.nr_vers = NFS_VER2;
 
 	if ((error = newnfs_connect(nmp, &nmp->nm_sockreq, cred, td, 0, false,
-	    &nmp->nm_sockreq.nr_client)))
+	    false, &nmp->nm_sockreq.nr_client)))
 		goto bad;
 	/* For NFSv4, get the clientid now. */
 	if ((argp->flags & NFSMNT_NFSV4) != 0) {
