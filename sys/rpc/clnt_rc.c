@@ -134,7 +134,9 @@ clnt_reconnect_connect(CLIENT *cl)
 	struct ucred *oldcred;
 	CLIENT *newclient = NULL;
 	uint32_t reterr;
+	bool dordma;
 
+	dordma = false;
 	mtx_lock(&rc->rc_lock);
 	while (rc->rc_connecting) {
 		error = msleep(rc, &rc->rc_lock,
@@ -164,79 +166,96 @@ clnt_reconnect_connect(CLIENT *cl)
 
 	oldcred = td->td_ucred;
 	td->td_ucred = rc->rc_ucred;
-	so = __rpc_nconf2socket(rc->rc_nconf);
-	if (!so) {
-		stat = rpc_createerr.cf_stat = RPC_TLIERROR;
-		rpc_createerr.cf_error.re_errno = 0;
-		td->td_ucred = oldcred;
-		goto out;
-	}
 
-	if (rc->rc_privport)
-		bindresvport(so, NULL);
+	/* Handle RDMA. */
+	if (strcmp("roce" rc->rc_nconf->nc_netid) == 0 ||
+	    strcmp("roce6", rc->rc_nconf->nc_netid) == 0 ||
+	    strcmp("iwarp", rc->rc_nconf->nc_netid) == 0 ||
+	    strcmp("iwarp6", rc->rc_nconf->nc_netid) == 0)
+		dordma = true;
+	if (dordma) {
+		/* Set up the QP. */
+	} else {
+		so = __rpc_nconf2socket(rc->rc_nconf);
+		if (!so) {
+			stat = rpc_createerr.cf_stat = RPC_TLIERROR;
+			rpc_createerr.cf_error.re_errno = 0;
+			td->td_ucred = oldcred;
+			goto out;
+		}
 
-	if (rc->rc_nconf->nc_semantics == NC_TPI_CLTS)
-		newclient = clnt_dg_create(so,
-		    (struct sockaddr *) &rc->rc_addr, rc->rc_prog, rc->rc_vers,
-		    rc->rc_sendsz, rc->rc_recvsz);
-	else {
-		/*
-		 * I do not believe a timeout of less than 1sec would make
-		 * sense here since short delays can occur when a server is
-		 * temporarily overloaded.
-		 */
-		if (rc->rc_timeout.tv_sec > 0 && rc->rc_timeout.tv_usec >= 0) {
-			error = so_setsockopt(so, SOL_SOCKET, SO_SNDTIMEO,
-			    &rc->rc_timeout, sizeof(struct timeval));
-			if (error != 0) {
-				stat = rpc_createerr.cf_stat = RPC_CANTSEND;
-				rpc_createerr.cf_error.re_errno = error;
-				td->td_ucred = oldcred;
-				goto out;
+		if (rc->rc_privport)
+			bindresvport(so, NULL);
+
+		if (rc->rc_nconf->nc_semantics == NC_TPI_CLTS)
+			newclient = clnt_dg_create(so,
+			    (struct sockaddr *) &rc->rc_addr, rc->rc_prog,
+			    rc->rc_vers, rc->rc_sendsz, rc->rc_recvsz);
+		else {
+			/*
+			 * I do not believe a timeout of less than 1sec would
+			 * make sense here since short delays can occur when a
+			 * server is temporarily overloaded.
+			 */
+			if (rc->rc_timeout.tv_sec > 0 &&
+			    rc->rc_timeout.tv_usec >= 0) {
+				error = so_setsockopt(so, SOL_SOCKET,
+				    SO_SNDTIMEO, &rc->rc_timeout,
+				    sizeof(struct timeval));
+				if (error != 0) {
+					stat = rpc_createerr.cf_stat =
+					    RPC_CANTSEND;
+					rpc_createerr.cf_error.re_errno = error;
+					td->td_ucred = oldcred;
+					goto out;
+				}
+			}
+			newclient = clnt_vc_create(so,
+			    (struct sockaddr *) &rc->rc_addr, rc->rc_prog,
+			    rc->rc_vers, rc->rc_sendsz, rc->rc_recvsz,
+			    rc->rc_intr);
+			/*
+			 * CLSET_FD_CLOSE must be done now, in case
+			 * rpctls_connect() fails just below.
+			 */
+			if (newclient != NULL)
+				CLNT_CONTROL(newclient, CLSET_FD_CLOSE, 0);
+			if (rc->rc_tls && newclient != NULL) {
+				CURVNET_SET(so->so_vnet);
+				stat = rpctls_connect(newclient,
+				    rc->rc_tlscertname, so, &reterr);
+				CURVNET_RESTORE();
+				if (stat != RPC_SUCCESS ||
+				    reterr != RPCTLSERR_OK) {
+					if (stat == RPC_SUCCESS)
+						stat = RPC_FAILED;
+					stat = rpc_createerr.cf_stat = stat;
+					rpc_createerr.cf_error.re_errno = 0;
+					CLNT_CLOSE(newclient);
+					CLNT_RELEASE(newclient);
+					newclient = NULL;
+					td->td_ucred = oldcred;
+					goto out;
+				}
+				CLNT_CONTROL(newclient, CLSET_TLS,
+				    &(int){RPCTLS_COMPLETE});
+			}
+			if (newclient != NULL) {
+				int optval = 1;
+
+				(void)so_setsockopt(so, IPPROTO_TCP,
+				    TCP_USE_DDP, &optval, sizeof(optval));
 			}
 		}
-		newclient = clnt_vc_create(so,
-		    (struct sockaddr *) &rc->rc_addr, rc->rc_prog, rc->rc_vers,
-		    rc->rc_sendsz, rc->rc_recvsz, rc->rc_intr);
-		/*
-		 * CLSET_FD_CLOSE must be done now, in case rpctls_connect()
-		 * fails just below.
-		 */
-		if (newclient != NULL)
-			CLNT_CONTROL(newclient, CLSET_FD_CLOSE, 0);
-		if (rc->rc_tls && newclient != NULL) {
-			CURVNET_SET(so->so_vnet);
-			stat = rpctls_connect(newclient, rc->rc_tlscertname, so,
-			    &reterr);
-			CURVNET_RESTORE();
-			if (stat != RPC_SUCCESS || reterr != RPCTLSERR_OK) {
-				if (stat == RPC_SUCCESS)
-					stat = RPC_FAILED;
-				stat = rpc_createerr.cf_stat = stat;
-				rpc_createerr.cf_error.re_errno = 0;
-				CLNT_CLOSE(newclient);
-				CLNT_RELEASE(newclient);
-				newclient = NULL;
-				td->td_ucred = oldcred;
-				goto out;
-			}
-			CLNT_CONTROL(newclient, CLSET_TLS,
-			    &(int){RPCTLS_COMPLETE});
-		}
-		if (newclient != NULL) {
-			int optval = 1;
-
-			(void)so_setsockopt(so, IPPROTO_TCP, TCP_USE_DDP,
-			    &optval, sizeof(optval));
-		}
-		if (newclient != NULL && rc->rc_reconcall != NULL)
-			(*rc->rc_reconcall)(newclient, rc->rc_reconarg,
-			    rc->rc_ucred);
 	}
+	if (newclient != NULL && rc->rc_reconcall != NULL)
+		(*rc->rc_reconcall)(newclient, rc->rc_reconarg,
+		    rc->rc_ucred);
 	td->td_ucred = oldcred;
 
 	if (!newclient) {
-		soclose(so);
+		if (!dordma)
+			soclose(so);
 		rc->rc_err = rpc_createerr.cf_error;
 		stat = rpc_createerr.cf_stat;
 		goto out;
@@ -247,7 +266,7 @@ clnt_reconnect_connect(CLIENT *cl)
 	CLNT_CONTROL(newclient, CLSET_RETRY_TIMEOUT, &rc->rc_retry);
 	CLNT_CONTROL(newclient, CLSET_WAITCHAN, rc->rc_waitchan);
 	CLNT_CONTROL(newclient, CLSET_INTERRUPTIBLE, &rc->rc_intr);
-	if (rc->rc_backchannel != NULL)
+	if (!dordma && rc->rc_backchannel != NULL)
 		CLNT_CONTROL(newclient, CLSET_BACKCHANNEL, rc->rc_backchannel);
 	stat = RPC_SUCCESS;
 
