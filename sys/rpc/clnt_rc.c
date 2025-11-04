@@ -168,7 +168,7 @@ clnt_reconnect_connect(CLIENT *cl)
 	td->td_ucred = rc->rc_ucred;
 
 	/* Handle RDMA. */
-	if (strcmp("roce" rc->rc_nconf->nc_netid) == 0 ||
+	if (strcmp("roce", rc->rc_nconf->nc_netid) == 0 ||
 	    strcmp("roce6", rc->rc_nconf->nc_netid) == 0 ||
 	    strcmp("iwarp", rc->rc_nconf->nc_netid) == 0 ||
 	    strcmp("iwarp6", rc->rc_nconf->nc_netid) == 0)
