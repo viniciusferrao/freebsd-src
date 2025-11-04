@@ -55,6 +55,20 @@ static struct netconfig netconfigs[] = {
 		.nc_protofmly =	"inet6",
 		.nc_proto =	"tcp",
 	},
+	{
+		.nc_netid =	"roce6",
+		.nc_semantics =	NC_TPI_COTS_ORD,
+		.nc_flag =	NC_VISIBLE,
+		.nc_protofmly =	"inet6",
+		.nc_proto =	"udp",
+	},
+	{
+		.nc_netid =	"iwarp6",
+		.nc_semantics =	NC_TPI_COTS_ORD,
+		.nc_flag =	NC_VISIBLE,
+		.nc_protofmly =	"inet6",
+		.nc_proto =	"tcp",
+	},
 #endif	
 	{
 		.nc_netid =	"udp",
@@ -76,6 +90,20 @@ static struct netconfig netconfigs[] = {
 		.nc_flag =	0,
 		.nc_protofmly =	"loopback",
 		.nc_proto =	"",
+	},
+	{
+		.nc_netid =	"roce",
+		.nc_semantics =	NC_TPI_COTS_ORD,
+		.nc_flag =	NC_VISIBLE,
+		.nc_protofmly =	"inet",
+		.nc_proto =	"udp",
+	},
+	{
+		.nc_netid =	"iwarp",
+		.nc_semantics =	NC_TPI_COTS_ORD,
+		.nc_flag =	NC_VISIBLE,
+		.nc_protofmly =	"inet",
+		.nc_proto =	"tcp",
 	},
 	{
 		.nc_netid =	NULL,
