@@ -252,14 +252,14 @@ static bool nfscl_use_gss[NFSV42_NPROCS] = {
 int
 newnfs_connect(struct nfsmount *nmp, struct nfssockreq *nrp,
     struct ucred *cred, NFSPROC_T *p, int callback_retry_mult, bool dotls,
-    bool dordma, struct __rpc_client **clipp)
+    char *dordma, struct __rpc_client **clipp)
 {
 	int rcvreserve, sndreserve;
 	int pktscale, pktscalesav;
 	struct sockaddr *saddr;
 	struct ucred *origcred;
 	CLIENT *client;
-	struct netconfig *nconf;
+	struct netconfig *nconf, nc;
 	struct socket *so;
 	int one = 1, retries, error = 0;
 	struct thread *td = curthread;
@@ -290,20 +290,25 @@ newnfs_connect(struct nfsmount *nmp, struct nfssockreq *nrp,
 
 	saddr = nrp->nr_nam;
 	/* For RDMA, just set nconf manually. */
-	if (dordma) {
+	if (dordma != NULL) {
+		nc.nc_netid = dordma;
+		nc.nc_semantics = NC_TPI_COTS_ORD;
+		nc.nc_flag = NC_VISIBLE;
 		/* SOCK_DGRAM indicates RoCE. */
 		if (saddr->sa_family == AF_INET) {
+			nc.nc_protofmly = "inet";
 			if (nrp->nr_sotype == SOCK_DGRAM)
-				nconf = getnetconfigent("roce");
+				nc.nc_proto = "udp";
 			else
-				nconf = getnetconfigent("iwarp");
+				nc.nc_proto = "tcp";
 		} else {
+			nc.nc_protofmly = "inet6";
 			if (nrp->nr_sotype == SOCK_DGRAM)
-				nconf = getnetconfigent("roce6");
+				nc.nc_proto = "udp";
 			else
-				nconf = getnetconfigent("iwarp6");
+				nc.nc_proto = "tcp";
 		}
-		client = clnt_reconnect_create(nconf, saddr, nrp->nr_prog,
+		client = clnt_reconnect_create(&nc, saddr, nrp->nr_prog,
 		    nrp->nr_vers, 0, 0);
 		goto gotclient;
 	}
@@ -546,7 +551,7 @@ gotclient:
 		 * left unconnected for servers that reply from a port other
 		 * than NFS_PORT.
 		 */
-		if (!dordma && (nmp == NULL ||
+		if (dordma == NULL && (nmp == NULL ||
 		    (nmp->nm_flag & NFSMNT_NOCONN) == 0)) {
 			mtx_unlock(&nrp->nr_mtx);
 			CLNT_CONTROL(client, CLSET_CONNECT, &one);
@@ -744,7 +749,7 @@ newnfs_request(struct nfsrv_descript *nd, struct nfsmount *nmp,
 	 * If not already connected call newnfs_connect now.
 	 */
 	if (nrp->nr_client == NULL)
-		newnfs_connect(nmp, nrp, cred, td, 0, false, false,
+		newnfs_connect(nmp, nrp, cred, td, 0, false, NULL,
 		    &nrp->nr_client);
 
 	/*
@@ -766,7 +771,7 @@ newnfs_request(struct nfsrv_descript *nd, struct nfsmount *nmp,
 		nextconn %= nmp->nm_aconnect;
 		nextconn_set = true;
 		if (nmp->nm_aconn[nextconn] == NULL)
-			newnfs_connect(nmp, nrp, cred, td, 0, false, false,
+			newnfs_connect(nmp, nrp, cred, td, 0, false, NULL,
 			    &nmp->nm_aconn[nextconn]);
 	}
 

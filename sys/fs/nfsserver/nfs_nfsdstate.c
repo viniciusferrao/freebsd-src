@@ -4408,10 +4408,10 @@ nfsrv_docallback(struct nfsclient *clp, int procnum, nfsv4stateid_t *stateidp,
 			nfsrv_freesession(NULL, sep, NULL, false, NULL);
 		} else if (nd->nd_procnum == NFSV4PROC_CBNULL)
 			error = newnfs_connect(NULL, &clp->lc_req, cred,
-			    NULL, 1, dotls, false, &clp->lc_req.nr_client);
+			    NULL, 1, dotls, NULL, &clp->lc_req.nr_client);
 		else
 			error = newnfs_connect(NULL, &clp->lc_req, cred,
-			    NULL, 3, dotls, false, &clp->lc_req.nr_client);
+			    NULL, 3, dotls, NULL, &clp->lc_req.nr_client);
 	}
 	newnfs_sndunlock(&clp->lc_req.nr_lock);
 	NFSD_DEBUG(4, "aft sndunlock=%d\n", error);
