@@ -4832,6 +4832,8 @@ ofed/drivers/infiniband/core/ib_uverbs_uapi.c		optional ofed	\
 	compile-with "${OFED_C}"
 ofed/drivers/infiniband/core/ib_verbs.c			optional ofed	\
 	compile-with "${OFED_C}"
+ofed/drivers/infiniband/core/xprt_verbs.c		optional ofed	\
+	compile-with "${OFED_C}"
 
 ofed/drivers/infiniband/ulp/ipoib/ipoib_cm.c	optional ipoib		\
 	compile-with "${OFED_C} -I$S/ofed/drivers/infiniband/ulp/ipoib/"
