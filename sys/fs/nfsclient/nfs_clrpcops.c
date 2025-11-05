@@ -6439,7 +6439,7 @@ nfsrpc_fillsa(struct nfsmount *nmp, struct sockaddr_in *sin,
 	 * unmount, but I did it anyhow.
 	 */
 	nrp->nr_cred = crhold(nmp->nm_sockreq.nr_cred);
-	error = newnfs_connect(nmp, nrp, NULL, p, 0, false, false,
+	error = newnfs_connect(nmp, nrp, NULL, p, 0, false, NULL,
 	    &nrp->nr_client);
 	NFSCL_DEBUG(3, "DS connect=%d\n", error);
 
