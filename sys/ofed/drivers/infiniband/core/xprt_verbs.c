@@ -60,23 +60,106 @@
 #include <rdma/rdma_cm.h>
 #include <rdma/xprt_rdma.h>
 
-struct rdma_cm_id *
-xprt_create_id(struct vnet *net, struct sockaddr *saddr,
-    rdma_cm_event_handler event_handler, void *context, enum rdma_port_space ps,
-    enum ib_qp_type qptype)
+/**
+ * xprt_cm_event_handler - Handle RDMA CM events
+ * @id: rdma_cm_id on which an event has occurred
+ * @event: details of the event
+ *
+ * Called with @id's mutex held. Returns 1 if caller should
+ * destroy @id, otherwise 0.
+ */
+static int
+xprt_cm_event_handler(struct rdma_cm_id *id, struct rdma_cm_event *event)
 {
+	struct xprt_rdma_ep *ep = id->context;
+
+	might_sleep();
+
+	switch (event->event) {
+	case RDMA_CM_EVENT_ADDR_RESOLVED:
+	case RDMA_CM_EVENT_ROUTE_RESOLVED:
+		ep->re_async_rc = 0;
+		complete(&ep->re_done);
+		return 0;
+	case RDMA_CM_EVENT_ADDR_ERROR:
+		ep->re_async_rc = -EPROTO;
+		complete(&ep->re_done);
+		return 0;
+	case RDMA_CM_EVENT_ROUTE_ERROR:
+		ep->re_async_rc = -ENETUNREACH;
+		complete(&ep->re_done);
+		return 0;
+#ifdef notyet
+	case RDMA_CM_EVENT_ADDR_CHANGE:
+		ep->re_connect_status = -ENODEV;
+		goto disconnected;
+	case RDMA_CM_EVENT_ESTABLISHED:
+		rpcrdma_ep_get(ep);
+		ep->re_connect_status = 1;
+		rpcrdma_update_cm_private(ep, &event->param.conn);
+		trace_xprtrdma_inline_thresh(ep);
+		wake_up_all(&ep->re_connect_wait);
+		break;
+	case RDMA_CM_EVENT_CONNECT_ERROR:
+		ep->re_connect_status = -ENOTCONN;
+		goto wake_connect_worker;
+	case RDMA_CM_EVENT_UNREACHABLE:
+		ep->re_connect_status = -ENETUNREACH;
+		goto wake_connect_worker;
+	case RDMA_CM_EVENT_REJECTED:
+		ep->re_connect_status = -ECONNREFUSED;
+		if (event->status == IB_CM_REJ_STALE_CONN)
+			ep->re_connect_status = -ENOTCONN;
+wake_connect_worker:
+		wake_up_all(&ep->re_connect_wait);
+		return 0;
+	case RDMA_CM_EVENT_DISCONNECTED:
+		ep->re_connect_status = -ECONNABORTED;
+disconnected:
+		rpcrdma_force_disconnect(ep);
+		return rpcrdma_ep_put(ep);
+#endif
+	default:
+		break;
+	}
+
+	return 0;
+}
+
+static struct rdma_cm_id *
+_xprt_create_id(struct vnet *net, struct sockaddr *saddr,
+    struct xprt_rdma_ep *ep, rdma_cm_event_handler event_handler, void *context,
+    enum rdma_port_space ps, enum ib_qp_type qptype)
+{
+	unsigned long wtimeout = msecs_to_jiffies(RDMA_RESOLVE_TIMEOUT) + 1;
 	struct rdma_cm_id *id;
 	int rc;
+
+	init_completion(&ep->re_done);
 
 	id = rdma_create_id(net, event_handler, context, ps, qptype);
 	if (IS_ERR(id))
 		return (id);
 
+	ep->re_async_rc = -ETIMEDOUT;
 	rc = rdma_resolve_addr(id, NULL, saddr, RDMA_RESOLVE_TIMEOUT);
 	if (rc)
 		goto out;
+	rc = wait_for_completion_interruptible_timeout(&ep->re_done, wtimeout);
+	if (rc < 0)
+		goto out;
+	rc = ep->re_async_rc;
+	if (rc)
+		goto out;
 
+	ep->re_async_rc = -ETIMEDOUT;
 	rc = rdma_resolve_route(id, RDMA_RESOLVE_TIMEOUT);
+	if (rc)
+		goto out;
+	rc = wait_for_completion_interruptible_timeout(&ep->re_done, wtimeout);
+	if (rc < 0)
+		goto out;
+	rc = ep->re_async_rc;
 	if (rc)
 		goto out;
 
@@ -91,5 +174,19 @@ xprt_create_id(struct vnet *net, struct sockaddr *saddr,
 out:
 	rdma_destroy_id(id);
 	return (ERR_PTR(rc));
+}
+
+int
+xprt_create_id(struct vnet *net, struct sockaddr *saddr,
+    struct xprt_rdma_ep *ep)
+{
+	struct rdma_cm_id *id;
+
+	id = _xprt_create_id(net, saddr, ep, xprt_cm_event_handler, ep,
+	    RDMA_PS_TCP, IB_QPT_RC);
+	if (IS_ERR(id))
+		return (PTR_ERR(id));
+	ep->re_id = id;
+	return (0);
 }
 

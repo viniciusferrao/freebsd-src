@@ -55,8 +55,14 @@
 #define RPCRDMA_MAX_REEST_TO	(30U * HZ)
 #define RPCRDMA_IDLE_DISC_TO	(5U * 60 * HZ)
 
-struct rdma_cm_id *xprt_create_id(struct vnet *net, struct sockaddr *saddr,
-    rdma_cm_event_handler event_handler, void *context, enum rdma_port_space ps,
-    enum ib_qp_type qptype);
+/* Structure for a connection endpoint. */
+struct xprt_rdma_ep {
+	struct completion	re_done;
+	int			re_async_rc;
+	struct rdma_cm_id	*re_id;
+};
+
+int xprt_create_id(struct vnet *net, struct sockaddr *saddr,
+    struct xprt_rdma_ep *ep);
 
 #endif	/* _RDMA_XPRT_RDMA_H */
