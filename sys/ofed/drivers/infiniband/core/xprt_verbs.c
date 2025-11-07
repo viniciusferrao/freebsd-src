@@ -190,3 +190,9 @@ xprt_create_id(struct vnet *net, struct sockaddr *saddr,
 	return (0);
 }
 
+int
+xprt_rdma_send(struct xprt_rdma_ep *ep, struct mbuf *mreq)
+{
+
+	return (0);
+}
