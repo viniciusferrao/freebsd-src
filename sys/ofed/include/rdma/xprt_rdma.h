@@ -64,5 +64,6 @@ struct xprt_rdma_ep {
 
 int xprt_create_id(struct vnet *net, struct sockaddr *saddr,
     struct xprt_rdma_ep *ep);
+int xprt_rdma_send(struct xprt_rdma_ep *ep, struct mbuf *mreq);
 
 #endif	/* _RDMA_XPRT_RDMA_H */
