@@ -60,6 +60,38 @@
 #include <rdma/rdma_cm.h>
 #include <rdma/xprt_rdma.h>
 
+static void rpcrdma_ep_destroy(struct kref *kref)
+{
+	struct rpcrdma_ep *ep = container_of(kref, struct rpcrdma_ep, re_kref);
+
+	if (ep->re_id->qp) {
+		rdma_destroy_qp(ep->re_id);
+		ep->re_id->qp = NULL;
+	}
+
+	if (ep->re_attr.recv_cq)
+		ib_free_cq(ep->re_attr.recv_cq);
+	ep->re_attr.recv_cq = NULL;
+	if (ep->re_attr.send_cq)
+		ib_free_cq(ep->re_attr.send_cq);
+	ep->re_attr.send_cq = NULL;
+
+	if (ep->re_pd)
+		ib_dealloc_pd(ep->re_pd);
+	ep->re_pd = NULL;
+
+#ifdef notyet
+	rpcrdma_rn_unregister(ep->re_id->device, &ep->re_rn);
+#endif
+
+	kfree(ep);
+}
+
+static noinline int rpcrdma_ep_put(struct rpcrdma_ep *ep)
+{
+	return kref_put(&ep->re_kref, rpcrdma_ep_destroy);
+}
+
 static int
 rpcrdma_cm_event_handler(struct rdma_cm_id *id, struct rdma_cm_event *event)
 {
@@ -262,9 +294,7 @@ rpcrdma_ep_create(struct vnet *net, struct sockaddr *saddr, int max_reqs,
 	return 0;
 
 out_destroy:
-#ifdef notyet
 	rpcrdma_ep_put(ep);
-#endif
 	rdma_destroy_id(id);
 	return rc;
 }
