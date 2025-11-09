@@ -56,14 +56,28 @@
 #define RPCRDMA_IDLE_DISC_TO	(5U * 60 * HZ)
 
 /* Structure for a connection endpoint. */
-struct xprt_rdma_ep {
+struct rpcrdma_ep {
 	struct completion	re_done;
 	int			re_async_rc;
 	struct rdma_cm_id	*re_id;
+	struct ib_pd		*re_pd;
+	struct ib_qp_init_attr	re_attr;
+	struct kref		re_kref;
+	unsigned int		re_send_count;
+	int			re_receive_count;
+	int			re_connect_status;
+	struct rdma_conn_param	re_remote_cma;
+	unsigned int		re_max_requests; /* depends on device */
+	wait_queue_head_t       re_connect_wait;
+};
+
+/* Structure for a connection. */
+struct rpcrdma_xprt {
+	struct rpcrdma_ep	*rx_ep;
 };
 
 int xprt_create_id(struct vnet *net, struct sockaddr *saddr,
-    struct xprt_rdma_ep *ep);
-int xprt_rdma_send(struct xprt_rdma_ep *ep, struct mbuf *mreq);
+    struct rpcrdma_ep *ep);
+int xprt_rdma_send(struct rpcrdma_ep *ep, struct mbuf *mreq);
 
 #endif	/* _RDMA_XPRT_RDMA_H */

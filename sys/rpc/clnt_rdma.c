@@ -124,7 +124,7 @@ static void clnt_rdma_upcallsdone(struct ct_data *);
  */
 CLIENT *
 clnt_rdma_create(
-	struct xprt_rdma_ep *ep,	/* RDMA endpoint */
+	struct rpcrdma_ep *ep,	/* RDMA endpoint */
 	struct sockaddr *raddr,		/* servers address */
 	const rpcprog_t prog,		/* program number */
 	const rpcvers_t vers,		/* version number */

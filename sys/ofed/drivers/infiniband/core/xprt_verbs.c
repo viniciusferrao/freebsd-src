@@ -60,18 +60,10 @@
 #include <rdma/rdma_cm.h>
 #include <rdma/xprt_rdma.h>
 
-/**
- * xprt_cm_event_handler - Handle RDMA CM events
- * @id: rdma_cm_id on which an event has occurred
- * @event: details of the event
- *
- * Called with @id's mutex held. Returns 1 if caller should
- * destroy @id, otherwise 0.
- */
 static int
-xprt_cm_event_handler(struct rdma_cm_id *id, struct rdma_cm_event *event)
+rpcrdma_cm_event_handler(struct rdma_cm_id *id, struct rdma_cm_event *event)
 {
-	struct xprt_rdma_ep *ep = id->context;
+	struct rpcrdma_ep *ep = id->context;
 
 	might_sleep();
 
@@ -127,9 +119,8 @@ disconnected:
 }
 
 static struct rdma_cm_id *
-_xprt_create_id(struct vnet *net, struct sockaddr *saddr,
-    struct xprt_rdma_ep *ep, rdma_cm_event_handler event_handler, void *context,
-    enum rdma_port_space ps, enum ib_qp_type qptype)
+rpcrdma_create_id(struct vnet *net, struct sockaddr *saddr,
+    struct rpcrdma_ep *ep)
 {
 	unsigned long wtimeout = msecs_to_jiffies(RDMA_RESOLVE_TIMEOUT) + 1;
 	struct rdma_cm_id *id;
@@ -137,9 +128,10 @@ _xprt_create_id(struct vnet *net, struct sockaddr *saddr,
 
 	init_completion(&ep->re_done);
 
-	id = rdma_create_id(net, event_handler, context, ps, qptype);
+	id = rdma_create_id(net, rpcrdma_cm_event_handler, ep,
+	    RDMA_PS_TCP, IB_QPT_RC);
 	if (IS_ERR(id))
-		return (id);
+		return id;
 
 	ep->re_async_rc = -ETIMEDOUT;
 	rc = rdma_resolve_addr(id, NULL, saddr, RDMA_RESOLVE_TIMEOUT);
@@ -148,6 +140,7 @@ _xprt_create_id(struct vnet *net, struct sockaddr *saddr,
 	rc = wait_for_completion_interruptible_timeout(&ep->re_done, wtimeout);
 	if (rc < 0)
 		goto out;
+
 	rc = ep->re_async_rc;
 	if (rc)
 		goto out;
@@ -169,29 +162,115 @@ _xprt_create_id(struct vnet *net, struct sockaddr *saddr,
 		goto out;
 #endif
 
-	return (id);
+	return id;
 
 out:
 	rdma_destroy_id(id);
-	return (ERR_PTR(rc));
+	return ERR_PTR(rc);
 }
 
-int
-xprt_create_id(struct vnet *net, struct sockaddr *saddr,
-    struct xprt_rdma_ep *ep)
+static int
+rpcrdma_ep_create(struct vnet *net, struct sockaddr *saddr, int max_reqs,
+    struct rpcrdma_xprt *r_xprt)
 {
+	struct ib_device *device;
 	struct rdma_cm_id *id;
+	struct rpcrdma_ep *ep;
+	int rc;
 
-	id = _xprt_create_id(net, saddr, ep, xprt_cm_event_handler, ep,
-	    RDMA_PS_TCP, IB_QPT_RC);
-	if (IS_ERR(id))
-		return (PTR_ERR(id));
+	ep = kzalloc(sizeof(*ep), GFP_KERNEL);
+	if (!ep)
+		return -ENOTCONN;
+	kref_init(&ep->re_kref);
+
+	id = rpcrdma_create_id(net, saddr, ep);
+	if (IS_ERR(id)) {
+		kfree(ep);
+		return PTR_ERR(id);
+	}
+	device = id->device;
 	ep->re_id = id;
-	return (0);
+	reinit_completion(&ep->re_done);
+
+	ep->re_max_requests = max_reqs;
+#ifdef notyet
+	rc = frwr_query_device(ep, device);
+	if (rc)
+		goto out_destroy;
+#endif
+
+	ep->re_attr.srq = NULL;
+	ep->re_attr.cap.max_inline_data = 0;
+	ep->re_attr.sq_sig_type = IB_SIGNAL_REQ_WR;
+	ep->re_attr.qp_type = IB_QPT_RC;
+	ep->re_attr.port_num = ~0;
+
+	init_waitqueue_head(&ep->re_connect_wait);
+
+#ifdef notyet
+	ep->re_attr.send_cq = ib_alloc_cq_any(device, r_xprt,
+	      ep->re_attr.cap.max_send_wr, IB_POLL_WORKQUEUE);
+	if (IS_ERR(ep->re_attr.send_cq)) {
+		rc = PTR_ERR(ep->re_attr.send_cq);
+		ep->re_attr.send_cq = NULL;
+		goto out_destroy;
+	}
+
+	ep->re_attr.recv_cq = ib_alloc_cq_any(device, r_xprt,
+	      ep->re_attr.cap.max_recv_wr, IB_POLL_WORKQUEUE);
+	if (IS_ERR(ep->re_attr.recv_cq)) {
+		rc = PTR_ERR(ep->re_attr.recv_cq);
+		ep->re_attr.recv_cq = NULL;
+		goto out_destroy;
+	}
+#endif
+	ep->re_receive_count = 0;
+
+	/* Initialize cma parameters */
+	memset(&ep->re_remote_cma, 0, sizeof(ep->re_remote_cma));
+
+	/* Client offers RDMA Read but does not initiate */
+	ep->re_remote_cma.initiator_depth = 0;
+	ep->re_remote_cma.responder_resources =
+	    min_t(int, U8_MAX, device->attrs.max_qp_rd_atom);
+
+	/* Limit transport retries so client can detect server
+	 * GID changes quickly. RPC layer handles re-establishing
+	 * transport connection and retransmission.
+	 */
+	ep->re_remote_cma.retry_count = 6;
+
+	/* RPC-over-RDMA handles its own flow control. In addition,
+	 * make all RNR NAKs visible so we know that RPC-over-RDMA
+	 * flow control is working correctly (no NAKs should be seen).
+	 */
+	ep->re_remote_cma.flow_control = 0;
+	ep->re_remote_cma.rnr_retry_count = 0;
+
+	ep->re_pd = ib_alloc_pd(device, 0);
+	if (IS_ERR(ep->re_pd)) {
+		rc = PTR_ERR(ep->re_pd);
+		ep->re_pd = NULL;
+		goto out_destroy;
+	}
+
+	rc = rdma_create_qp(id, ep->re_pd, &ep->re_attr);
+	if (rc)
+		goto out_destroy;
+
+	r_xprt->rx_ep = ep;
+	return 0;
+
+out_destroy:
+#ifdef notyet
+	rpcrdma_ep_put(ep);
+#endif
+	rdma_destroy_id(id);
+	return rc;
 }
 
 int
-xprt_rdma_send(struct xprt_rdma_ep *ep, struct mbuf *mreq)
+xprt_rdma_send(struct rpcrdma_ep *ep, struct mbuf *mreq)
 {
 
 	return (0);
