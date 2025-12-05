@@ -60,38 +60,6 @@
 #include <rdma/rdma_cm.h>
 #include <rdma/xprt_rdma.h>
 
-static void rpcrdma_ep_destroy(struct kref *kref)
-{
-	struct rpcrdma_ep *ep = container_of(kref, struct rpcrdma_ep, re_kref);
-
-	if (ep->re_id->qp) {
-		rdma_destroy_qp(ep->re_id);
-		ep->re_id->qp = NULL;
-	}
-
-	if (ep->re_attr.recv_cq)
-		ib_free_cq(ep->re_attr.recv_cq);
-	ep->re_attr.recv_cq = NULL;
-	if (ep->re_attr.send_cq)
-		ib_free_cq(ep->re_attr.send_cq);
-	ep->re_attr.send_cq = NULL;
-
-	if (ep->re_pd)
-		ib_dealloc_pd(ep->re_pd);
-	ep->re_pd = NULL;
-
-#ifdef notyet
-	rpcrdma_rn_unregister(ep->re_id->device, &ep->re_rn);
-#endif
-
-	kfree(ep);
-}
-
-static noinline int rpcrdma_ep_put(struct rpcrdma_ep *ep)
-{
-	return kref_put(&ep->re_kref, rpcrdma_ep_destroy);
-}
-
 static int
 rpcrdma_cm_event_handler(struct rdma_cm_id *id, struct rdma_cm_event *event)
 {
@@ -203,23 +171,15 @@ out:
 
 static int
 rpcrdma_ep_create(struct vnet *net, struct sockaddr *saddr, int max_reqs,
-    struct rpcrdma_xprt *r_xprt)
+    struct rpcrdma_ep *ep)
 {
 	struct ib_device *device;
 	struct rdma_cm_id *id;
-	struct rpcrdma_ep *ep;
 	int rc;
 
-	ep = kzalloc(sizeof(*ep), GFP_KERNEL);
-	if (!ep)
-		return -ENOTCONN;
-	kref_init(&ep->re_kref);
-
 	id = rpcrdma_create_id(net, saddr, ep);
-	if (IS_ERR(id)) {
-		kfree(ep);
+	if (IS_ERR(id))
 		return PTR_ERR(id);
-	}
 	device = id->device;
 	ep->re_id = id;
 	reinit_completion(&ep->re_done);
@@ -290,13 +250,36 @@ rpcrdma_ep_create(struct vnet *net, struct sockaddr *saddr, int max_reqs,
 	if (rc)
 		goto out_destroy;
 
-	r_xprt->rx_ep = ep;
 	return 0;
 
 out_destroy:
-	rpcrdma_ep_put(ep);
 	rdma_destroy_id(id);
 	return rc;
+}
+
+int
+xprt_rdma_connect(struct vnet *net, struct sockaddr *saddr,
+    struct rpcrdma_xprt *rdmaxprt, int max_reqs,
+    struct rdma_conn_param *conn_param)
+{
+	unsigned long wtimeout = msecs_to_jiffies(RDMA_RESOLVE_TIMEOUT) + 1;
+	struct rpcrdma_ep *ep;
+	int rc;
+
+	ep = &rdmaxprt->rx_ep;
+	memset(ep, 0, sizeof(*ep));
+	rc = rpcrdma_ep_create(net, saddr, max_reqs, ep);
+	if (rc)
+		goto out;
+
+	rc = rdma_connect(ep->re_id, conn_param);
+	if (rc)
+		goto out;
+	rc = wait_for_completion_interruptible_timeout(&ep->re_done, wtimeout);
+out:
+	if (rc != 0)
+		rc = ECONNREFUSED;
+	return (rc);
 }
 
 int

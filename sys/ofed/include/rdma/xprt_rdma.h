@@ -62,7 +62,6 @@ struct rpcrdma_ep {
 	struct rdma_cm_id	*re_id;
 	struct ib_pd		*re_pd;
 	struct ib_qp_init_attr	re_attr;
-	struct kref		re_kref;
 	unsigned int		re_send_count;
 	int			re_receive_count;
 	int			re_connect_status;
@@ -73,11 +72,12 @@ struct rpcrdma_ep {
 
 /* Structure for a connection. */
 struct rpcrdma_xprt {
-	struct rpcrdma_ep	*rx_ep;
+	struct rpcrdma_ep	rx_ep;
 };
 
-int xprt_create_id(struct vnet *net, struct sockaddr *saddr,
-    struct rpcrdma_ep *ep);
+int xprt_rdma_connect(struct vnet *net, struct sockaddr *saddr,
+    struct rpcrdma_xprt *rdmaxprt, int max_reqs,
+    struct rdma_conn_param *conn_param);
 int xprt_rdma_send(struct rpcrdma_ep *ep, struct mbuf *mreq);
 
 #endif	/* _RDMA_XPRT_RDMA_H */
