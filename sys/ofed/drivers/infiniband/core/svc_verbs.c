@@ -73,6 +73,7 @@
 
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/endian.h>		/* be32dec: endian- and alignment-safe word decode */
 #include <sys/kernel.h>		/* SYSUNINIT, bootverbose */
 #include <sys/lock.h>
 #include <sys/malloc.h>		/* malloc/free, MALLOC_DEFINE */
@@ -128,6 +129,47 @@ MALLOC_DEFINE(M_NFSRDMA, "nfsrdma", "NFS over RDMA server");
  */
 #define	SVC_RDMA_INLINE		4096
 #define	SVC_RDMA_RECV_DEPTH	8
+
+/*
+ * RFC 8166 (RPC-over-RDMA version 1) transport-header constants.
+ *
+ * The header that prefixes an inline RPC message is a sequence of big-endian
+ * 32-bit XDR words:
+ *   word0 rdma_xid, word1 rdma_vers(==1), word2 rdma_credit, word3 rdma_proc,
+ *   then for RDMA_MSG/RDMA_NOMSG three chunk lists: word4 read_list,
+ *   word5 write_list, word6 reply_chunk (each a present-flag here; 0 == empty).
+ * For an inline RDMA_MSG with all three chunk lists empty the ONC RPC call
+ * message starts at word7, i.e. byte offset RPCRDMA_HDR_MIN (28).
+ *
+ * RPCRDMA_HDR_MIN is the smallest header we will parse: 7 words = 28 bytes.
+ * Words 4..6 are the three chunk-list optional-data/array discriminators; a
+ * length of at least RPCRDMA_HDR_MIN therefore guarantees all of words 0..6 are
+ * present, which is what lets svc_rdma_parse_header() read them after the single
+ * len >= RPCRDMA_HDR_MIN gate.
+ */
+#define	RPCRDMA_VERSION		1
+#define	RPCRDMA_HDR_MIN		28	/* xid,vers,credit,proc + 3 empty chunk-list words */
+
+enum {
+	RDMA_MSG	= 0,
+	RDMA_NOMSG	= 1,
+	RDMA_MSGP	= 2,	/* deprecated */
+	RDMA_DONE	= 3,
+	RDMA_ERROR	= 4
+};
+
+/*
+ * Parsed inline RPC-over-RDMA call.  rpc/rpc_len point into the recv buffer (no
+ * copy); they are only valid while that buffer is owned by the completion that
+ * produced them.  3c only locates the payload -- decoding the ONC RPC body is
+ * the krpc layer's job (3e).
+ */
+struct svc_rdma_msg {
+	uint32_t	 xid;		/* word0, echoed opaque */
+	uint32_t	 credit;	/* word2, flow control */
+	const void	*rpc;		/* inline RPC payload (buf + RPCRDMA_HDR_MIN) */
+	uint32_t	 rpc_len;	/* payload length (len - RPCRDMA_HDR_MIN) */
+};
 
 struct svc_rdma_conn;
 
@@ -218,6 +260,8 @@ static int svc_rdma_accept(struct rdma_cm_id *id);
 static void svc_rdma_conn_free_verbs(struct svc_rdma_conn *conn);
 static void svc_rdma_conn_destroy(void *arg, int pending);
 static void svc_rdma_conn_close(struct svc_rdma_conn *conn);
+static int svc_rdma_parse_header(const void *buf, uint32_t len,
+    struct svc_rdma_msg *out);
 static void svc_rdma_wc_recv(struct ib_cq *cq, struct ib_wc *wc);
 
 /*
@@ -443,25 +487,116 @@ svc_rdma_cm_event_handler(struct rdma_cm_id *id, struct rdma_cm_event *event)
 }
 
 /*
+ * Parse and validate the RFC 8166 RPC-over-RDMA version 1 transport header that
+ * prefixes an inline RPC message, and locate the inline RPC payload.
+ *
+ * UNTRUSTED PEER.  buf/len describe bytes the remote (a possibly-hostile NFS/
+ * RDMA client) sent into our recv buffer; len is wc->byte_len, already clamped
+ * by the caller to <= SVC_RDMA_INLINE (the posted SGE length).  EVERY wire word
+ * we read is gated by len BEFORE the read, so a short, truncated, or otherwise
+ * malformed header can only produce a clean error return -- never an overread,
+ * never a panic.
+ *
+ * Bounds model: the only words 3c needs are word0..word6 (xid, vers, credit,
+ * proc, read_list, write_list, reply_chunk), occupying bytes [0, 28).  A single
+ * up-front check, len >= RPCRDMA_HDR_MIN (28), proves the last byte we touch,
+ * buf[27] (= the 4th byte of word6, read by be32dec(buf + 24)), is in range.
+ * After that gate no further word read can exceed len.  We do NOT cast buf to
+ * uint32_t* and dereference: the recv buffer is malloc'd (aligned) but be32dec()
+ * is the correct portable choice -- it reads byte-by-byte (endian-safe, no
+ * unaligned access assumption) per <sys/endian.h>.
+ *
+ * Returns 0 and fills *out for an inline RDMA_MSG with all chunk lists empty.
+ * Returns a positive errno for anything we will not handle in 3c:
+ *   EBADMSG   - too short, wrong version, or a non-RDMA_MSG proc (hard protocol
+ *               violation; caller closes the connection).
+ *   EOPNOTSUPP- well-formed RDMA_MSG but carrying read/write/reply chunks, which
+ *               are 3f (caller closes the connection with a "not yet supported"
+ *               note).
+ * On any nonzero return *out is left untouched and no payload pointer escapes.
+ */
+static int
+svc_rdma_parse_header(const void *buf, uint32_t len, struct svc_rdma_msg *out)
+{
+	uint32_t vers, proc, read_list, write_list, reply_chunk;
+
+	/*
+	 * Single bounds gate.  Reject anything that cannot contain the full
+	 * 7-word (28-byte) fixed header.  This one check authorizes every
+	 * be32dec() below (offsets 0,4,8,12,16,20,24 -- all < 28 <= len), so no
+	 * individual word read can run past the received length.
+	 */
+	if (len < RPCRDMA_HDR_MIN)
+		return (EBADMSG);
+
+	/* word1: version MUST be 1 (RFC 8166 4.2). */
+	vers = be32dec((const char *)buf + 4);
+	if (vers != RPCRDMA_VERSION)
+		return (EBADMSG);
+
+	/* word3: 3c handles inline RDMA_MSG only; everything else -> close. */
+	proc = be32dec((const char *)buf + 12);
+	if (proc != RDMA_MSG)
+		return (EBADMSG);
+
+	/*
+	 * words 4..6: the three chunk-list discriminators (read_list,
+	 * write_list, reply_chunk).  0 == empty for each.  If ANY is nonzero the
+	 * request carries chunks, which are out of scope until 3f; we do NOT
+	 * attempt to walk the chunk segments here (that would read peer-counted
+	 * lengths past word6).  Recognize and reject.
+	 */
+	read_list   = be32dec((const char *)buf + 16);
+	write_list  = be32dec((const char *)buf + 20);
+	reply_chunk = be32dec((const char *)buf + 24);
+	if (read_list != 0 || write_list != 0 || reply_chunk != 0)
+		return (EOPNOTSUPP);
+
+	/*
+	 * Inline RDMA_MSG, all chunk lists empty: the ONC RPC call message
+	 * starts at word7 (offset 28).  len >= 28 guarantees buf + 28 is a valid
+	 * pointer and len - 28 (>= 0) the exact remaining byte count -- which may
+	 * legitimately be 0 (an empty body), still in bounds.
+	 */
+	out->xid     = be32dec((const char *)buf + 0);	/* word0 */
+	out->credit  = be32dec((const char *)buf + 8);	/* word2 */
+	out->rpc     = (const char *)buf + RPCRDMA_HDR_MIN;
+	out->rpc_len = len - RPCRDMA_HDR_MIN;
+	return (0);
+}
+
+/*
  * Receive completion.  Dispatched by the CQ core (ib_cq.c: wc->wr_cqe->done)
  * in IB_POLL_WORKQUEUE context -- a kernel workqueue thread, NOT an ithread,
  * so it is technically sleepable, but the reviewer treats it as hostile: keep
  * it short, take no sleepable lock, and start no blocking teardown here.
  *
  * The WR's wr_cqe aliases &rr->rr_cqe, so container_of() recovers the recv
- * descriptor and rr_conn the owning connection.  3b does not parse the bytes:
- * we log the length and repost.  wc->byte_len is the device's count of bytes
- * actually written into our buffer; the device caps it at the posted SGE
- * length (SVC_RDMA_INLINE), so a peer that sends more than the inline size
- * cannot make byte_len exceed the buffer -- the surplus is simply not
- * delivered.  We still treat byte_len as untrusted and only print it.
+ * descriptor and rr_conn the owning connection.  wc->byte_len is the device's
+ * count of bytes actually written into our buffer; the device caps it at the
+ * posted SGE length (SVC_RDMA_INLINE), so a peer that sends more than the inline
+ * size cannot make byte_len exceed the buffer -- the surplus is simply not
+ * delivered.  We still treat byte_len as fully untrusted: svc_rdma_parse_header()
+ * bounds-checks every header word against it before any read.
+ *
+ * 3c parses the RFC 8166 transport header on the success path:
+ *   - a clean inline RDMA_MSG is logged (xid/credit/inline rpc bytes) and the
+ *     recv buffer is reposted via the unchanged 3b SC_UP-gated barrier so the
+ *     next call can arrive;
+ *   - a hard protocol violation (too short, bad version, non-RDMA_MSG proc) or a
+ *     chunk-carrying request (3f) is logged with its reason and the connection
+ *     is closed via the 3b deferred teardown path -- we do NOT repost a
+ *     connection we are tearing down.
+ * The reply/send path, SVCXPRT dispatch, and chunk handling remain 3d..3f.
  */
 static void
 svc_rdma_wc_recv(struct ib_cq *cq, struct ib_wc *wc)
 {
 	struct svc_rdma_recv *rr;
 	struct svc_rdma_conn *conn;
+	struct svc_rdma_msg msg;
 	const struct ib_recv_wr *bad_wr;
+	uint32_t len;
 	int rc;
 
 	rr = container_of(wc->wr_cqe, struct svc_rdma_recv, rr_cqe);
@@ -493,8 +628,46 @@ svc_rdma_wc_recv(struct ib_cq *cq, struct ib_wc *wc)
 		return;
 	}
 
+	/*
+	 * Parse the RFC 8166 transport header before reposting.  Defend in depth:
+	 * although the device caps wc->byte_len at the posted SGE length, clamp it
+	 * to SVC_RDMA_INLINE anyway so the parser's bounds math can never be told
+	 * the buffer is larger than it is, then hand the parser exactly the bytes
+	 * that landed in rr_buf.  svc_rdma_parse_header() gates every wire-word
+	 * read on this length, so a short/truncated/garbage header returns an
+	 * error rather than overreading rr_buf.
+	 */
+	len = wc->byte_len;
+	if (len > SVC_RDMA_INLINE)
+		len = SVC_RDMA_INLINE;
+
+	rc = svc_rdma_parse_header(rr->rr_buf, len, &msg);
+	if (rc != 0) {
+		/*
+		 * Protocol violation (EBADMSG: too short / bad version / not an
+		 * inline RDMA_MSG) or a chunk-carrying request (EOPNOTSUPP: 3f).
+		 * Log the reason (rate-limited -- the arrival rate is peer-
+		 * controlled) and close the connection via the 3b deferred
+		 * teardown path.  We deliberately do NOT repost: this connection
+		 * is being torn down, and the SC_UP gate below would skip the
+		 * repost once conn_close() publishes SC_CLOSING anyway.
+		 */
+		if (ppsratecheck(&svc_rdma_log_last, &svc_rdma_log_pps, 5)) {
+			if (rc == EOPNOTSUPP)
+				printf("nfsrdma: RPC-over-RDMA request carries "
+				    "chunks; not yet supported (3f), closing "
+				    "(%u bytes)\n", len);
+			else
+				printf("nfsrdma: malformed RPC-over-RDMA header "
+				    "(%u bytes), closing\n", len);
+		}
+		svc_rdma_conn_close(conn);
+		return;
+	}
+
 	if (ppsratecheck(&svc_rdma_log_last, &svc_rdma_log_pps, 5))
-		printf("nfsrdma: received %u bytes\n", wc->byte_len);
+		printf("nfsrdma: RPC-over-RDMA v1 RDMA_MSG xid=0x%08x credit=%u "
+		    "inline rpc=%u bytes\n", msg.xid, msg.credit, msg.rpc_len);
 
 	/*
 	 * Repost the same buffer to keep the receive queue from starving --
@@ -784,20 +957,25 @@ svc_rdma_accept(struct rdma_cm_id *id)
 	}
 
 	/*
-	 * Separate send/recv CQs, each sized to its QP cap so it cannot
-	 * overflow.  comp_vector 0 is the deliberate minimal choice (matching
+	 * Separate send/recv CQs, each sized to its QP cap PLUS ONE.  The +1 is
+	 * drain-sentinel head-room: ib_drain_qp() (the teardown precondition)
+	 * posts one extra sentinel WR per queue whose completion can coexist
+	 * with up to max_wr flushed completions, so the CQ must hold max_wr + 1
+	 * CQEs to honor that contract on an exact-fit provider (mlx5 happens to
+	 * round entries up to a power of two, but we do not rely on that).
+	 * comp_vector 0 is the deliberate minimal choice (matching
 	 * rpcrdma_ep_create; spreading vectors is a later perf task).  conn is
 	 * the CQ context.  IB_POLL_WORKQUEUE dispatches completions from a
 	 * workqueue thread (see svc_rdma_wc_recv()'s context note).
 	 */
-	conn->sc_scq = ib_alloc_cq(dev, conn, max_wr, 0, IB_POLL_WORKQUEUE);
+	conn->sc_scq = ib_alloc_cq(dev, conn, max_wr + 1, 0, IB_POLL_WORKQUEUE);
 	if (IS_ERR(conn->sc_scq)) {
 		rc = -PTR_ERR(conn->sc_scq);
 		conn->sc_scq = NULL;
 		printf("nfsrdma: ib_alloc_cq (send) failed: %d\n", rc);
 		goto fail;
 	}
-	conn->sc_rcq = ib_alloc_cq(dev, conn, max_wr, 0, IB_POLL_WORKQUEUE);
+	conn->sc_rcq = ib_alloc_cq(dev, conn, max_wr + 1, 0, IB_POLL_WORKQUEUE);
 	if (IS_ERR(conn->sc_rcq)) {
 		rc = -PTR_ERR(conn->sc_rcq);
 		conn->sc_rcq = NULL;
@@ -825,7 +1003,7 @@ svc_rdma_accept(struct rdma_cm_id *id)
 	 */
 	rc = rdma_create_qp(id, conn->sc_pd, &qp_attr);
 	if (rc != 0) {
-		printf("nfsrdma: rdma_create_qp failed: %d\n", rc);
+		printf("nfsrdma: rdma_create_qp failed: %d\n", rc < 0 ? -rc : rc);
 		goto fail;
 	}
 
