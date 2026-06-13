@@ -169,6 +169,49 @@ out:
 	return ERR_PTR(rc);
 }
 
+/*
+ * Release all verbs resources attached to an endpoint, in reverse order of
+ * allocation.  This is the single unwind path shared by rpcrdma_ep_create()'s
+ * mid-construction error handling and by xprt_rdma_connect()'s post-create
+ * failure handling, so it must tolerate ANY subset of the resources being
+ * absent (NULL):
+ *   - QP: created by rdma_create_qp(), which records it in re_id->qp; absent
+ *     unless that call succeeded.  rdma_destroy_qp() is the cm_id-paired
+ *     destructor (ib_cma.c:869): it takes id_priv->qp_mutex, calls
+ *     ib_destroy_qp(), and clears id->qp -- so we must NOT touch re_id->qp by
+ *     hand, and must guard it (only call when a QP actually exists).
+ *   - recv_cq / send_cq / re_pd: each NULL until its alloc succeeds; the
+ *     create-time failure paths NULL the failing pointer before unwinding.
+ *   - re_id: always present once rpcrdma_create_id() returned; rdma_destroy_id
+ *     MUST run even when re_id->qp is NULL, so it sits outside the qp guard.
+ * Order: QP -> recv_cq -> send_cq -> PD -> cm_id.  A CQ is never freed while a
+ * live QP references it, and the PD outlives both.  Every pointer is nulled
+ * after release so a second call (or a create-then-connect failure sequence)
+ * cannot double-free.
+ */
+static void
+rpcrdma_ep_destroy(struct rpcrdma_ep *ep)
+{
+	if (ep->re_id != NULL && ep->re_id->qp != NULL)
+		rdma_destroy_qp(ep->re_id);
+	if (ep->re_attr.recv_cq != NULL) {
+		ib_free_cq(ep->re_attr.recv_cq);
+		ep->re_attr.recv_cq = NULL;
+	}
+	if (ep->re_attr.send_cq != NULL) {
+		ib_free_cq(ep->re_attr.send_cq);
+		ep->re_attr.send_cq = NULL;
+	}
+	if (ep->re_pd != NULL) {
+		ib_dealloc_pd(ep->re_pd);
+		ep->re_pd = NULL;
+	}
+	if (ep->re_id != NULL) {
+		rdma_destroy_id(ep->re_id);
+		ep->re_id = NULL;
+	}
+}
+
 static int
 rpcrdma_ep_create(struct vnet *net, struct sockaddr *saddr, int max_reqs,
     struct rpcrdma_ep *ep)
@@ -176,6 +219,16 @@ rpcrdma_ep_create(struct vnet *net, struct sockaddr *saddr, int max_reqs,
 	struct ib_device *device;
 	struct rdma_cm_id *id;
 	int rc;
+
+	/*
+	 * max_reqs is signed and is stored into the unsigned re_max_requests
+	 * and the u32 QP caps below.  A value <= 0 would size the QP and CQs to
+	 * zero entries, which is degenerate (mlx4 rejects a 0-entry CQ) -- and
+	 * a negative value would wrap to a huge unsigned cap.  Reject it before
+	 * allocating anything.  After this guard the min_t() caps are >= 1.
+	 */
+	if (max_reqs <= 0)
+		return -EINVAL;
 
 	id = rpcrdma_create_id(net, saddr, ep);
 	if (IS_ERR(id))
@@ -197,25 +250,58 @@ rpcrdma_ep_create(struct vnet *net, struct sockaddr *saddr, int max_reqs,
 	ep->re_attr.qp_type = IB_QPT_RC;
 	ep->re_attr.port_num = ~0;
 
+	/*
+	 * Size the QP conservatively from the negotiated request depth,
+	 * clamped to what the device can support.  re_max_requests is the
+	 * number of RPCs we expect to have in flight; each consumes roughly
+	 * one send and one receive WR, so a 1:1 mapping bounded by
+	 * device->attrs.max_qp_wr is a safe, correct starting point.  This is
+	 * the correctness task, not the performance task: no extra head-room
+	 * for FRWR register/invalidate or RDMA Read/Write WRs is reserved yet
+	 * (those arrive with the WR-posting work in a later task).
+	 *
+	 * device->attrs.max_sge is the driver-reported per-QP scatter/gather
+	 * limit (see mlx5: props->max_sge = min(max_rq_sg, max_sq_sg)).  Note
+	 * that the ib_device_attr.max_send_sge / max_recv_sge members on this
+	 * FreeBSD OFED alias max_srq_sge in a union and do NOT describe the QP
+	 * limit, so max_sge is the field to bound against here.  Until real
+	 * scatter/gather buffers are provisioned we request a single SGE per
+	 * WR, which is sufficient for an inline (single-segment) message.
+	 */
+	ep->re_attr.cap.max_send_wr = min_t(unsigned int, ep->re_max_requests,
+	    (unsigned int)device->attrs.max_qp_wr);
+	ep->re_attr.cap.max_recv_wr = min_t(unsigned int, ep->re_max_requests,
+	    (unsigned int)device->attrs.max_qp_wr);
+	ep->re_attr.cap.max_send_sge = min_t(unsigned int, 1U,
+	    (unsigned int)device->attrs.max_sge);
+	ep->re_attr.cap.max_recv_sge = min_t(unsigned int, 1U,
+	    (unsigned int)device->attrs.max_sge);
+
 	init_waitqueue_head(&ep->re_connect_wait);
 
-#ifdef notyet
-	ep->re_attr.send_cq = ib_alloc_cq_any(device, r_xprt,
-	      ep->re_attr.cap.max_send_wr, IB_POLL_WORKQUEUE);
+	/*
+	 * comp_vector 0 is a deliberate minimal choice.  Linux uses
+	 * ib_alloc_cq_any(), which round-robins completion vectors across
+	 * device->num_comp_vectors to spread interrupt load; doing that here
+	 * is a later optimization.  Pass ep (not the xprt) as the CQ context;
+	 * the xprt is not in scope at this layer.  nr_cqe matches the
+	 * corresponding QP cap so the CQ cannot overflow.
+	 */
+	ep->re_attr.send_cq = ib_alloc_cq(device, ep,
+	    ep->re_attr.cap.max_send_wr, 0, IB_POLL_WORKQUEUE);
 	if (IS_ERR(ep->re_attr.send_cq)) {
 		rc = PTR_ERR(ep->re_attr.send_cq);
 		ep->re_attr.send_cq = NULL;
 		goto out_destroy;
 	}
 
-	ep->re_attr.recv_cq = ib_alloc_cq_any(device, r_xprt,
-	      ep->re_attr.cap.max_recv_wr, IB_POLL_WORKQUEUE);
+	ep->re_attr.recv_cq = ib_alloc_cq(device, ep,
+	    ep->re_attr.cap.max_recv_wr, 0, IB_POLL_WORKQUEUE);
 	if (IS_ERR(ep->re_attr.recv_cq)) {
 		rc = PTR_ERR(ep->re_attr.recv_cq);
 		ep->re_attr.recv_cq = NULL;
 		goto out_destroy;
 	}
-#endif
 	ep->re_receive_count = 0;
 
 	/* Initialize cma parameters */
@@ -252,11 +338,28 @@ rpcrdma_ep_create(struct vnet *net, struct sockaddr *saddr, int max_reqs,
 
 	return 0;
 
+	/*
+	 * Reachable partial-construction states (the failing pointer is NULLed
+	 * before the goto in each case): send_cq fail (no CQs/PD/QP); recv_cq
+	 * fail (send_cq only); ib_alloc_pd fail (both CQs, no PD/QP);
+	 * rdma_create_qp fail (both CQs + PD, re_id->qp still NULL).
+	 * rpcrdma_ep_destroy() tolerates every one of these.
+	 */
 out_destroy:
-	rdma_destroy_id(id);
+	rpcrdma_ep_destroy(ep);
 	return rc;
 }
 
+/*
+ * WARNING: the connection-establishment path is INCOMPLETE.
+ * rpcrdma_cm_event_handler() still has RDMA_CM_EVENT_ESTABLISHED (and
+ * DISCONNECTED) behind #ifdef notyet, so re_done is never completed on a
+ * successful connect: the post-connect wait below always times out and this
+ * function always reports failure, tearing the endpoint back down.  That is
+ * intended and safe for now (no resource is left dangling), but it means NO
+ * caller (clnt_rdma.c) may be wired to this transport until TASK_003 enables
+ * the ESTABLISHED/DISCONNECTED handling and the establishment handshake.
+ */
 int
 xprt_rdma_connect(struct vnet *net, struct sockaddr *saddr,
     struct rpcrdma_xprt *rdmaxprt, int max_reqs,
@@ -270,15 +373,29 @@ xprt_rdma_connect(struct vnet *net, struct sockaddr *saddr,
 	memset(ep, 0, sizeof(*ep));
 	rc = rpcrdma_ep_create(net, saddr, max_reqs, ep);
 	if (rc)
-		goto out;
+		return (ECONNREFUSED);	/* ep already torn down internally */
 
 	rc = rdma_connect(ep->re_id, conn_param);
-	if (rc)
-		goto out;
-	rc = wait_for_completion_interruptible_timeout(&ep->re_done, wtimeout);
-out:
-	if (rc != 0)
+	if (rc) {
 		rc = ECONNREFUSED;
+		goto out_destroy;
+	}
+
+	/*
+	 * wait_for_completion_interruptible_timeout() returns >0 when the
+	 * completion fired, 0 on timeout, and <0 when interrupted
+	 * (linux_compat.c).  Only a strictly positive return is success; map
+	 * timeout to ETIMEDOUT and anything else (interrupt / negative) to
+	 * ECONNREFUSED.  On any failure the endpoint we just built must be
+	 * released here -- rpcrdma_ep_create() only frees on its own failure.
+	 */
+	rc = wait_for_completion_interruptible_timeout(&ep->re_done, wtimeout);
+	if (rc > 0)
+		return (0);
+	rc = (rc == 0) ? ETIMEDOUT : ECONNREFUSED;
+
+out_destroy:
+	rpcrdma_ep_destroy(ep);
 	return (rc);
 }
 
