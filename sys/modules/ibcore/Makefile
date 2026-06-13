@@ -42,7 +42,8 @@ SRCS= \
 	ib_uverbs_std_types_mr.c \
 	ib_uverbs_uapi.c \
 	ib_verbs.c \
-	xprt_verbs.c
+	xprt_verbs.c \
+	svc_verbs.c
 
 SRCS+=	${LINUXKPI_GENSRCS}
 SRCS+=	opt_inet.h opt_inet6.h
