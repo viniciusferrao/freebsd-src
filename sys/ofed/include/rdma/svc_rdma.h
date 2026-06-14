@@ -306,6 +306,50 @@ int	svc_rdma_conn_send(struct svc_rdma_conn *conn, const void *buf,
 	    uint32_t len);
 
 /*
+ * RDMA-Write a too-large-for-inline reply into the client's reply chunk, then
+ * SEND a small RDMA_NOMSG transport header reporting the bytes written
+ * (TASK_003f-4).  This is the OUTBOUND data path for the RFC 8166 §4.3 reply
+ * chunk: the whole marshalled ONC RPC reply does not fit the inline send buffer,
+ * so the client pre-registered reply-chunk memory and the server RDMA-Writes the
+ * reply into it and reports the length in the RDMA_NOMSG header's reply chunk.
+ *
+ * buf/len are the marshalled ONC RPC reply BODY ONLY (NO RFC 8166 header -- the
+ * verbs layer builds the RDMA_NOMSG header itself).  buf is caller-owned and only
+ * read here: the verbs layer copies len bytes into its own DMA-mapped source
+ * buffer (no ownership transfer), so the caller may free/reuse buf the instant
+ * this returns.
+ *
+ * reply is the parsed-and-validated reply chunk the client offered, captured by
+ * the consumer during sro_recv (it is a pure value type -- a fixed-size segment
+ * array, no pointers -- so the consumer copies it and hands it back here).  EVERY
+ * field is UNTRUSTED and is RE-VALIDATED at post time: the segment count <= cap,
+ * each segment length in (0, cap], the running total >= len (the client must have
+ * offered at least as much reply-chunk space as the reply needs -- if not, the
+ * reply does not fit the client's chunk and EMSGSIZE is returned, NOT an
+ * over-write of the client's memory).  The client {rkey, addr} are passed
+ * VERBATIM to the HCA, which enforces them; a bad one fails the WR -> clean close.
+ *
+ * xid is the echoed opaque transaction id for the RDMA_NOMSG header (word0).
+ *
+ * Context: callable from a krpc pool thread (xp_reply) under the consumer's
+ * per-conn lock (the same caller-reference rule as svc_rdma_conn_send: the lock
+ * keeps conn alive across the call).  It does NOT sleep.  It is gated by the
+ * connection still being up and by the bounded send pool (the RDMA_NOMSG header
+ * SEND draws one buffer); a tearing-down conn or exhausted pool drops the reply.
+ *
+ * Returns 0 if the RDMA Write chain + header SEND were posted, EINVAL for a
+ * len/segment violation, EMSGSIZE if the reply exceeds the client's reply-chunk
+ * capacity, ENOMEM on allocation failure, EBUSY if the send pool was exhausted,
+ * ENOTCONN if the connection is no longer up, or the posted errno otherwise.  On
+ * a nonzero return the verbs layer has released everything it allocated for a
+ * never-posted attempt (a posted-but-failed chain is reclaimed by the drained
+ * teardown -- the partial-post discipline, see svc_verbs.c).
+ */
+int	svc_rdma_conn_reply_chunk(struct svc_rdma_conn *conn, uint32_t xid,
+	    const struct svc_rdma_write_chunk *reply, const void *buf,
+	    uint32_t len);
+
+/*
  * Report the flow-control credit the verbs layer GRANTED this connection: the
  * number of receive buffers (and thus recv WRs) it actually posted, which is the
  * value a reply's RPC-over-RDMA header should advertise in rdma_credit (RFC 8166
@@ -339,6 +383,7 @@ uint32_t svc_rdma_conn_credits(struct svc_rdma_conn *conn);
  *   svo_listen_start  -> svc_rdma_listen_start_ops
  *   svo_listen_stop   -> svc_rdma_listen_stop
  *   svo_conn_send     -> svc_rdma_conn_send
+ *   svo_conn_reply_chunk -> svc_rdma_conn_reply_chunk (TASK_003f-4)
  *   svo_conn_set_ctx  -> svc_rdma_conn_set_ctx
  *   svo_conn_get_ctx  -> svc_rdma_conn_get_ctx
  *   svo_conn_credits  -> svc_rdma_conn_credits
@@ -357,6 +402,9 @@ struct svc_rdma_verbs_ops {
 		    const struct svc_rdma_ops *ops, void *ctx);
 	void	(*svo_listen_stop)(void);
 	int	(*svo_conn_send)(struct svc_rdma_conn *conn, const void *buf,
+		    uint32_t len);
+	int	(*svo_conn_reply_chunk)(struct svc_rdma_conn *conn, uint32_t xid,
+		    const struct svc_rdma_write_chunk *reply, const void *buf,
 		    uint32_t len);
 	void	(*svo_conn_set_ctx)(struct svc_rdma_conn *conn, void *cctx);
 	void	*(*svo_conn_get_ctx)(struct svc_rdma_conn *conn);
