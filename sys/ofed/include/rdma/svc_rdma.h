@@ -91,6 +91,21 @@ struct svc_rdma_conn;
 #define	SVC_RDMA_MAX_SEGS	16	/* max rdma_segments in one chunk */
 #define	SVC_RDMA_MAX_CHUNKS	8	/* max chunks in read/write list */
 #define	SVC_RDMA_MAX_SEG_LEN	(1U << 30)	/* sane per-segment length cap */
+/*
+ * SVC_RDMA_MAX_READ_SEGS caps the read list SPECIFICALLY (decoupled from
+ * SVC_RDMA_MAX_CHUNKS, TASK_003f-10).  An NFS WRITE's read list is many segments
+ * of ONE logical chunk (one rdma_position), and a real Linux NFS/RDMA client
+ * splits a 1 MiB WRITE into ~16 segments of ~64 KiB (the HCA's FRWR granularity)
+ * -- far more than the 8-chunk write-list cap.  Sizing the read list at 8 made
+ * the server reject every >~0.5 MiB WRITE ("exceeds chunk/segment caps") and
+ * was the wall that pinned the negotiated wsize at 128 KiB.  64 covers a 1 MiB
+ * request down to 16 KiB segments (4x the observed fragmentation) while the
+ * reads[] array still leaves struct svc_rdma_msg under the 4 KiB budget.  It is
+ * a FIXED LOCAL constant: a peer declaring more read segments is a clean reject,
+ * never a larger allocation.  Each read segment is one RDMA Read WR / SQ slot,
+ * so this also bounds the SQ head-room reserved at accept (see max_send_wr).
+ */
+#define	SVC_RDMA_MAX_READ_SEGS	64	/* max segments in the read list */
 
 /*
  * One RFC 8166 rdma_segment: { handle (rkey), length, offset (virtual addr) }.
@@ -106,7 +121,7 @@ struct svc_rdma_segment {
 /*
  * One read-list entry: an rdma_position plus a single rdma_segment.  The read
  * list is a flat array of these (the parser flattens the RFC 8166 1/0-terminated
- * chain into rd_nchunks entries, capped at SVC_RDMA_MAX_CHUNKS).
+ * chain into rd_nchunks entries, capped at SVC_RDMA_MAX_READ_SEGS).
  */
 struct svc_rdma_read_chunk {
 	uint32_t	 rc_position;	/* position in the XDR stream */
@@ -162,7 +177,7 @@ struct svc_rdma_msg {
 	uint32_t	 rd_nchunks;	/* valid entries in reads[] (<= cap) */
 	uint32_t	 wr_nchunks;	/* valid entries in writes[] (<= cap) */
 	bool		 reply_present;	/* a reply chunk was encoded */
-	struct svc_rdma_read_chunk  reads[SVC_RDMA_MAX_CHUNKS];
+	struct svc_rdma_read_chunk  reads[SVC_RDMA_MAX_READ_SEGS];
 	struct svc_rdma_write_chunk writes[SVC_RDMA_MAX_CHUNKS];
 	struct svc_rdma_write_chunk reply;
 };

@@ -197,15 +197,17 @@ MALLOC_DEFINE(M_NFSRDMA, "nfsrdma", "NFS over RDMA server");
  * length (<= SVC_RDMA_MAX_SEG_LEN) and the per-chunk total; this is an additional
  * whole-request cap re-asserted at post time.
  *
- * SVC_RDMA_MAX_READ_SEGS is the cap on how many RDMA Read WRs we will chain for
- * one request.  The read list itself is already capped at SVC_RDMA_MAX_CHUNKS
- * entries (each a single segment) by the parser, so this is that same fixed cap;
- * naming it here documents the post-time re-check and keeps the WR-chain bound
- * explicit.  Each WR consumes one SQ slot, so this must fit the SQ head-room
- * reserved at accept time (see max_send_wr).
+ * SVC_RDMA_MAX_READ_SEGS (defined in <rdma/svc_rdma.h>, == 64) is the cap on how
+ * many RDMA Read WRs we will chain for one request.  It bounds the read list,
+ * the rs_wr[]/rs_sge[] arrays, and the SQ read head-room reserved at accept.  It
+ * is DECOUPLED from SVC_RDMA_MAX_CHUNKS (the write-list cap): an NFS WRITE's read
+ * list is many single-segment entries of one position, and a real client splits
+ * 1 MiB into ~16 of them, so the read list needs far more entries than the
+ * 8-chunk write list (TASK_003f-10).  Each WR consumes one SQ slot, so the value
+ * must fit the SQ head-room reserved at accept time (see max_send_wr).
  */
 #define	SVC_RDMA_MAX_READ	(1U << 20)	/* 1 MiB whole-request cap */
-#define	SVC_RDMA_MAX_READ_SEGS	SVC_RDMA_MAX_CHUNKS
+/* SVC_RDMA_MAX_READ_SEGS now lives in <rdma/svc_rdma.h> (sizes reads[] there). */
 
 /*
  * RDMA Write engine sizing (TASK_003f-4) -- the OUTBOUND data path.
@@ -314,8 +316,9 @@ enum {
  * (rr_rs.rs_msg below) so the parsed chunk arrays survive past the recv handler
  * until the async RDMA Read completes.  Assert its size stays within a sane
  * budget so a future grow of the fixed-capacity chunk arrays cannot silently
- * bloat per-recv (or per-conn) memory.  4 KiB comfortably holds the current
- * 2608-byte layout (16 segs x 8 chunks + reply) with head-room.
+ * bloat per-recv (or per-conn) memory.  4 KiB comfortably holds the layout
+ * (reads[64] read segments + writes[8] x 16 segs + reply ~= 3.7 KiB) with
+ * head-room; the CTASSERT below is the hard guard if a future grow exceeds it.
  */
 CTASSERT(sizeof(struct svc_rdma_msg) <= 4096);
 
@@ -1111,7 +1114,7 @@ svc_rdma_decode_segment(const void *buf, uint32_t len, uint32_t *offp,
 /*
  * Decode the RFC 8166 read list: a chain where each entry is preceded by a
  * "1" (more) word, then { rdma_position, rdma_segment }, terminated by a "0".
- * Flattens into out->reads[], capping at SVC_RDMA_MAX_CHUNKS.  A "more" word
+ * Flattens into out->reads[], capping at SVC_RDMA_MAX_READ_SEGS.  A "more" word
  * that is neither 0 nor 1 is malformed.  Returns 0 or a positive errno.
  *
  * SINGLE rdma_position constraint (TASK_003f-3, NIT).  RFC 8166 4.3 permits a
@@ -1146,8 +1149,8 @@ svc_rdma_decode_read_list(const void *buf, uint32_t len, uint32_t *offp,
 		if (more != 1)			/* only 0/1 are valid */
 			return (EBADMSG);
 
-		/* Fixed cap: more chunks than we will serve -> reject. */
-		if (out->rd_nchunks >= SVC_RDMA_MAX_CHUNKS)
+		/* Fixed cap: more read segments than we will serve -> reject. */
+		if (out->rd_nchunks >= SVC_RDMA_MAX_READ_SEGS)
 			return (EOPNOTSUPP);
 
 		/* rdma_position (1 word) + rdma_segment (4 words). */
@@ -1819,7 +1822,7 @@ svc_rdma_read_start(struct svc_rdma_conn *conn, struct svc_rdma_recv *rr,
 
 	/*
 	 * Re-validate the read-list SHAPE at post time (untrusted peer).  The
-	 * parser already enforced n <= SVC_RDMA_MAX_CHUNKS and each rs_length in
+	 * parser already enforced n <= SVC_RDMA_MAX_READ_SEGS and each rs_length in
 	 * (0, SVC_RDMA_MAX_SEG_LEN]; re-assert here so this engine is correct
 	 * independent of the parser's caps and so a future parser change cannot
 	 * silently let an over-cap request reach the HCA.
@@ -1829,7 +1832,8 @@ svc_rdma_read_start(struct svc_rdma_conn *conn, struct svc_rdma_recv *rr,
 
 	/*
 	 * Re-compute and re-bound the TOTAL inbound length.  uint64 accumulation
-	 * cannot wrap (each rs_length <= 1<<30, n <= 8).  Reject 0 (a read list of
+	 * cannot wrap (each rs_length <= 1<<30, n <= SVC_RDMA_MAX_READ_SEGS (64) ->
+	 * at most 2^36, far under UINT64_MAX).  Reject 0 (a read list of
 	 * only zero-length segments is malformed -- though the parser already
 	 * rejects a 0-length segment) and anything over the whole-request cap.  The
 	 * server buffer is sized by THIS value, never by a raw peer field.
@@ -4040,7 +4044,7 @@ svc_rdma_accept(struct rdma_cm_id *id)
 	 *     bounded by the request depth (max_wr) -> max_wr * (SVC_RDMA_MAX_WRITE_SEGS
 	 *     + 1).
 	 * All are FIXED LOCAL bounds, never peer counts (the parser caps the read list
-	 * at SVC_RDMA_MAX_CHUNKS and the reply chunk at SVC_RDMA_MAX_SEGS ==
+	 * at SVC_RDMA_MAX_READ_SEGS and the reply chunk at SVC_RDMA_MAX_SEGS ==
 	 * SVC_RDMA_MAX_WRITE_SEGS).  Every cap is clamped to the device's max_qp_wr; on
 	 * a small-cap device the clamp wins and a chain that would overflow simply fails
 	 * ib_post_send -> clean close, never a panic.
@@ -4286,6 +4290,15 @@ svc_rdma_accept(struct rdma_cm_id *id)
 	 * sinks so the NFS-WRITE RDMA-Read hot path does not contigmalloc per write.
 	 * Best-effort: cap at the recv depth, and stop at the first allocation/map
 	 * failure (a shorter pool just means more fallback, never an accept failure).
+	 *
+	 * M_NOWAIT for the contigmalloc (TASK_003f-10 review SHOULD-FIX): svc_rdma_accept
+	 * runs under the RDMA-CM listener's handler_mutex, which serializes ALL new
+	 * connection acceptance.  A 1 MiB PHYSICALLY-contiguous M_WAITOK request can
+	 * block indefinitely on the physical-page allocator under fragmentation, so one
+	 * fragmented accept would stall every new NFS/RDMA client.  M_NOWAIT returns NULL
+	 * instead, which the short-pool branch already handles (more per-read fallback,
+	 * never a stall) -- matching the per-read fallback at svc_rdma_read_start, which
+	 * is M_NOWAIT for the same reason.
 	 */
 	conn->sc_nrbpool = (SVC_RDMA_READBUF_POOL < conn->sc_nrecv) ?
 	    SVC_RDMA_READBUF_POOL : conn->sc_nrecv;
@@ -4297,7 +4310,7 @@ svc_rdma_accept(struct rdma_cm_id *id)
 			struct svc_rdma_readbuf *rb = &conn->sc_rbpool[rbk];
 
 			rb->rb_buf = contigmalloc(SVC_RDMA_MAX_READ, M_NFSRDMA,
-			    M_WAITOK, 0, ~(vm_paddr_t)0, PAGE_SIZE, 0);
+			    M_NOWAIT, 0, ~(vm_paddr_t)0, PAGE_SIZE, 0);
 			if (rb->rb_buf == NULL) {
 				conn->sc_nrbpool = rbk;	/* short pool */
 				break;
