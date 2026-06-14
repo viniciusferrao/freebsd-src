@@ -713,6 +713,19 @@ static struct timeval svc_rdma_log_last;
 static int svc_rdma_log_pps;
 
 /*
+ * Rotating completion-vector assignment (TASK_003f-9 fix #2).  comp_vector
+ * selects which device completion vector (MSI-X / per-core ib-comp workqueue)
+ * a CQ's completions steer to.  Pinning every CQ to vector 0 funnels all RDMA
+ * completion processing onto one core (the ~99%-idle/concurrency-1 symptom in
+ * the WRITE benchmark); rotating per-connection, and putting a connection's send
+ * and recv CQ on adjacent vectors, fans completion work across cores.  This is
+ * ONLY a vector (steering) change -- each CQ still uses IB_POLL_WORKQUEUE with
+ * one work item per CQ, so the per-CQ completion serialization the lockless
+ * counters / teardown barrier rely on is unchanged.
+ */
+static volatile u_int svc_rdma_cqv;
+
+/*
  * Last requested listen port; 0 means stopped.  This is the value the sysctl
  * read-back reports.  It is kept in sync with svc_rdma_listener.sl_id and is
  * read/written ONLY under sl_lock so the read-back can never be stale or
@@ -3971,6 +3984,7 @@ svc_rdma_accept(struct rdma_cm_id *id)
 	struct ib_device *dev = id->device;
 	const struct ib_recv_wr *bad_wr;
 	u32 max_wr, max_send_wr, max_sge;
+	u32 send_vec, recv_vec;
 	int i, rc;
 
 	conn = malloc(sizeof(*conn), M_NFSRDMA, M_WAITOK | M_ZERO);
@@ -4080,17 +4094,26 @@ svc_rdma_accept(struct rdma_cm_id *id)
 	 * (mlx5 happens to round entries up to a power of two, but we do not rely
 	 * on that).  The send CQ is sized to max_send_wr + 1 (the reply depth plus
 	 * the 3f-2 FRWR head-room), the recv CQ to max_wr + 1.
-	 * comp_vector 0 is the deliberate minimal choice (matching
-	 * rpcrdma_ep_create; spreading vectors is a later perf task).  conn is
-	 * the CQ context.  IB_POLL_WORKQUEUE dispatches completions from a
-	 * workqueue thread (see svc_rdma_wc_recv()'s context note).  This poll
-	 * context is load-bearing: the completion handlers' lockless decrements of
-	 * sc_reposts/sc_sends/sc_upcalls and the teardown quiescence barrier are
-	 * correct only because a single workqueue thread serializes per-conn
-	 * completions.  svc_rdma_wc_recv()/svc_rdma_wc_send() MPASS exactly this
-	 * (N2), so changing either CQ away from IB_POLL_WORKQUEUE trips INVARIANTS.
+	 * comp_vector (TASK_003f-9 fix #2): rotate per connection and put this
+	 * connection's send and recv CQ on ADJACENT vectors, instead of pinning every
+	 * CQ to vector 0 (which funnels all completion processing onto one core).
+	 * Bounded to the device's num_comp_vectors.  conn is the CQ context.
+	 * IB_POLL_WORKQUEUE dispatches completions from a workqueue thread (see
+	 * svc_rdma_wc_recv()'s context note).  This poll context is load-bearing: the
+	 * completion handlers' lockless decrements of sc_reposts/sc_sends/sc_upcalls
+	 * and the teardown quiescence barrier are correct only because a single
+	 * workqueue thread serializes per-CQ completions; changing the VECTOR keeps
+	 * one work item per CQ (only the core changes), so it preserves that.  Leaving
+	 * IB_POLL_WORKQUEUE is what would trip INVARIANTS, not the vector.
 	 */
-	conn->sc_scq = ib_alloc_cq(dev, conn, max_send_wr + 1, 0,
+	{
+		u32 ncv = (dev->num_comp_vectors > 0) ?
+		    (u32)dev->num_comp_vectors : 1;
+		u32 base = atomic_fetchadd_int(&svc_rdma_cqv, 2);
+		send_vec = base % ncv;
+		recv_vec = (base + 1) % ncv;
+	}
+	conn->sc_scq = ib_alloc_cq(dev, conn, max_send_wr + 1, send_vec,
 	    IB_POLL_WORKQUEUE);
 	if (IS_ERR(conn->sc_scq)) {
 		rc = -PTR_ERR(conn->sc_scq);
@@ -4098,7 +4121,8 @@ svc_rdma_accept(struct rdma_cm_id *id)
 		printf("nfsrdma: ib_alloc_cq (send) failed: %d\n", rc);
 		goto fail;
 	}
-	conn->sc_rcq = ib_alloc_cq(dev, conn, max_wr + 1, 0, IB_POLL_WORKQUEUE);
+	conn->sc_rcq = ib_alloc_cq(dev, conn, max_wr + 1, recv_vec,
+	    IB_POLL_WORKQUEUE);
 	if (IS_ERR(conn->sc_rcq)) {
 		rc = -PTR_ERR(conn->sc_rcq);
 		conn->sc_rcq = NULL;
@@ -4333,10 +4357,16 @@ svc_rdma_accept(struct rdma_cm_id *id)
 	 * read/atomic depth (capped to the u8 field) AND a matching initiator depth
 	 * (the server ISSUES RDMA Reads to pull NFS WRITE data, TASK_003f-3, so
 	 * the client must allow them via max_dest_rd_atomic), and
-	 * leave RNR retry at 0 so any flow-control bug surfaces immediately
-	 * rather than silently stalling.  retry_count is ignored when
-	 * accepting.  No private data is exchanged.  Because a QP is already
-	 * bound to the id, the qp_num/srq/qkey fields are ignored.
+	 * RNR retry = 7 (infinite) (TASK_003f-9 fix #6): when the server's RQ
+	 * momentarily drains under a concurrent WRITE burst, an inbound SEND from the
+	 * client gets an RNR NAK; with rnr_retry_count 0 the QP errored on the first
+	 * RNR -> connection kill -> 60 s NFS retransmit stall (the 8-stream collapse
+	 * signature).  7 means retry-forever, so transient receive-side pressure
+	 * PAUSES the peer instead of killing the connection.  This is a robustness
+	 * floor; the real serialization fix is moving completion work off the single
+	 * CQ thread (fix #1).  retry_count is ignored when accepting.  No private data
+	 * is exchanged.  Because a QP is already bound to the id, the qp_num/srq/qkey
+	 * fields are ignored.
 	 */
 	memset(&conn_param, 0, sizeof(conn_param));
 	conn_param.responder_resources =
@@ -4344,7 +4374,7 @@ svc_rdma_accept(struct rdma_cm_id *id)
 	conn_param.initiator_depth =
 	    min_t(u32, U8_MAX, (u32)dev->attrs.max_qp_init_rd_atom);
 	conn_param.flow_control = 0;
-	conn_param.rnr_retry_count = 0;
+	conn_param.rnr_retry_count = 7;
 	conn_param.private_data = NULL;
 	conn_param.private_data_len = 0;
 
