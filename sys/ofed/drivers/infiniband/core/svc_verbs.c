@@ -2154,6 +2154,17 @@ svc_rdma_wc_rdma_read(struct ib_cq *cq, struct ib_wc *wc)
 	bodylen = rs->rs_headlen + rs->rs_total;
 
 	/*
+	 * DMA sync the read sink before the CPU reads it (TASK_003f-3 corruption
+	 * fix).  rs_buf is a malloc'd, physically-scattered buffer, so
+	 * ib_dma_map_single may bounce it; the RDMA-Read data is only guaranteed
+	 * visible to the CPU after a DMA_FROM_DEVICE sync_for_cpu.  Without it a
+	 * bounced read leaves stale (uninitialized) rs_buf bytes in the assembled
+	 * body -- intermittent NFS-WRITE data corruption under load.
+	 */
+	ib_dma_sync_single_for_cpu(conn->sc_id->device, rs->rs_dma,
+	    rs->rs_total, DMA_FROM_DEVICE);
+
+	/*
 	 * Assemble in place: rs_buf currently holds [read_data] of rs_total bytes.
 	 * We need [head[0,pos)][read_data][head[pos,headlen)].  Rather than grow
 	 * rs_buf, build the assembled body in a fresh allocation sized to the
@@ -4178,7 +4189,9 @@ svc_rdma_accept(struct rdma_cm_id *id)
 	/*
 	 * Conservative accept parameters (mirroring rpcrdma_ep_create's
 	 * remote_cma): advertise responder_resources from the device's RDMA
-	 * read/atomic depth (capped to the u8 field), initiate nothing, and
+	 * read/atomic depth (capped to the u8 field) AND a matching initiator depth
+	 * (the server ISSUES RDMA Reads to pull NFS WRITE data, TASK_003f-3, so
+	 * the client must allow them via max_dest_rd_atomic), and
 	 * leave RNR retry at 0 so any flow-control bug surfaces immediately
 	 * rather than silently stalling.  retry_count is ignored when
 	 * accepting.  No private data is exchanged.  Because a QP is already
@@ -4187,7 +4200,8 @@ svc_rdma_accept(struct rdma_cm_id *id)
 	memset(&conn_param, 0, sizeof(conn_param));
 	conn_param.responder_resources =
 	    min_t(u32, U8_MAX, (u32)dev->attrs.max_qp_rd_atom);
-	conn_param.initiator_depth = 0;
+	conn_param.initiator_depth =
+	    min_t(u32, U8_MAX, (u32)dev->attrs.max_qp_init_rd_atom);
 	conn_param.flow_control = 0;
 	conn_param.rnr_retry_count = 0;
 	conn_param.private_data = NULL;
