@@ -5228,6 +5228,8 @@ rpc/svc_auth.c			optional krpc | nfslockd | nfscl | nfsd
 rpc/svc_auth_unix.c		optional krpc | nfslockd | nfscl | nfsd
 rpc/svc_dg.c			optional krpc | nfslockd | nfscl | nfsd
 rpc/svc_generic.c		optional krpc | nfslockd | nfscl | nfsd
+rpc/svc_rdma.c			optional ofed					\
+	compile-with		"${CC} -c ${CFLAGS} -I$S/ofed/include ${WERROR} ${.IMPSRC}"
 rpc/svc_vc.c			optional krpc | nfslockd | nfscl | nfsd
 #
 # Kernel RPC-over-TLS

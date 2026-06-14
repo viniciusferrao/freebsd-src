@@ -2200,3 +2200,99 @@ svc_rdma_uninit(void *arg __unused)
 }
 SYSUNINIT(svc_rdma_uninit, SI_SUB_OFED_MODINIT, SI_ORDER_FIFTH,
     svc_rdma_uninit, NULL);
+
+/*
+ * ===========================================================================
+ * Cross-module verbs-ops registration with the krpc layer (TASK_003e-2a).
+ *
+ * Module layering (docs/16-svcxprt-rdma-integration.md "Module layering").  The
+ * SVCXPRT/krpc consumer lives in sys/rpc/svc_rdma.c, built INTO the kernel; the
+ * verbs above live here in ibcore.  The krpc layer exports the built-in symbols
+ * svc_rdma_register_verbs()/svc_rdma_unregister_verbs() (declared in
+ * <rdma/svc_rdma.h>); a built-in kernel symbol is always resolvable from this
+ * module, so no MODULE_DEPEND on krpc is needed (and on GENERIC-OFED, where
+ * options OFED compiles this file INTO the kernel, both sides are in the same
+ * image -- still a plain built-in-symbol call).  We hand krpc a table of our
+ * verbs entry points at module load and revoke it at module unload; krpc reaches
+ * the verbs ONLY through this table and refuses RDMA (ENXIO) when it is absent.
+ *
+ * ibcore_verbs_ops is a file-static const table -- it is the krpc registration's
+ * "ops must outlive the registration window" object.  It is valid for the whole
+ * lifetime of this module's text, and we svc_rdma_unregister_verbs() before that
+ * text can go away (the SYSUNINIT below), so krpc never holds a dangling table.
+ */
+static const struct svc_rdma_verbs_ops ibcore_verbs_ops = {
+	.svo_listen_start	= svc_rdma_listen_start_ops,
+	.svo_listen_stop	= svc_rdma_listen_stop,
+	.svo_conn_send		= svc_rdma_conn_send,
+	.svo_conn_set_ctx	= svc_rdma_conn_set_ctx,
+	.svo_conn_get_ctx	= svc_rdma_conn_get_ctx,
+};
+
+/*
+ * Register the verbs-ops with krpc at module load.
+ *
+ * Ordering is load-bearing (the mirror image of svc_rdma_uninit's argument).
+ * SYSINITs run in ASCENDING SI_ORDER, and the CM core comes up at
+ *	module_init_order(cma_init, SI_ORDER_FOURTH)	(ib_cma.c:4701)
+ * = SYSINIT(... SI_SUB_OFED_MODINIT, SI_ORDER_FOURTH ...).  We register at
+ * SI_ORDER_FIFTH(4) so this runs strictly AFTER cma_init's FOURTH(3): by the
+ * time krpc can be handed a verbs table, the ibcore/CM core it will drive is
+ * already up.  (Registration itself only stores a pointer and does not touch the
+ * CM core, but keeping it after cma_init matches the documented invariant and
+ * leaves no window where a krpc listen could race a half-initialized core.)
+ */
+static void
+svc_rdma_verbs_register(void *arg __unused)
+{
+	int rc;
+
+	rc = svc_rdma_register_verbs(&ibcore_verbs_ops);
+	if (rc != 0)
+		printf("nfsrdma: svc_rdma_register_verbs failed: %d\n", rc);
+}
+SYSINIT(svc_rdma_verbs_register, SI_SUB_OFED_MODINIT, SI_ORDER_FIFTH,
+    svc_rdma_verbs_register, NULL);
+
+/*
+ * Revoke the verbs-ops at module unload, BEFORE svc_rdma_uninit tears the
+ * listener down.
+ *
+ * SYSUNINITs run in DESCENDING SI_ORDER.  svc_rdma_uninit (the listener/conn
+ * teardown) is at SI_ORDER_FIFTH(4); we unregister at SI_ORDER_SIXTH(5) so this
+ * runs FIRST on the unload path:
+ *	SIXTH(5) unregister  ->  FIFTH(4) svc_rdma_uninit  ->  FOURTH(3) cma_cleanup
+ * Why unregister must precede the teardown: once we return, krpc's table is NULL
+ * and its bring-up sysctl returns ENXIO, so no NEW krpc-driven listen can start
+ * against verbs whose module text is about to be freed.  And
+ * svc_rdma_unregister_verbs() itself calls svo_listen_stop() (==
+ * svc_rdma_listen_stop) on the outgoing table as a lifecycle safety net, so if a
+ * krpc bring-up listener is still up it is torn down THROUGH the still-valid
+ * verbs path now, not orphaned with rr_cqe.done/sc_teardown callbacks pointing
+ * into freed ibcore text.  That svc_rdma_listen_stop() runs here at SIXTH(5),
+ * still strictly before cma_cleanup's FOURTH(3), so it drains against a live CM
+ * core -- the same constraint svc_rdma_uninit relies on.  The subsequent
+ * svc_rdma_uninit's own svc_rdma_listen_stop() is then an idempotent no-op (sl_id
+ * already NULL, registry already empty).
+ *
+ * OWNER-KEYED.  We pass &ibcore_verbs_ops -- the EXACT pointer this module's
+ * svc_rdma_verbs_register() recorded -- so unregister revokes the global ONLY if
+ * THIS module is the registered owner.  On GENERIC-OFED the in-kernel provider
+ * owns the global and a duplicate kldload'd ibcore.ko was EBUSY'd at register;
+ * that module's unload calls here with ITS OWN &ibcore_verbs_ops, which does not
+ * match the in-kernel owner, so it is a no-op and cannot tear down the live
+ * in-kernel listener.
+ *
+ * THIS MUST STAY > svc_rdma_uninit's SI_ORDER_FIFTH (so it runs before it) and,
+ * transitively, > cma_cleanup's SI_ORDER_FOURTH; lowering it would let the
+ * listener teardown (or the CM core) go away before the krpc consumer is cut
+ * off, reintroducing exactly the dangling-callback hazard this ordering closes.
+ */
+static void
+svc_rdma_verbs_unregister(void *arg __unused)
+{
+
+	svc_rdma_unregister_verbs(&ibcore_verbs_ops);
+}
+SYSUNINIT(svc_rdma_verbs_unregister, SI_SUB_OFED_MODINIT, SI_ORDER_SIXTH,
+    svc_rdma_verbs_unregister, NULL);
