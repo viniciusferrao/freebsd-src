@@ -117,6 +117,11 @@
  * here.  It is a fixed local constant, never peer-derived.
  */
 #define	SVC_RDMA_INLINE		4096
+/* Conservative RPC-over-RDMA v1 reply inline limit: the client posts recv
+ * buffers of ~1KB for replies (no in-protocol inline negotiation in v1), so an
+ * inline reply larger than this overflows the client recv buffer and is NAKd
+ * REM_INV_REQ.  Larger replies must use the client-offered reply chunk. */
+#define	SVC_RDMA_REPLY_INLINE	1024
 
 /*
  * RFC 8166 (RPC-over-RDMA version 1) transport-header constants, identical to
@@ -609,7 +614,7 @@ svc_rdma_xprt_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 	 * buffer); the verbs layer's reply_chunk also returns EMSGSIZE if the reply
 	 * exceeds the offered chunk, which we treat as the same drop.
 	 */
-	if (total > SVC_RDMA_INLINE) {
+	if (total > SVC_RDMA_REPLY_INLINE) {
 		if (have_reply_chunk) {
 			/*
 			 * Linearize the marshalled ONC RPC reply ALONE (no RFC 8166
