@@ -560,6 +560,7 @@ struct svc_rdma_conn {
 	int			 sc_nsend;
 	struct svc_rdma_mr	*sc_mr;		/* sc_nmr FRWR pool (3f-2) */
 	int			 sc_nmr;
+	void			*sc_selftest_buf; /* private FRWR self-test buffer */
 	u32			 sc_mr_pages;	/* per-MR page cap (device-bounded) */
 	struct mtx		 sc_lock;
 	enum {
@@ -1404,14 +1405,18 @@ svc_rdma_wc_recv(struct ib_cq *cq, struct ib_wc *wc)
 	bool ready;
 
 	/*
-	 * Invariant guard (review N2): this handler -- and the lockless-decrement
-	 * quiescence dance on sc_reposts/sc_sends/sc_upcalls it drives -- is
-	 * correct ONLY because the CQ is polled from a single workqueue thread
-	 * (IB_POLL_WORKQUEUE), so completions for one conn are serialized and the
-	 * teardown can wait them out.  If a future change allocated the CQ with
-	 * IB_POLL_DIRECT/SOFTIRQ this serialization would vanish and reopen a
-	 * completion-vs-teardown UAF; assert the context so that mistake trips
-	 * INVARIANTS here instead of failing silently.
+	 * Invariant guard (review N2): this handler -- and the sc_lock-protected
+	 * quiescence counters sc_reposts/sc_sends/sc_upcalls it drives -- relies on
+	 * IB_POLL_WORKQUEUE for its completion model.  Each CQ is polled by its own
+	 * workqueue work item, and a work_struct cannot run concurrently with itself,
+	 * so completions ON ONE CQ are serialized (the send CQ and recv CQ are
+	 * distinct work items and MAY run concurrently on two CPUs; the counters are
+	 * therefore maintained under sc_lock, and the teardown waits them out under
+	 * sc_lock -- it is sc_lock, not a single per-conn thread, that serializes the
+	 * counter updates).  If a future change allocated the CQ with
+	 * IB_POLL_DIRECT/SOFTIRQ the completion would run in an unexpected context and
+	 * reopen a completion-vs-teardown hazard; assert the context so that mistake
+	 * trips INVARIANTS here instead of failing silently.
 	 */
 	MPASS(cq->poll_ctx == IB_POLL_WORKQUEUE);
 
@@ -1962,10 +1967,10 @@ svc_rdma_read_start(struct svc_rdma_conn *conn, struct svc_rdma_recv *rr,
  * guard, a separate concern this routine merely clears defensively).  So the two
  * legitimate reclaimers -- the first read completion (success or assemble-alloc
  * drop), and the drained teardown (svc_rdma_conn_free_verbs) -- can each call this
- * and the SECOND is a harmless no-op (all tokens already cleared/NULL).  Callable
- * under sc_lock (it only ib_dma_unmap_single / free, neither sleeps); the read
- * completion calls it WITHOUT the lock, the teardown without the lock after the
- * drain.
+ * and the SECOND is a harmless no-op (all tokens already cleared/NULL).  Call it
+ * WITHOUT sc_lock held: it calls ib_dma_unmap_single, which takes DMA_PRIV_LOCK
+ * (so it is not lock-free), though it never sleeps.  All callers comply -- the
+ * read completion and the drained teardown both drop sc_lock before calling.
  *
  * The DMA / read-vs-teardown rule: the server buffer's DMA mapping MUST stay live
  * until the device is done writing into it (the read completion) or the QP is
@@ -2034,12 +2039,15 @@ svc_rdma_read_free(struct svc_rdma_conn *conn, struct svc_rdma_recv *rr)
  * rr_buf is NOT reposted (the teardown owns it).  This mirrors the recv/send flush
  * handling exactly.
  *
- * Serialization (the true model, documented per the reviewer): per-conn
- * completions are serialized by the single IB_POLL_WORKQUEUE thread; the recv that
- * owns rr_rs is single-owner (never reposted while rs_active); and ib_drain_qp()
- * is FIFO, so every completion this read can ever produce has run before the
- * teardown frees conn/rr.  The rs_active one-shot then makes the >1-completion
- * case safe: exactly one invocation does the work, the rest no-op.
+ * Serialization (the true model): completions on ONE CQ are serialized because a
+ * CQ's IB_POLL_WORKQUEUE work item cannot run concurrently with itself -- and
+ * every completion this RDMA Read can produce lands on the SEND CQ, so they are
+ * serialized with each other (the recv CQ is a separate work item and may run
+ * concurrently, but the recv that owns rr_rs is single-owner: never reposted while
+ * rs_active, so no recv completion races this read's rr_rs).  ib_drain_qp() is
+ * FIFO, so every completion this read can ever produce has run before the teardown
+ * frees conn/rr.  The rs_active one-shot then makes the >1-completion case safe:
+ * exactly one invocation does the work, the rest no-op.
  */
 static void
 svc_rdma_wc_rdma_read(struct ib_cq *cq, struct ib_wc *wc)
@@ -2565,10 +2573,19 @@ svc_rdma_conn_reply_chunk(struct svc_rdma_conn *conn, uint32_t xid,
  * address against live list entries is legal; dereferencing it is not.  Only if ws
  * is still ON the list (and ws_active) do we own it -- remove it, clear ws_active,
  * and proceed to dereference/free it.  A duplicate finds ws already off the list
- * and returns having dereferenced nothing.  Per-conn completions are serialized by
- * the single IB_POLL_WORKQUEUE thread, so the first completion fully frees ws
- * before any duplicate runs -- the list search is the safe membership test across
- * that free.  sc_sends is NOT touched here (decremented once at the post site).
+ * and returns having dereferenced nothing.  Every completion for this write lands
+ * on the SEND CQ, whose IB_POLL_WORKQUEUE work item cannot run concurrently with
+ * itself, so the duplicates are serialized: the first completion fully frees ws
+ * before any duplicate runs, and the list search is the safe membership test
+ * across that free.  ABA safety (a freed ws re-malloc'd at the same address):
+ * duplicate completions arise ONLY from a teardown flush or a partial-post, and
+ * BOTH publish SC_CLOSING (via svc_rdma_conn_close) before any new reply_chunk can
+ * insert a ws -- the SC_UP gate in svc_rdma_conn_reply_chunk then refuses the
+ * insert, so no live ws can occupy the freed address while a stale duplicate is
+ * still pending.  The pure-success path produces exactly one completion (the
+ * unsignaled writes raise none), so there is no duplicate to alias.  If that
+ * SC_UP-gate ordering is ever relaxed, this membership test must be revisited.
+ * sc_sends is NOT touched here (decremented once at the post site).
  *
  * SUCCESS (first completion): the reply has been RDMA-Written into the client's
  * reply chunk and the RDMA_NOMSG header SEND has been transmitted, so the device
@@ -2929,7 +2946,8 @@ svc_rdma_mr_selftest(struct svc_rdma_conn *conn)
 	int i, rc;
 
 	/* No MR pool (degenerate device) -> nothing to self-test. */
-	if (conn->sc_mr == NULL || conn->sc_nmr == 0 || conn->sc_nsend == 0)
+	if (conn->sc_mr == NULL || conn->sc_nmr == 0 ||
+	    conn->sc_selftest_buf == NULL)
 		return;
 
 	/*
@@ -2957,19 +2975,16 @@ svc_rdma_mr_selftest(struct svc_rdma_conn *conn)
 	mtx_unlock(&conn->sc_lock);
 
 	/*
-	 * Register one of our own send buffers (a contiguous, server-owned
-	 * SVC_RDMA_INLINE-byte heap allocation -- never stack/pageable) into the
-	 * MR and build its REG_MR WR.  The buffer already carries a DMA_TO_DEVICE
-	 * single-mapping for the send path; the FRWR register helper adds a SECOND,
-	 * INDEPENDENT bus_dma mapping (its own scatterlist + dma_map handle) just
-	 * for this MR, torn down on the LOCAL_INV completion.  Two mappings of one
-	 * stable KVA region are valid bus_dma usage; this is a no-data register/
-	 * invalidate (the self-test transfers nothing), and the self-test runs once
-	 * at establish while no reply send is using sc_send[0], so the two mappings
-	 * never describe a live concurrent transfer.  On failure release the slot
-	 * and drop the send barrier.
+	 * Register our PRIVATE self-test buffer (sc_selftest_buf: a contiguous,
+	 * server-owned SVC_RDMA_INLINE-byte heap allocation -- never stack/pageable,
+	 * never a send-pool buffer) into the MR and build its REG_MR WR.  This buffer
+	 * is owned solely by the self-test, so the FRWR register helper's bus_dma
+	 * mapping is the ONLY mapping of this KVA: no aliasing with any concurrent
+	 * reply SEND.  This is a no-data register/invalidate (the self-test transfers
+	 * nothing); the mapping is torn down on the LOCAL_INV completion or by the
+	 * drained teardown.  On failure release the slot and drop the send barrier.
 	 */
-	rc = svc_rdma_mr_reg(conn, sm, conn->sc_send[0].ss_buf, SVC_RDMA_INLINE,
+	rc = svc_rdma_mr_reg(conn, sm, conn->sc_selftest_buf, SVC_RDMA_INLINE,
 	    IB_ACCESS_LOCAL_WRITE, &rkey);
 	if (rc != 0) {
 		mtx_lock(&conn->sc_lock);
@@ -3580,6 +3595,17 @@ svc_rdma_conn_free_verbs(struct svc_rdma_conn *conn)
 		conn->sc_nmr = 0;
 	}
 
+	/*
+	 * Free the private self-test buffer AFTER the MR pool above: the FRWR
+	 * self-test's sg mapping over this buffer (left live for the drained
+	 * teardown in the partial-post case) is dropped by svc_rdma_mr_unmap() in
+	 * the sc_mr block, so by here no MR mapping references it.
+	 */
+	if (conn->sc_selftest_buf != NULL) {
+		free(conn->sc_selftest_buf, M_NFSRDMA);
+		conn->sc_selftest_buf = NULL;
+	}
+
 	if (conn->sc_pd != NULL) {
 		ib_dealloc_pd(conn->sc_pd);
 		conn->sc_pd = NULL;
@@ -4012,6 +4038,17 @@ svc_rdma_accept(struct rdma_cm_id *id)
 		}
 		ss->ss_mapped = true;
 	}
+
+	/*
+	 * Private FRWR self-test buffer (TASK_003f-2 hardening).  The establish-
+	 * time MR self-test registers a server buffer; it must NOT alias a live
+	 * send-pool buffer (a first reply could claim sc_send[0] and post a
+	 * DMA_TO_DEVICE SEND concurrently with the self-test's independent map of
+	 * the same KVA -- two oppositely-directioned mappings of one buffer).  This
+	 * dedicated buffer is owned solely by the self-test, mapped only by it, and
+	 * freed in svc_rdma_conn_free_verbs after the QP is drained.
+	 */
+	conn->sc_selftest_buf = malloc(SVC_RDMA_INLINE, M_NFSRDMA, M_WAITOK);
 
 	/*
 	 * Allocate the FRWR memory-registration pool (TASK_003f-2), the per-conn
