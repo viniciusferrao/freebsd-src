@@ -1,0 +1,223 @@
+/* SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause */
+/*
+ * Copyright (c) 2014-2017 Oracle.  All rights reserved.
+ * Copyright (c) 2003-2007 Network Appliance, Inc. All rights reserved.
+ *
+ * This software is available to you under a choice of one of two
+ * licenses.  You may choose to be licensed under the terms of the GNU
+ * General Public License (GPL) Version 2, available from the file
+ * COPYING in the main directory of this source tree, or the BSD-type
+ * license below:
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ *
+ *      Redistributions of source code must retain the above copyright
+ *      notice, this list of conditions and the following disclaimer.
+ *
+ *      Redistributions in binary form must reproduce the above
+ *      copyright notice, this list of conditions and the following
+ *      disclaimer in the documentation and/or other materials provided
+ *      with the distribution.
+ *
+ *      Neither the name of the Network Appliance, Inc. nor the names of
+ *      its contributors may be used to endorse or promote products
+ *      derived from this software without specific prior written
+ *      permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+ * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+ * OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+ * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
+/*
+ * svc_rdma.h -- consumer upcall interface for the NFS-over-RDMA server verbs
+ * layer (svc_verbs.c, in the ibcore module).
+ *
+ * TASK_003e-1 scope: decouple the verbs layer from the RPC policy.  svc_verbs.c
+ * owns the RDMA-CM listener, the per-connection QP/CQ/PD, the recv/send buffer
+ * pools, and the drained-teardown lifecycle.  It does NOT know anything about
+ * krpc/SVCXPRT/nfsd.  A consumer (TASK_003e-2's krpc SVCXPRT in
+ * sys/rpc/svc_rdma.c) registers a struct svc_rdma_ops upcall table plus an
+ * opaque ctx with svc_rdma_listen_start_ops(); the verbs layer then calls back
+ * into the consumer at the three lifecycle points (newconn / recv / disconnect)
+ * and exposes svc_rdma_conn_send() so the consumer can post a marshalled reply.
+ *
+ * Module layering (docs/16-svcxprt-rdma-integration.md "Module layering"): the
+ * verbs live in the ibcore module; the SVCXPRT/xp_ops live in the krpc layer
+ * built into the kernel.  A kernel built-in cannot hard-link a loadable module's
+ * symbols, so the consumer does NOT call these entry points directly at link
+ * time -- ibcore registers this ops surface with krpc at module load and krpc
+ * invokes it through function pointers.  This header is the shared contract for
+ * that registration; it declares only what a consumer needs and keeps every
+ * verbs-internal detail (recv/send descriptors, the registry, the barriers)
+ * private to svc_verbs.c.
+ *
+ * NOTE: the additive sysctl self-test in svc_verbs.c uses an internal DEFAULT
+ * ops table (accept -> parse -> stub reply -> teardown) and does not go through
+ * this header.  These declarations exist for the external consumer.
+ */
+
+#ifndef _RDMA_SVC_RDMA_H
+#define _RDMA_SVC_RDMA_H
+
+#include <sys/types.h>
+
+/*
+ * Opaque per-accepted-connection handle.  The concrete struct svc_rdma_conn is
+ * defined privately in svc_verbs.c (it carries the cm_id, QP/CQ/PD, buffer
+ * pools, state machine, and registry linkage).  A consumer only ever holds the
+ * pointer the verbs layer hands it in the upcalls below and passes it back to
+ * svc_rdma_conn_send() / svc_rdma_conn_set_ctx().  Its lifetime is bounded by
+ * the sro_newconn .. sro_disconnect upcall pair (see the ops contract below).
+ */
+struct svc_rdma_conn;
+
+/*
+ * A parsed inline RPC-over-RDMA v1 (RFC 8166) call, handed to the consumer's
+ * sro_recv upcall.  This mirrors the verbs-internal definition in svc_verbs.c
+ * (which stays authoritative); it exposes exactly what a consumer needs to
+ * dispatch the call:
+ *   xid     - word0, the echoed opaque transaction id (the only field a stub
+ *             reply needs).
+ *   credit  - word2, the peer's offered flow-control credit.
+ *   rpc     - pointer to the inline ONC RPC payload (recv buffer + 28-byte
+ *             RFC 8166 header).  NO COPY: this points directly into the verbs
+ *             layer's recv buffer and is valid ONLY for the duration of the
+ *             sro_recv call (see the lifetime rule below).
+ *   rpc_len - length in bytes of the inline RPC payload (may be 0).
+ */
+struct svc_rdma_msg {
+	uint32_t	 xid;		/* word0, echoed opaque */
+	uint32_t	 credit;	/* word2, flow control */
+	const void	*rpc;		/* inline RPC payload (buf + 28) */
+	uint32_t	 rpc_len;	/* payload length */
+};
+
+/*
+ * Consumer upcall table.  ctx is the opaque value the consumer passed to
+ * svc_rdma_listen_start_ops(); it is handed back to every upcall so the
+ * consumer can recover its listener-scoped state (e.g. the SVCPOOL).  All three
+ * upcalls run in the verbs layer's own contexts; the consumer MUST honor the
+ * context rules:
+ *
+ *   sro_newconn(ctx, conn)
+ *       Called exactly once per accepted connection, from the ESTABLISHED CM
+ *       event handler (the rdma_cm work context, which is sleepable), and ALWAYS
+ *       BEFORE any sro_recv is dispatched for that connection.  The consumer
+ *       attaches its per-conn state via svc_rdma_conn_set_ctx() here, and -- since
+ *       this runs in a sleepable context -- MAY do blocking setup such as
+ *       xprt_register / SVCXPRT allocation inline; an M_WAITOK allocation is
+ *       acceptable.  MUST NOT call back into the verbs layer destroy path.  This
+ *       is the start of conn's lifetime as seen by the consumer.
+ *
+ *       Ordering vs. recv: receive buffers are posted before the connection is
+ *       accepted, so the peer's first inline call can complete and reach the
+ *       verbs layer BEFORE this ESTABLISHED event.  The verbs layer does NOT
+ *       dispatch sro_recv for such an early call -- it drops it and reposts the
+ *       buffer; the RC client retransmits the RPC, and a later recv is dispatched
+ *       once this sro_newconn has completed and the connection is up.  So the
+ *       consumer never sees an sro_recv before sro_newconn has returned; the only
+ *       visible effect of the race is a one-retransmit delay on the very first op.
+ *
+ *   sro_recv(ctx, conn, msg)  -> 0 to continue, nonzero to drop+close
+ *       Called once per successfully-parsed inline RDMA_MSG call, from the recv
+ *       completion (IB_POLL_WORKQUEUE context).  *** MUST NOT SLEEP. ***  It is
+ *       GUARANTEED that sro_newconn for this conn has already completed before
+ *       the first sro_recv, so svc_rdma_conn_get_ctx() returns the state that
+ *       sro_newconn attached.  The krpc consumer enqueues the message and calls
+ *       xprt_active() -- it does NOT block a pool thread here.  msg (and
+ *       msg->rpc) are valid ONLY for the duration of this call; the underlying
+ *       recv buffer is reposted to the QP as soon as sro_recv returns, so a
+ *       consumer that needs the bytes past the call MUST copy them (e.g. into an
+ *       mbuf chain) before returning.  The consumer MAY call svc_rdma_conn_send()
+ *       synchronously from within sro_recv (the stub does); that is supported in
+ *       this context.  Returning nonzero asks the verbs layer to close the
+ *       connection (the consumer rejected the call); returning 0 lets the verbs
+ *       layer repost and await the next call.
+ *
+ *   sro_disconnect(ctx, conn)
+ *       Delivered EXACTLY ONCE, and PAIRED with sro_newconn: it fires if and only
+ *       if sro_newconn fired for this conn (a connection that never reached
+ *       ESTABLISHED gets neither).  Runs from the deferred teardown task
+ *       (taskqueue_thread, a sleepable context) -- NOT from a completion or the
+ *       CM callback.
+ *
+ *       It is delivered ONLY AFTER all sro_recv upcalls for this conn (and the
+ *       sro_newconn) have returned: the verbs layer drains its in-flight consumer
+ *       upcalls before calling sro_disconnect, so no sro_recv can be running
+ *       concurrently.  The consumer may therefore safely tear down and FREE its
+ *       per-conn state here (e.g. xprt_unregister and release its SVCXPRT
+ *       reference, and free whatever it attached with svc_rdma_conn_set_ctx()).
+ *       After this returns the verbs layer finishes draining the QP and frees
+ *       conn; the consumer MUST NOT touch conn (or call svc_rdma_conn_send() on
+ *       it) afterward.
+ */
+struct svc_rdma_ops {
+	void	(*sro_newconn)(void *ctx, struct svc_rdma_conn *conn);
+	int	(*sro_recv)(void *ctx, struct svc_rdma_conn *conn,
+		    const struct svc_rdma_msg *msg);
+	void	(*sro_disconnect)(void *ctx, struct svc_rdma_conn *conn);
+};
+
+/*
+ * Start the passive RDMA-CM listener on the wildcard address and the given
+ * (host-order) port, driving the supplied consumer ops with the supplied ctx.
+ * ops and ctx are stored on the listener and copied onto each accepted
+ * connection at accept time, so every completion/teardown can reach them.
+ *
+ * Returns 0 on success or a positive FreeBSD errno on failure (EINVAL for a
+ * zero port or NULL ops, EBUSY if a listener is already up, or the normalized
+ * errno from the rdma_*() bring-up).  ops MUST outlive the listener (it is a
+ * function-pointer table the consumer owns; typically a static const in the
+ * krpc module), as MUST ctx until svc_rdma_listen_stop() has returned.
+ */
+int	svc_rdma_listen_start_ops(uint16_t port, const struct svc_rdma_ops *ops,
+	    void *ctx);
+
+/*
+ * Attach consumer per-connection state to conn.  Intended to be called from
+ * sro_newconn (or from within sro_recv).  The verbs layer stores the pointer
+ * opaquely and does not interpret or free it; the consumer reclaims it from
+ * sro_disconnect.  Safe to call from the upcall contexts above.
+ */
+void	svc_rdma_conn_set_ctx(struct svc_rdma_conn *conn, void *cctx);
+
+/*
+ * Retrieve the consumer per-connection state previously set with
+ * svc_rdma_conn_set_ctx() (NULL if never set).  Convenience for the consumer's
+ * own upcalls.
+ */
+void	*svc_rdma_conn_get_ctx(struct svc_rdma_conn *conn);
+
+/*
+ * Marshal-and-post an inline reply on conn: copy len bytes from buf into a free
+ * send buffer from the connection's bounded pool and post a SEND WR for them.
+ * buf is a caller-owned, already-marshalled RPC-over-RDMA reply (transport
+ * header + ONC RPC body); the verbs layer copies it (no ownership transfer) and
+ * the caller may free/reuse buf as soon as this returns.
+ *
+ * Context: safe to call from sro_recv (the recv completion / workqueue context)
+ * -- it does NOT sleep.  It is gated by the connection still being up and by the
+ * bounded send pool: if the connection is tearing down or the pool is exhausted
+ * the reply is dropped (this is not an error the caller must recover from -- the
+ * peer will retransmit / the conn is going away).
+ *
+ * Returns 0 if the SEND WR was posted, EINVAL if len exceeds the inline reply
+ * capacity, EBUSY if the pool was exhausted, ENOTCONN if the connection is no
+ * longer up, or the posted error otherwise.  MUST NOT be called after
+ * sro_disconnect for this conn has returned.
+ */
+int	svc_rdma_conn_send(struct svc_rdma_conn *conn, const void *buf,
+	    uint32_t len);
+
+#endif	/* _RDMA_SVC_RDMA_H */
