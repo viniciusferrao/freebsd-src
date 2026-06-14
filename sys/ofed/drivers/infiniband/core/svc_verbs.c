@@ -61,6 +61,25 @@
  * send path, SVCXPRT/nfsd dispatch, and RDMA Read/Write chunks all arrive in
  * later increments (3c..3f).  We do NOT touch any peer-supplied byte beyond
  * logging wc->byte_len here.
+ *
+ * TASK_003 (3f-2) scope (this increment): the FRWR (Fast Registration Work
+ * Request) memory-registration SUBSTRATE that the RDMA Read (3f-3) and RDMA
+ * Write (3f-4) data engines will build on.  Each accepted connection gains a
+ * small bounded pool of fast-registration memory regions (ib_alloc_mr with
+ * IB_MR_TYPE_MEM_REG); a register helper maps a SERVER-allocated buffer's
+ * scatter/gather list into an MR (ib_map_mr_sg), rotates the registration key
+ * (ib_update_fast_reg_key), and builds an IB_WR_REG_MR work request whose rkey/
+ * lkey the caller (3f-3/3f-4) will use as the local MR for an RDMA Read/Write.
+ * A tiny accept-time self-test posts REG_MR + LOCAL_INV (chained, one signaled
+ * completion) over one of the server's own buffers to prove the registration/
+ * invalidation completion path end-to-end; that single completion is accounted
+ * in the EXISTING send-side quiescence barrier (sc_sends) so the drained
+ * teardown waits it out before ib_drain_qp()/ib_dereg_mr().  NO RDMA Read/Write
+ * (IB_WR_RDMA_READ/WRITE) and NO peer-chunk consumption here -- only the
+ * registration substrate and its per-connection lifecycle.  The MR pool's
+ * lifetime mirrors the recv/send buffer pools EXACTLY: allocated at accept,
+ * deregistered in the drained teardown after ib_drain_qp() so no completion can
+ * race the free.
  */
 
 #include <linux/errno.h>
@@ -68,6 +87,7 @@
 #include <linux/module.h>	/* SI_SUB_OFED_MODINIT */
 #include <linux/netdevice.h>	/* init_net */
 #include <linux/dma-mapping.h>	/* DMA_FROM_DEVICE */
+#include <linux/scatterlist.h>	/* sg_init_one for the FRWR map (TASK_003f-2) */
 #include <rdma/rdma_cm.h>
 #include <rdma/ib_verbs.h>
 #include <rdma/svc_rdma.h>	/* consumer upcall interface (TASK_003e-1) */
@@ -154,6 +174,31 @@ MALLOC_DEFINE(M_NFSRDMA, "nfsrdma", "NFS over RDMA server");
 #define	SVC_RDMA_INLINE		4096
 #define	SVC_RDMA_RECV_DEPTH	8
 #define	SVC_RDMA_SEND_DEPTH	SVC_RDMA_RECV_DEPTH
+
+/*
+ * FRWR memory-registration pool sizing (TASK_003f-2).
+ *
+ * SVC_RDMA_MR_DEPTH is how many fast-registration MRs we pre-allocate per
+ * connection.  It is SVC_RDMA_MAX_CHUNKS (the RFC 8166 chunk cap from 3f-1, in
+ * <rdma/svc_rdma.h>): the data engine (3f-3/3f-4) registers at most one MR per
+ * chunk it serves concurrently, and the parser already rejects any request that
+ * declares more than SVC_RDMA_MAX_CHUNKS chunks, so this depth can never be
+ * outrun by a (validated) peer request.  It is a fixed LOCAL constant, never a
+ * peer-supplied count.
+ *
+ * SVC_RDMA_MR_PAGES is the maximum number of device pages a single MR can map
+ * (the max_num_sg passed to ib_alloc_mr).  It bounds the page-list length so a
+ * future multi-page server buffer registers within one MR.  It is clamped DOWN
+ * at accept time to the device-reported dev->attrs.max_fast_reg_page_list_len
+ * (the per-MR fast-reg page-list cap), so the MR is never asked to hold more
+ * pages than the HCA supports.  Today the only buffer we register is the
+ * SVC_RDMA_INLINE-byte (one-page) self-test buffer, so one page would suffice;
+ * we size for a small multi-page window now so 3f-3/3f-4 need not resize the
+ * pool.  Like every other size here it is a fixed local constant, NOT a
+ * peer-driven length (3f-2 registers only server-allocated buffers).
+ */
+#define	SVC_RDMA_MR_DEPTH	SVC_RDMA_MAX_CHUNKS
+#define	SVC_RDMA_MR_PAGES	256
 
 /*
  * Size of the inline RPC-over-RDMA v1 reply we marshal in 3d.  It is a fixed
@@ -265,6 +310,48 @@ struct svc_rdma_send {
 };
 
 /*
+ * One fast-registration memory region from the per-connection FRWR pool
+ * (TASK_003f-2).  This is the local MR the RDMA Read (3f-3) / RDMA Write (3f-4)
+ * engines will fast-register over a SERVER buffer's scatter/gather list and use
+ * as the lkey/rkey of the data transfer, then invalidate.
+ *
+ * sm_mr is the kernel fast-reg MR (ib_alloc_mr(IB_MR_TYPE_MEM_REG, max_pages));
+ * its lifetime is the exact mirror of a recv/send buffer's: created at accept
+ * time and ib_dereg_mr()'d in the drained teardown AFTER ib_drain_qp(), so no
+ * REG_MR/LOCAL_INV completion can race the free.
+ *
+ * sm_cqe.done is the completion callback the CQ core dispatches for a REG_MR/
+ * LOCAL_INV WR posted with this descriptor; sm_regwr.wr.wr_cqe / sm_invwr.wr_cqe
+ * alias &sm_cqe so a completion lands in svc_rdma_wc_reg() with this sm_* in hand
+ * via container_of().  sm_regwr is the prebuilt IB_WR_REG_MR work request the
+ * register helper fills; sm_invwr is the IB_WR_LOCAL_INV that invalidates the
+ * same MR (the FRWR reg+inv pair).
+ *
+ * sm_sg is a ONE-entry scatterlist describing the (contiguous, server-allocated)
+ * buffer being registered; ib_map_mr_sg() turns it into the MR's page vector.
+ * sm_sg_mapped tracks whether sm_sg currently holds a live ib_dma_map_sg()
+ * mapping -- the MR-vs-DMA lifetime token: the DMA mapping that ib_map_mr_sg()
+ * consumed MUST stay mapped until the MR is invalidated (LOCAL_INV completes) or
+ * the connection is torn down, and is unmapped exactly once (on the LOCAL_INV
+ * completion that releases the slot, or in the drained teardown for a slot still
+ * mapped at close).  sm_inuse, under sc_lock, makes the pool a bounded free-list
+ * exactly like ss_inuse.  sm_key is the rolling registration-key nibble
+ * ib_update_fast_reg_key() rotates on every (re)registration so a stale rkey can
+ * never be reused.
+ */
+struct svc_rdma_mr {
+	struct ib_cqe		 sm_cqe;
+	struct svc_rdma_conn	*sm_conn;
+	struct ib_mr		*sm_mr;		/* fast-reg MR (max sm_pages) */
+	struct scatterlist	 sm_sg[1];	/* one contiguous server buffer */
+	bool			 sm_sg_mapped;	/* sm_sg holds a live DMA map */
+	bool			 sm_inuse;	/* reserved from the pool (sc_lock) */
+	u8			 sm_key;	/* rolling fast-reg key nibble */
+	struct ib_reg_wr	 sm_regwr;	/* prebuilt IB_WR_REG_MR */
+	struct ib_send_wr	 sm_invwr;	/* prebuilt IB_WR_LOCAL_INV */
+};
+
+/*
  * Per-accepted-connection state.  id->context points here for the child cm_id
  * (the listener's own id keeps context == &svc_rdma_listener), which is how the
  * shared CM handler tells a connection event from a listener event.
@@ -288,6 +375,11 @@ struct svc_rdma_send {
  * waits for sc_sends == 0 in the SAME barrier that waits for sc_reposts == 0,
  * BEFORE ib_drain_qp(), so no late SEND WR can be posted behind the SQ drain
  * sentinel -- the identical post-after-drain UAF barrier applied to the SQ.
+ * The FRWR self-test (3f-2) posts its REG_MR+LOCAL_INV chain through the EXACT
+ * same sc_sends arm (svc_rdma_mr_selftest increments sc_sends under SC_UP and
+ * decrements after ib_post_send), so those SQ WRs are drained by this same
+ * barrier before ib_drain_qp()/ib_dereg_mr() -- no separate accounting, no new
+ * completion-vs-teardown race.
  *
  * sc_upcalls (TASK_003e-1) extends that quiescence pattern to the CONSUMER
  * upcalls: it counts in-flight sro_newconn + sro_recv calls (incremented under
@@ -312,6 +404,9 @@ struct svc_rdma_conn {
 	int			 sc_nrecv;
 	struct svc_rdma_send	*sc_send;	/* sc_nsend-element pool (3d) */
 	int			 sc_nsend;
+	struct svc_rdma_mr	*sc_mr;		/* sc_nmr FRWR pool (3f-2) */
+	int			 sc_nmr;
+	u32			 sc_mr_pages;	/* per-MR page cap (device-bounded) */
 	struct mtx		 sc_lock;
 	enum {
 		SC_CONNECTING = 0,
@@ -435,6 +530,11 @@ static int svc_rdma_parse_header(const void *buf, uint32_t len,
 static void svc_rdma_wc_recv(struct ib_cq *cq, struct ib_wc *wc);
 static void svc_rdma_reply(struct svc_rdma_conn *conn, uint32_t xid);
 static void svc_rdma_wc_send(struct ib_cq *cq, struct ib_wc *wc);
+static int svc_rdma_mr_reg(struct svc_rdma_conn *conn, struct svc_rdma_mr *sm,
+    void *buf, uint32_t len, int access, uint32_t *rkeyp);
+static void svc_rdma_mr_unmap(struct svc_rdma_conn *conn, struct svc_rdma_mr *sm);
+static void svc_rdma_wc_reg(struct ib_cq *cq, struct ib_wc *wc);
+static void svc_rdma_mr_selftest(struct svc_rdma_conn *conn);
 
 /*
  * Default consumer ops (TASK_003e-1) -- the in-tree self-test policy that
@@ -571,6 +671,22 @@ svc_rdma_cm_event_handler(struct rdma_cm_id *id, struct rdma_cm_event *event)
 				if (--conn->sc_upcalls == 0)
 					wakeup(&conn->sc_upcalls);
 				mtx_unlock(&conn->sc_lock);
+
+				/*
+				 * FRWR substrate self-test (TASK_003f-2).  Now
+				 * that the conn is SC_UP, exercise the register/
+				 * invalidate completion path once: post REG_MR +
+				 * LOCAL_INV over a server buffer and let the
+				 * send-side barrier (sc_sends) drain the single
+				 * completion at teardown.  Only the SC_UP winner
+				 * runs it, so it fires exactly once per conn.  It
+				 * proves the 3f-3/3f-4 posting path works against
+				 * the EXISTING teardown discipline without adding a
+				 * new completion-vs-teardown race.  Run with the
+				 * lock dropped (it claims sc_lock briefly itself);
+				 * a failure only logs / closes via the shared path.
+				 */
+				svc_rdma_mr_selftest(conn);
 			}
 			if (ppsratecheck(&svc_rdma_log_last,
 			    &svc_rdma_log_pps, 5))
@@ -1342,6 +1458,365 @@ repost:
 }
 
 /*
+ * ===========================================================================
+ * FRWR memory-registration substrate (TASK_003f-2).
+ *
+ * This is ONLY the registration plumbing the RDMA Read (3f-3) and RDMA Write
+ * (3f-4) engines will sit on top of: a per-connection pool of fast-registration
+ * MRs, a helper that fast-registers a SERVER buffer into one of them, a helper
+ * that releases the MR's DMA mapping, and the completion handler for the REG_MR/
+ * LOCAL_INV WRs.  NO RDMA Read/Write is posted here, and NO peer-supplied chunk
+ * drives any of it -- the only buffer registered in 3f-2 is a server-allocated
+ * one in the accept-time self-test below.
+ *
+ * The MR-vs-DMA lifetime rule (the #1 review hazard) is enforced as follows:
+ *   - the MR is created at accept time and ib_dereg_mr()'d ONLY in the drained
+ *     teardown, after ib_drain_qp(), so no REG_MR/LOCAL_INV completion can fire
+ *     against a freed MR;
+ *   - the scatterlist ib_map_mr_sg() consumes is ib_dma_map_sg()'d in the
+ *     register helper and stays mapped until the MR is invalidated (the LOCAL_INV
+ *     completion) or the connection is torn down -- it is NEVER unmapped while
+ *     the MR could still be accessed; the teardown unmaps any slot still mapped
+ *     at close;
+ *   - the registration key is rotated (ib_update_fast_reg_key) on every
+ *     (re)registration, so a stale rkey can never be reused.
+ * ===========================================================================
+ */
+
+/*
+ * Fast-register a SERVER buffer into one of this connection's pre-allocated MRs
+ * and BUILD (but do NOT post) the IB_WR_REG_MR work request for it.  Posting is
+ * the CALLER's job (the 3f-3/3f-4 data engine, or the self-test below), so that
+ * the WR can be chained ahead of the RDMA Read/Write it gates on the same SQ.
+ *
+ * buf/len describe a contiguous, kernel-heap (never stack/pageable), SERVER-
+ * allocated buffer -- in 3f-2 one of the connection's own send buffers.  len is
+ * a fixed local size, NOT a peer-supplied length.  access is the MR access mask
+ * the caller needs (IB_ACCESS_LOCAL_WRITE for a Read-target/Write-source, plus
+ * IB_ACCESS_REMOTE_* if the rkey is to be handed to the peer -- the self-test
+ * uses LOCAL_WRITE only, as a local MR is all the substrate needs to prove).
+ *
+ * Steps (the canonical FreeBSD FRWR sequence, verified against the in-tree KPI):
+ *   1. describe buf as a one-entry scatterlist (sg_init_one);
+ *   2. ib_dma_map_sg() it for the device -- this populates sg_dma_address/
+ *      sg_dma_len that ib_map_mr_sg() reads.  The mapping MUST outlive the MR's
+ *      registration; sm_sg_mapped records it so the unmap is paired exactly once
+ *      (on invalidation or in teardown);
+ *   3. ib_map_mr_sg() builds the MR's page vector from the mapped sg at
+ *      PAGE_SIZE granularity; it returns the number of sg entries mapped.  We
+ *      require it to map our single entry whole -- a short map means the buffer
+ *      needed more pages than the MR holds (it cannot here: len <= the
+ *      device-bounded page cap), which we treat as an error rather than
+ *      registering a truncated region;
+ *   4. rotate the registration key (ib_update_fast_reg_key) so the rkey/lkey are
+ *      fresh -- no stale-rkey reuse;
+ *   5. fill the prebuilt ib_reg_wr {opcode IB_WR_REG_MR, mr, key, access}.
+ * On success *rkeyp is the fresh rkey (== lkey for a fast-reg MR) the caller will
+ * cite in its RDMA Read/Write, and sm->sm_regwr is ready to post.  On any failure
+ * the DMA mapping is undone here (so the caller need not) and a positive errno is
+ * returned.
+ *
+ * Context: callable from the recv completion / a sleepable setup path; it does
+ * not sleep (ib_dma_map_sg / ib_map_mr_sg do not) and takes no lock -- the caller
+ * owns sm (claimed from the pool under sc_lock) for the duration.
+ */
+static int
+svc_rdma_mr_reg(struct svc_rdma_conn *conn, struct svc_rdma_mr *sm,
+    void *buf, uint32_t len, int access, uint32_t *rkeyp)
+{
+	struct ib_device *dev = conn->sc_id->device;
+	int n;
+
+	/*
+	 * A server buffer must fit the MR's page vector.  sc_mr_pages was clamped
+	 * to the device's fast-reg page-list cap at accept time, so this is a
+	 * fixed local bound, not a peer length.  howmany() rounds up to whole
+	 * pages (the first page may carry an offset; ib_map_mr_sg handles that).
+	 */
+	if (len == 0 || howmany(len, PAGE_SIZE) > conn->sc_mr_pages)
+		return (EINVAL);
+
+	/* (1) one-entry scatterlist over the contiguous server buffer. */
+	sg_init_one(sm->sm_sg, buf, len);
+
+	/*
+	 * (2) DMA-map the sg for the device.  DMA_BIDIRECTIONAL is the safe choice
+	 * for a substrate MR that a later increment may use as either an RDMA Read
+	 * sink (device writes) or an RDMA Write source (device reads); the self-
+	 * test here only registers and invalidates, touching no data.  Record the
+	 * live mapping so it is unmapped exactly once.
+	 */
+	n = ib_dma_map_sg(dev, sm->sm_sg, 1, DMA_BIDIRECTIONAL);
+	if (n != 1) {
+		if (ppsratecheck(&svc_rdma_log_last, &svc_rdma_log_pps, 5))
+			printf("nfsrdma: ib_dma_map_sg (FRWR) failed\n");
+		return (EIO);
+	}
+	sm->sm_sg_mapped = true;
+
+	/*
+	 * (3) Build the MR page vector from the mapped sg.  Require the whole
+	 * single entry to map; ib_map_mr_sg returns the count mapped (or a
+	 * negative errno).  A partial/failed map leaves the MR unusable -- undo
+	 * the DMA mapping and fail.
+	 */
+	n = ib_map_mr_sg(sm->sm_mr, sm->sm_sg, 1, NULL, PAGE_SIZE);
+	if (n != 1) {
+		if (ppsratecheck(&svc_rdma_log_last, &svc_rdma_log_pps, 5))
+			printf("nfsrdma: ib_map_mr_sg mapped %d of 1 sg\n", n);
+		svc_rdma_mr_unmap(conn, sm);
+		return (EIO);
+	}
+
+	/* (4) Rotate the registration key -- never reuse a stale rkey. */
+	ib_update_fast_reg_key(sm->sm_mr, ++sm->sm_key);
+
+	/* (5) Fill the prebuilt IB_WR_REG_MR; the caller posts it. */
+	memset(&sm->sm_regwr, 0, sizeof(sm->sm_regwr));
+	sm->sm_regwr.wr.opcode = IB_WR_REG_MR;
+	sm->sm_regwr.wr.wr_cqe = &sm->sm_cqe;
+	sm->sm_regwr.wr.num_sge = 0;
+	sm->sm_regwr.wr.send_flags = 0;	/* signaling is the caller's choice */
+	sm->sm_regwr.mr = sm->sm_mr;
+	sm->sm_regwr.key = sm->sm_mr->rkey;
+	sm->sm_regwr.access = access;
+
+	if (rkeyp != NULL)
+		*rkeyp = sm->sm_mr->rkey;
+	return (0);
+}
+
+/*
+ * Drop the DMA mapping an svc_rdma_mr_reg() established, exactly once.  Called
+ * either when the MR's LOCAL_INV has completed (the device is done with the MR's
+ * page vector) or from the drained teardown for a slot still mapped at close.
+ * Idempotent via sm_sg_mapped, so a teardown after a normal release is a no-op.
+ * Does NOT touch sm_mr (the MR itself is deregistered in the teardown).
+ */
+static void
+svc_rdma_mr_unmap(struct svc_rdma_conn *conn, struct svc_rdma_mr *sm)
+{
+	struct ib_device *dev;
+
+	if (!sm->sm_sg_mapped)
+		return;
+	dev = (conn->sc_id != NULL) ? conn->sc_id->device : NULL;
+	if (dev != NULL)
+		ib_dma_unmap_sg(dev, sm->sm_sg, 1, DMA_BIDIRECTIONAL);
+	sm->sm_sg_mapped = false;
+}
+
+/*
+ * Completion for a self-test REG_MR+LOCAL_INV chain (TASK_003f-2).  Dispatched by
+ * the CQ core in the SAME IB_POLL_WORKQUEUE context as svc_rdma_wc_send(); keep
+ * it short, take no sleepable lock, start no blocking teardown.  sm_cqe aliases
+ * the wr_cqe of the (signaled) LOCAL_INV WR in the chain, so container_of()
+ * recovers the MR descriptor and sm_conn the owning connection.
+ *
+ * The REG_MR in the chain is posted UNSIGNALED, so the only completion that fires
+ * is for the LOCAL_INV; reaching here means the MR was fast-registered AND
+ * invalidated successfully (or the chain flushed during teardown).  Either way
+ * the device is done with the MR's page vector, so we drop the DMA mapping and
+ * return the slot to the bounded pool.  This is the send-side mirror of
+ * svc_rdma_wc_send(): it does NOT ib_dereg_mr() (the drained teardown does that
+ * exactly once after ib_drain_qp()).
+ *
+ * IB_WC_WR_FLUSH_ERR is the expected status for a chain flushed when the QP
+ * drains during teardown: swallow it silently -- the teardown task unmaps any
+ * still-mapped slot and deregisters every MR, and it does so only AFTER
+ * ib_drain_qp(), so this completion sees a still-live conn.  Any other error is a
+ * real registration fault -> start a deferred teardown.
+ *
+ * The matching sc_sends decrement is done by the POSTING site (svc_rdma_mr_selftest)
+ * right after ib_post_send returns, exactly as svc_rdma_conn_send() decrements its
+ * own sc_sends after posting -- NOT here.  So this handler only reclaims the slot.
+ */
+static void
+svc_rdma_wc_reg(struct ib_cq *cq, struct ib_wc *wc)
+{
+	struct svc_rdma_mr *sm;
+	struct svc_rdma_conn *conn;
+
+	/* Same single-workqueue-thread invariant as the recv/send handlers (N2). */
+	MPASS(cq->poll_ctx == IB_POLL_WORKQUEUE);
+
+	sm = container_of(wc->wr_cqe, struct svc_rdma_mr, sm_cqe);
+	conn = sm->sm_conn;
+
+	if (wc->status != IB_WC_SUCCESS) {
+		if (wc->status != IB_WC_WR_FLUSH_ERR) {
+			if (ppsratecheck(&svc_rdma_log_last,
+			    &svc_rdma_log_pps, 5))
+				printf("nfsrdma: FRWR completion error %u\n",
+				    wc->status);
+			/*
+			 * Leave sm_sg_mapped as-is: the teardown unmaps it (the
+			 * device may still hold the registration on an error that
+			 * did not invalidate).  Do not touch the pool here -- the
+			 * teardown owns the whole pool once it runs.
+			 */
+			svc_rdma_conn_close(conn);
+		}
+		return;
+	}
+
+	if (ppsratecheck(&svc_rdma_log_last, &svc_rdma_log_pps, 5))
+		printf("nfsrdma: FRWR self-test register+invalidate ok "
+		    "(rkey rotated)\n");
+
+	/*
+	 * Registered and invalidated cleanly: the device is done with the MR's
+	 * page vector, so drop the DMA mapping and free the slot back to the
+	 * bounded pool.  Unmap BEFORE clearing sm_inuse so a teardown that races
+	 * (it cannot reclaim a still-inuse slot until the sc_sends barrier has
+	 * drained this WR anyway) never sees a freed-but-mapped slot.
+	 */
+	svc_rdma_mr_unmap(conn, sm);
+	mtx_lock(&conn->sc_lock);
+	sm->sm_inuse = false;
+	mtx_unlock(&conn->sc_lock);
+}
+
+/*
+ * Accept-time FRWR self-test (TASK_003f-2): prove the registration/invalidation
+ * completion path end-to-end by fast-registering one of the connection's own
+ * send buffers into a pool MR and posting REG_MR + LOCAL_INV as a single chained
+ * SEND WR, then letting svc_rdma_wc_reg() reap the (single, signaled) completion.
+ *
+ * This is the ONLY posting the substrate does in 3f-2; the real REG_MR posting
+ * (chained ahead of an IB_WR_RDMA_READ/WRITE) is 3f-3/3f-4.  It registers a
+ * SERVER buffer only -- no peer chunk, no peer length -- so nothing here is
+ * attacker-influenced.
+ *
+ * Chaining: REG_MR is posted UNSIGNALED (the QP is IB_SIGNAL_REQ_WR, so an
+ * unsignaled WR yields no CQE) followed by a SIGNALED LOCAL_INV.  The two WRs are
+ * a single ib_post_send list, so they enter the SQ atomically and the device
+ * registers-then-invalidates; exactly ONE completion (for the LOCAL_INV) fires,
+ * which is exactly ONE sc_sends unit to account.  We register with LOCAL_WRITE
+ * access only: a local MR is all the substrate proves, and we hand the rkey to no
+ * peer here.
+ *
+ * sc_sends accounting (the load-bearing teardown-safety arm).  We arm the send
+ * barrier IDENTICALLY to svc_rdma_conn_send(): in one sc_lock section verify the
+ * conn is SC_UP, claim a free MR slot from the bounded pool (sm_inuse), and bump
+ * sc_sends; then build + post with the lock dropped; then reacquire, decrement
+ * sc_sends, and wake the teardown if we were the last in-flight send.  Because
+ * svc_rdma_conn_close() publishes SC_CLOSING before enqueuing the teardown, once
+ * teardown is pending this self-test cannot pass the SC_UP gate, and the barrier
+ * waits only for an already-counted post to finish.  After sc_sends hits 0 the
+ * chained WRs are on the SQ before ib_drain_qp(), so the SQ drain sentinel
+ * catches them (their flush completion reaches svc_rdma_wc_reg with a live conn)
+ * and nothing posts afterward -- the same argument the reply-send barrier makes.
+ *
+ * Best-effort: any failure (no free slot, registration error, post error) is
+ * logged and dropped; the self-test never closes a healthy connection on its own
+ * (a post failure does, via the shared close path, exactly like a reply send).
+ */
+static void
+svc_rdma_mr_selftest(struct svc_rdma_conn *conn)
+{
+	struct svc_rdma_mr *sm;
+	const struct ib_send_wr *bad_wr;
+	uint32_t rkey;
+	int i, rc;
+
+	/* No MR pool (degenerate device) -> nothing to self-test. */
+	if (conn->sc_mr == NULL || conn->sc_nmr == 0 || conn->sc_nsend == 0)
+		return;
+
+	/*
+	 * Claim a free MR slot and arm the send barrier while SC_UP, in one
+	 * sc_lock section -- the exact shape of svc_rdma_conn_send()'s claim.
+	 */
+	mtx_lock(&conn->sc_lock);
+	if (conn->sc_state != SC_UP) {
+		mtx_unlock(&conn->sc_lock);
+		return;
+	}
+	sm = NULL;
+	for (i = 0; i < conn->sc_nmr; i++) {
+		if (!conn->sc_mr[i].sm_inuse) {
+			sm = &conn->sc_mr[i];
+			sm->sm_inuse = true;
+			break;
+		}
+	}
+	if (sm == NULL) {
+		mtx_unlock(&conn->sc_lock);
+		return;
+	}
+	conn->sc_sends++;
+	mtx_unlock(&conn->sc_lock);
+
+	/*
+	 * Register one of our own send buffers (a contiguous, server-owned
+	 * SVC_RDMA_INLINE-byte heap allocation -- never stack/pageable) into the
+	 * MR and build its REG_MR WR.  The buffer already carries a DMA_TO_DEVICE
+	 * single-mapping for the send path; the FRWR register helper adds a SECOND,
+	 * INDEPENDENT bus_dma mapping (its own scatterlist + dma_map handle) just
+	 * for this MR, torn down on the LOCAL_INV completion.  Two mappings of one
+	 * stable KVA region are valid bus_dma usage; this is a no-data register/
+	 * invalidate (the self-test transfers nothing), and the self-test runs once
+	 * at establish while no reply send is using sc_send[0], so the two mappings
+	 * never describe a live concurrent transfer.  On failure release the slot
+	 * and drop the send barrier.
+	 */
+	rc = svc_rdma_mr_reg(conn, sm, conn->sc_send[0].ss_buf, SVC_RDMA_INLINE,
+	    IB_ACCESS_LOCAL_WRITE, &rkey);
+	if (rc != 0) {
+		mtx_lock(&conn->sc_lock);
+		sm->sm_inuse = false;
+		if (--conn->sc_sends == 0)
+			wakeup(&conn->sc_upcalls);
+		mtx_unlock(&conn->sc_lock);
+		return;
+	}
+
+	/*
+	 * REG_MR (unsignaled) -> LOCAL_INV (signaled), chained.  The REG_MR WR
+	 * was filled by svc_rdma_mr_reg(); chain the LOCAL_INV after it and make
+	 * only the tail signaled, so a single completion reaches svc_rdma_wc_reg.
+	 */
+	sm->sm_regwr.wr.next = &sm->sm_invwr;
+
+	memset(&sm->sm_invwr, 0, sizeof(sm->sm_invwr));
+	sm->sm_invwr.next = NULL;
+	sm->sm_invwr.opcode = IB_WR_LOCAL_INV;
+	sm->sm_invwr.send_flags = IB_SEND_SIGNALED;
+	sm->sm_invwr.ex.invalidate_rkey = sm->sm_mr->rkey;
+	sm->sm_invwr.wr_cqe = &sm->sm_cqe;
+	sm->sm_cqe.done = svc_rdma_wc_reg;
+
+	if (bootverbose)
+		printf("nfsrdma: FRWR self-test posting REG_MR+LOCAL_INV "
+		    "rkey=0x%08x\n", rkey);
+
+	rc = ib_post_send(conn->sc_id->qp, &sm->sm_regwr.wr, &bad_wr);
+
+	mtx_lock(&conn->sc_lock);
+	if (rc != 0) {
+		/*
+		 * Neither WR reached the SQ, so no completion will fire: undo the
+		 * DMA mapping and release the slot here, then drop the barrier.
+		 * (svc_rdma_mr_unmap is safe under sc_lock -- it only calls
+		 * ib_dma_unmap_sg, which does not sleep.)
+		 */
+		svc_rdma_mr_unmap(conn, sm);
+		sm->sm_inuse = false;
+	}
+	if (--conn->sc_sends == 0)
+		wakeup(&conn->sc_upcalls);
+	mtx_unlock(&conn->sc_lock);
+
+	if (rc != 0) {
+		if (ppsratecheck(&svc_rdma_log_last, &svc_rdma_log_pps, 5))
+			printf("nfsrdma: FRWR self-test ib_post_send failed: %d\n",
+			    rc);
+		svc_rdma_conn_close(conn);
+	}
+}
+
+/*
  * svc_rdma_conn_send() -- copy a caller-marshalled inline reply into a free
  * send buffer and post it (TASK_003e-1).  This is the reusable send-pool path:
  * the former svc_rdma_reply() body, generalized so the bytes come from a caller
@@ -1742,12 +2217,13 @@ svc_rdma_conn_close(struct svc_rdma_conn *conn)
  * fire against the buffers/conn this frees.
  *
  * Order: QP (clears sc_id->qp) -> recv CQ -> send CQ -> unmap+free each recv
- * buffer -> unmap+free each send buffer -> PD.  A CQ is never freed under a
- * live QP, and the PD (whose local_dma_lkey the recv and send SGEs both
- * reference) outlives every buffer that used it.  rdma_destroy_qp() is the
- * cm_id-paired QP destructor: it must only be called when a QP actually exists
- * (sc_id->qp != NULL), and it clears sc_id->qp itself, so we must not poke
- * sc_id->qp by hand.
+ * buffer -> unmap+free each send buffer -> unmap+dereg each FRWR MR -> PD.  A CQ
+ * is never freed under a live QP, and the PD (whose local_dma_lkey the recv/send
+ * SGEs reference, and whose usecnt every MR holds) outlives every buffer and MR
+ * that used it -- so the MR pool is deregistered BEFORE ib_dealloc_pd().
+ * rdma_destroy_qp() is the cm_id-paired QP destructor: it must only be called
+ * when a QP actually exists (sc_id->qp != NULL), and it clears sc_id->qp itself,
+ * so we must not poke sc_id->qp by hand.
  */
 static void
 svc_rdma_conn_free_verbs(struct svc_rdma_conn *conn)
@@ -1815,6 +2291,41 @@ svc_rdma_conn_free_verbs(struct svc_rdma_conn *conn)
 		conn->sc_nsend = 0;
 	}
 
+	if (conn->sc_mr != NULL) {
+		/*
+		 * FRWR MR pool (3f-2).  Mirror of the recv/send unwind, and it
+		 * obeys the SAME drained-teardown precondition: the caller
+		 * (svc_rdma_conn_destroy) has already run ib_drain_qp(), so no
+		 * REG_MR/LOCAL_INV completion can be touching an MR or its DMA
+		 * mapping when we release them here.  For each slot, in this order:
+		 *   - drop any DMA mapping STILL live at close (a slot registered
+		 *     but whose LOCAL_INV never completed -- e.g. closed mid-self-
+		 *     test or a registration error); svc_rdma_mr_unmap is idempotent
+		 *     via sm_sg_mapped, so a slot already released on its completion
+		 *     is skipped.  The unmap MUST precede ib_dereg_mr (you cannot
+		 *     unmap through a destroyed MR's device-less slot, and the device
+		 *     must still be reading neither);
+		 *   - ib_dereg_mr() the MR (NULL-guarded: a slot whose ib_alloc_mr
+		 *     failed during a partial accept-time build has sm_mr == NULL).
+		 * MRs are deregistered BEFORE ib_dealloc_pd() below: each MR holds a
+		 * reference on the PD (ib_alloc_mr atomic_inc's pd->usecnt), so the PD
+		 * must outlive every MR -- exactly the rule the recv/send SGEs'
+		 * local_dma_lkey already imposes on the PD.
+		 */
+		for (i = 0; i < conn->sc_nmr; i++) {
+			struct svc_rdma_mr *sm = &conn->sc_mr[i];
+
+			svc_rdma_mr_unmap(conn, sm);
+			if (sm->sm_mr != NULL) {
+				ib_dereg_mr(sm->sm_mr);
+				sm->sm_mr = NULL;
+			}
+		}
+		free(conn->sc_mr, M_NFSRDMA);
+		conn->sc_mr = NULL;
+		conn->sc_nmr = 0;
+	}
+
 	if (conn->sc_pd != NULL) {
 		ib_dealloc_pd(conn->sc_pd);
 		conn->sc_pd = NULL;
@@ -1861,7 +2372,10 @@ svc_rdma_conn_free_verbs(struct svc_rdma_conn *conn)
  *      1 -- has already run svc_rdma_wc_recv()/svc_rdma_wc_send() to completion.
  *      No completion can fire after this point.
  *   4. svc_rdma_conn_free_verbs() -- destroy QP, free CQs, unmap+free buffers,
- *      dealloc PD.  Safe now: step 3 guarantees nothing is touching them.
+ *      unmap+ib_dereg_mr the FRWR pool (3f-2), dealloc PD.  Safe now: step 3
+ *      guarantees nothing is touching them -- in particular no REG_MR/LOCAL_INV
+ *      completion can be reading an MR or its DMA mapping, the MR-vs-DMA lifetime
+ *      guarantee the reviewer cares about.
  *   5. rdma_destroy_id() -- a QP must be destroyed before its id (rdma_cm.h);
  *      this also blocks until no CM callback is running, after which no event
  *      can reference conn.
@@ -1994,7 +2508,7 @@ svc_rdma_accept(struct rdma_cm_id *id)
 	struct svc_rdma_conn *conn;
 	struct ib_device *dev = id->device;
 	const struct ib_recv_wr *bad_wr;
-	u32 max_wr, max_sge;
+	u32 max_wr, max_send_wr, max_sge;
 	int i, rc;
 
 	conn = malloc(sizeof(*conn), M_NFSRDMA, M_WAITOK | M_ZERO);
@@ -2051,11 +2565,25 @@ svc_rdma_accept(struct rdma_cm_id *id)
 	 * ib_device_attr; clamp to >= 1 so a degenerate device report cannot
 	 * size a zero-entry QP/CQ (mlx rejects those).  3b posts one SGE per
 	 * recv (a single inline segment), so one recv SGE is sufficient.
+	 *
+	 * max_wr is the RECV cap (and the reply-send pool depth).  max_send_wr is
+	 * the SEND-queue cap: the reply depth PLUS FRWR head-room (3f-2).  The
+	 * FRWR self-test (and, later, 3f-3/3f-4) posts REG_MR + LOCAL_INV WRs on
+	 * the SQ in addition to reply SENDs, so the SQ must hold both without
+	 * overflow.  We reserve 2 WRs per MR slot (one REG_MR + one LOCAL_INV) for
+	 * the whole pool -- a fixed local bound (SVC_RDMA_MR_DEPTH), never a peer
+	 * count -- so the entire MR pool could be registered+invalidated
+	 * concurrently with a full reply pool.  Both caps are clamped to the
+	 * device's max_qp_wr.
 	 */
 	max_wr = SVC_RDMA_RECV_DEPTH;
 	if (dev->attrs.max_qp_wr > 0 &&
 	    (u32)dev->attrs.max_qp_wr < max_wr)
 		max_wr = dev->attrs.max_qp_wr;
+	max_send_wr = max_wr + 2 * SVC_RDMA_MR_DEPTH;
+	if (dev->attrs.max_qp_wr > 0 &&
+	    (u32)dev->attrs.max_qp_wr < max_send_wr)
+		max_send_wr = dev->attrs.max_qp_wr;
 	max_sge = 1;
 	if (dev->attrs.max_sge > 0 && (u32)dev->attrs.max_sge < max_sge)
 		max_sge = dev->attrs.max_sge;
@@ -2072,9 +2600,11 @@ svc_rdma_accept(struct rdma_cm_id *id)
 	 * Separate send/recv CQs, each sized to its QP cap PLUS ONE.  The +1 is
 	 * drain-sentinel head-room: ib_drain_qp() (the teardown precondition)
 	 * posts one extra sentinel WR per queue whose completion can coexist
-	 * with up to max_wr flushed completions, so the CQ must hold max_wr + 1
-	 * CQEs to honor that contract on an exact-fit provider (mlx5 happens to
-	 * round entries up to a power of two, but we do not rely on that).
+	 * with up to the queue's WR cap of flushed completions, so the CQ must
+	 * hold (cap + 1) CQEs to honor that contract on an exact-fit provider
+	 * (mlx5 happens to round entries up to a power of two, but we do not rely
+	 * on that).  The send CQ is sized to max_send_wr + 1 (the reply depth plus
+	 * the 3f-2 FRWR head-room), the recv CQ to max_wr + 1.
 	 * comp_vector 0 is the deliberate minimal choice (matching
 	 * rpcrdma_ep_create; spreading vectors is a later perf task).  conn is
 	 * the CQ context.  IB_POLL_WORKQUEUE dispatches completions from a
@@ -2085,7 +2615,8 @@ svc_rdma_accept(struct rdma_cm_id *id)
 	 * completions.  svc_rdma_wc_recv()/svc_rdma_wc_send() MPASS exactly this
 	 * (N2), so changing either CQ away from IB_POLL_WORKQUEUE trips INVARIANTS.
 	 */
-	conn->sc_scq = ib_alloc_cq(dev, conn, max_wr + 1, 0, IB_POLL_WORKQUEUE);
+	conn->sc_scq = ib_alloc_cq(dev, conn, max_send_wr + 1, 0,
+	    IB_POLL_WORKQUEUE);
 	if (IS_ERR(conn->sc_scq)) {
 		rc = -PTR_ERR(conn->sc_scq);
 		conn->sc_scq = NULL;
@@ -2107,7 +2638,7 @@ svc_rdma_accept(struct rdma_cm_id *id)
 	qp_attr.srq = NULL;
 	qp_attr.sq_sig_type = IB_SIGNAL_REQ_WR;
 	qp_attr.qp_type = IB_QPT_RC;
-	qp_attr.cap.max_send_wr = max_wr;
+	qp_attr.cap.max_send_wr = max_send_wr;
 	qp_attr.cap.max_recv_wr = max_wr;
 	qp_attr.cap.max_send_sge = max_sge;
 	qp_attr.cap.max_recv_sge = max_sge;
@@ -2213,6 +2744,59 @@ svc_rdma_accept(struct rdma_cm_id *id)
 			goto fail;
 		}
 		ss->ss_mapped = true;
+	}
+
+	/*
+	 * Allocate the FRWR memory-registration pool (TASK_003f-2), the per-conn
+	 * substrate the RDMA Read (3f-3) / RDMA Write (3f-4) engines register
+	 * server buffers through.  Like the recv/send pools it is built at accept
+	 * time and reclaimed only in the drained teardown (ib_dereg_mr after
+	 * ib_drain_qp), so no completion can race the free.
+	 *
+	 * Per-MR page cap: bound SVC_RDMA_MR_PAGES (a fixed local constant) DOWN
+	 * to the device's fast-reg page-list limit
+	 * (dev->attrs.max_fast_reg_page_list_len) so we never ask ib_alloc_mr for
+	 * more pages than the HCA supports; clamp to >= 1 so a degenerate
+	 * device report cannot request a zero-page MR.  This is a device bound on
+	 * a LOCAL constant -- never a peer-supplied size.  A device that reports 0
+	 * fast-reg pages (no FRWR support) leaves sc_mr_pages 0 below, in which
+	 * case we skip the pool entirely (sc_nmr stays 0) rather than fail the
+	 * accept: 3f-2 only adds an optional substrate + self-test, and a non-FRWR
+	 * device must still accept connections for the inline path.
+	 */
+	conn->sc_mr_pages = SVC_RDMA_MR_PAGES;
+	if (dev->attrs.max_fast_reg_page_list_len > 0 &&
+	    dev->attrs.max_fast_reg_page_list_len < conn->sc_mr_pages)
+		conn->sc_mr_pages = dev->attrs.max_fast_reg_page_list_len;
+
+	if (conn->sc_mr_pages == 0) {
+		/* No FRWR support reported; run without an MR pool (inline only). */
+		if (bootverbose)
+			printf("nfsrdma: device reports no fast-reg pages; "
+			    "FRWR pool disabled\n");
+		conn->sc_nmr = 0;
+		conn->sc_mr = NULL;
+	} else {
+		conn->sc_nmr = SVC_RDMA_MR_DEPTH;
+		conn->sc_mr = malloc(conn->sc_nmr * sizeof(*conn->sc_mr),
+		    M_NFSRDMA, M_WAITOK | M_ZERO);
+
+		for (i = 0; i < conn->sc_nmr; i++) {
+			struct svc_rdma_mr *sm = &conn->sc_mr[i];
+
+			sm->sm_conn = conn;
+			sm->sm_inuse = false;
+			sm->sm_sg_mapped = false;
+			sm->sm_cqe.done = svc_rdma_wc_reg;
+			sm->sm_mr = ib_alloc_mr(conn->sc_pd, IB_MR_TYPE_MEM_REG,
+			    conn->sc_mr_pages);
+			if (IS_ERR(sm->sm_mr)) {
+				rc = -PTR_ERR(sm->sm_mr);
+				sm->sm_mr = NULL;
+				printf("nfsrdma: ib_alloc_mr failed: %d\n", rc);
+				goto fail;
+			}
+		}
 	}
 
 	/*
