@@ -63,6 +63,7 @@
 #include <sys/lock.h>
 #include <sys/malloc.h>		/* malloc/free, MALLOC_DEFINE */
 #include <sys/mutex.h>
+#include <sys/queue.h>		/* TAILQ: per-listener connection registry */
 #include <sys/socket.h>
 #include <sys/sysctl.h>
 #include <sys/taskqueue.h>	/* deferred (sleepable) connection teardown */
@@ -111,9 +112,26 @@ MALLOC_DEFINE(M_NFSRDMA, "nfsrdma", "NFS over RDMA server");
  *
  * SVC_RDMA_RECV_DEPTH is how many recv buffers (and thus recv WRs) we keep
  * posted.  It bounds the recv-side QP/CQ caps below.
+ *
+ * SVC_RDMA_SEND_DEPTH is the size of the per-connection reply-send buffer pool
+ * (3d).  It matches SVC_RDMA_RECV_DEPTH so we can have a reply in flight for
+ * every recv we can be processing concurrently.  Like the recv depth it is
+ * clamped down to the device-reported QP send cap at accept time, so the pool
+ * can never exceed what the SQ can hold (and thus never outruns the send CQ,
+ * which is sized max_wr + 1 for the ib_drain_qp SQ sentinel).
  */
 #define	SVC_RDMA_INLINE		4096
 #define	SVC_RDMA_RECV_DEPTH	8
+#define	SVC_RDMA_SEND_DEPTH	SVC_RDMA_RECV_DEPTH
+
+/*
+ * Size of the inline RPC-over-RDMA v1 reply we marshal in 3d.  It is a fixed
+ * local constant -- the 7-word (28-byte) RFC 8166 transport header followed by
+ * a minimal 6-word (24-byte) ONC RPC MSG_ACCEPTED/SUCCESS reply body (RFC 5531)
+ * -- so it is always well under SVC_RDMA_INLINE and cannot be influenced by any
+ * peer-supplied length.  See svc_rdma_reply() for the exact word layout.
+ */
+#define	SVC_RDMA_REPLY_LEN	(RPCRDMA_HDR_MIN + 24)
 
 /*
  * RFC 8166 (RPC-over-RDMA version 1) transport-header constants.
@@ -141,6 +159,20 @@ enum {
 	RDMA_MSGP	= 2,	/* deprecated */
 	RDMA_DONE	= 3,
 	RDMA_ERROR	= 4
+};
+
+/*
+ * ONC RPC (RFC 5531) reply-message constants for the minimal MSG_ACCEPTED/
+ * SUCCESS body 3d marshals after the RPC-over-RDMA header.  This is exactly a
+ * valid NFS NULL reply; the semantically-correct nfsd reply body is 3e.  These
+ * are our own fixed constants -- nothing here is peer-derived except the echoed
+ * opaque xid.
+ */
+enum {
+	RPC_REPLY	= 1,	/* msg_type: REPLY */
+	RPC_MSG_ACCEPTED = 0,	/* reply_stat: MSG_ACCEPTED */
+	RPC_AUTH_NONE	= 0,	/* auth_flavor of the verifier */
+	RPC_ACCEPT_SUCCESS = 0	/* accept_stat: SUCCESS */
 };
 
 /*
@@ -175,6 +207,26 @@ struct svc_rdma_recv {
 };
 
 /*
+ * One reply-send buffer (3d).  The exact send-side mirror of svc_rdma_recv:
+ * ss_cqe.done is the send completion the CQ core dispatches, and ss_wr.wr_cqe
+ * aliases &ss_cqe so a completion lands in svc_rdma_wc_send() with this ss_*
+ * recovered via container_of().  ss_buf is DMA-mapped DMA_TO_DEVICE once at
+ * accept time and unmapped exactly once in the drained teardown (ss_mapped,
+ * the analogue of rr_mapped).  ss_inuse, under sc_lock, makes the pool a simple
+ * bounded free-list: a reply grabs a free buffer, the send completion frees it.
+ */
+struct svc_rdma_send {
+	struct ib_cqe		 ss_cqe;
+	struct svc_rdma_conn	*ss_conn;
+	void			*ss_buf;	/* SVC_RDMA_INLINE bytes */
+	u64			 ss_dma;	/* ib_dma_map_single() address */
+	bool			 ss_mapped;	/* ss_dma is a live mapping */
+	bool			 ss_inuse;	/* reserved for a reply (sc_lock) */
+	struct ib_sge		 ss_sge;
+	struct ib_send_wr	 ss_wr;
+};
+
+/*
  * Per-accepted-connection state.  id->context points here for the child cm_id
  * (the listener's own id keeps context == &svc_rdma_listener), which is how the
  * shared CM handler tells a connection event from a listener event.
@@ -191,6 +243,13 @@ struct svc_rdma_recv {
  * ib_post_recv returns).  The teardown task waits for it to reach 0 (msleep on
  * &sc_reposts) BEFORE ib_drain_qp(), so no late WR can be posted after the
  * drain sentinel -- this is the post-after-drain UAF barrier.
+ *
+ * sc_sends is the send-side mirror of sc_reposts (3d): it counts reply sends
+ * currently in flight in svc_rdma_reply() (incremented while still SC_UP under
+ * sc_lock, decremented after ib_post_send returns).  The teardown task waits
+ * for sc_sends == 0 in the SAME barrier that waits for sc_reposts == 0, BEFORE
+ * ib_drain_qp(), so no late SEND WR can be posted behind the SQ drain sentinel
+ * -- the identical post-after-drain UAF barrier applied to the send queue.
  */
 struct svc_rdma_conn {
 	struct rdma_cm_id	*sc_id;		/* child cm_id; QP is sc_id->qp */
@@ -199,6 +258,8 @@ struct svc_rdma_conn {
 	struct ib_cq		*sc_rcq;	/* recv CQ */
 	struct svc_rdma_recv	*sc_recv;	/* sc_nrecv-element array */
 	int			 sc_nrecv;
+	struct svc_rdma_send	*sc_send;	/* sc_nsend-element pool (3d) */
+	int			 sc_nsend;
 	struct mtx		 sc_lock;
 	enum {
 		SC_CONNECTING = 0,
@@ -206,16 +267,50 @@ struct svc_rdma_conn {
 		SC_CLOSING
 	}			 sc_state;
 	int			 sc_reposts;	/* in-flight reposts (sc_lock) */
+	int			 sc_sends;	/* in-flight reply sends (sc_lock) */
 	struct task		 sc_teardown;	/* deferred (sleepable) unwind */
+	TAILQ_ENTRY(svc_rdma_conn) sc_link;	/* registry (svc_rdma_conns_lock) */
 };
 
 /*
- * Initialize/destroy sl_lock at module load/unload via MTX_SYSINIT.  This file
- * is linked into the ibcore KLD, so it has no module event of its own; SYSINIT
- * machinery is how an ibcore-internal source unit gets init/teardown hooks.
+ * Registry of every accepted connection that is currently "live" (made live in
+ * svc_rdma_accept(), removed at the very end of svc_rdma_conn_destroy()).
+ *
+ * Without this list there was no way to reach an ESTABLISHED connection at
+ * listener-stop / module-unload time: svc_rdma_listen_stop() destroyed only the
+ * listening cm_id, leaving every accepted conn's QP/CQ/PD and posted recv
+ * buffers alive -- and, fatally on unload, leaving its rr_cqe.done callbacks and
+ * its queued sc_teardown task pointing into ibcore text that is about to be
+ * freed (one more flush/frame -> panic or arbitrary kernel execution), plus an
+ * unbounded resource leak for idle conns.  The registry lets stop/unload sweep
+ * and drain every live conn before returning.
+ *
+ * Locking: svc_rdma_conns_lock guards the list head and every sc_link.  A conn
+ * is INSERTED exactly once (in svc_rdma_accept, right after it is made live) and
+ * REMOVED exactly once (at the end of svc_rdma_conn_destroy, just before the
+ * conn is freed), so no double-insert / double-remove is possible.
+ *
+ * Lock order: svc_rdma_conns_lock -> sc_lock.  The sweep in
+ * svc_rdma_listen_stop() holds svc_rdma_conns_lock and calls
+ * svc_rdma_conn_close(), which takes sc_lock -- so the registry lock is the
+ * OUTER lock.  The teardown's REMOVE takes ONLY svc_rdma_conns_lock (it holds no
+ * sc_lock at that point), and no other path ever takes sc_lock and then
+ * svc_rdma_conns_lock, so there is no lock-order reversal.
+ */
+static TAILQ_HEAD(svc_rdma_conn_list, svc_rdma_conn) svc_rdma_conns =
+    TAILQ_HEAD_INITIALIZER(svc_rdma_conns);
+static struct mtx svc_rdma_conns_lock;
+
+/*
+ * Initialize/destroy sl_lock and svc_rdma_conns_lock at module load/unload via
+ * MTX_SYSINIT.  This file is linked into the ibcore KLD, so it has no module
+ * event of its own; SYSINIT machinery is how an ibcore-internal source unit gets
+ * init/teardown hooks.
  */
 MTX_SYSINIT(svc_rdma_listener_lock, &svc_rdma_listener.sl_lock,
     "nfsrdma_listener", MTX_DEF);
+MTX_SYSINIT(svc_rdma_conns_lock, &svc_rdma_conns_lock,
+    "nfsrdma_conns", MTX_DEF);
 
 SYSCTL_NODE(_vfs, OID_AUTO, nfsrdma, CTLFLAG_RW | CTLFLAG_MPSAFE, 0,
     "NFS over RDMA server");
@@ -248,6 +343,8 @@ static void svc_rdma_conn_close(struct svc_rdma_conn *conn);
 static int svc_rdma_parse_header(const void *buf, uint32_t len,
     struct svc_rdma_msg *out);
 static void svc_rdma_wc_recv(struct ib_cq *cq, struct ib_wc *wc);
+static void svc_rdma_reply(struct svc_rdma_conn *conn, uint32_t xid);
+static void svc_rdma_wc_send(struct ib_cq *cq, struct ib_wc *wc);
 
 /*
  * CM event handler for the *listener* cm_id and for the child cm_ids it
@@ -655,6 +752,19 @@ svc_rdma_wc_recv(struct ib_cq *cq, struct ib_wc *wc)
 		    "inline rpc=%u bytes\n", msg.xid, msg.credit, msg.rpc_len);
 
 	/*
+	 * 3d: marshal and post an inline RPC-over-RDMA reply echoing this
+	 * call's opaque xid.  svc_rdma_reply() grabs a free send buffer, builds
+	 * the fixed reply, and posts it under the SC_UP-gated sc_sends barrier
+	 * (the send-side mirror of the repost barrier below).  It trusts NOTHING
+	 * from the call except msg.xid.  If the connection is no longer SC_UP or
+	 * the bounded send pool is exhausted it drops the reply (rate-limited
+	 * log) rather than blocking this completion or over-allocating.  We
+	 * still repost the recv buffer below regardless, so a dropped reply does
+	 * not starve the receive queue.
+	 */
+	svc_rdma_reply(conn, msg.xid);
+
+	/*
 	 * Repost the same buffer to keep the receive queue from starving --
 	 * but ONLY while the connection is still SC_UP, and under an in-flight
 	 * repost refcount (sc_reposts) that the teardown task drains before it
@@ -707,6 +817,224 @@ svc_rdma_wc_recv(struct ib_cq *cq, struct ib_wc *wc)
 }
 
 /*
+ * Marshal and post an inline RPC-over-RDMA version 1 reply (3d), echoing the
+ * call's opaque xid.  Called from svc_rdma_wc_recv() after a good parse, in the
+ * CQ workqueue context, so it must not sleep and must not take a sleepable lock.
+ *
+ * UNTRUSTED PEER.  The ONLY peer-derived datum that enters the reply is the
+ * 32-bit opaque xid, which we echo verbatim per RFC 5531 -- nothing else from
+ * the call body or header is trusted.  Every other field is our own fixed
+ * constant.  The credit we GRANT is conn->sc_nrecv -- the number of recv
+ * buffers we actually posted -- NOT the client's offered credit and NOT the
+ * SVC_RDMA_RECV_DEPTH constant (which can exceed what a small-cap device let us
+ * post).  The reply is a fixed SVC_RDMA_REPLY_LEN bytes that we build ourselves
+ * into a buffer we own, well under SVC_RDMA_INLINE, so no peer length can size
+ * or overflow it.
+ *
+ * Bounded pool + send-quiescence barrier (the send-side mirror of the recv
+ * repost barrier).  Under sc_lock, in one critical section, we:
+ *   - bail if the connection is no longer SC_UP (a teardown is in progress; the
+ *     send pool is reclaimed by that task after ib_drain_qp(), so dropping the
+ *     reply here cannot leak and must not post behind the drain sentinel);
+ *   - claim a free send buffer (ss_inuse) from the bounded pool, dropping the
+ *     reply if none is free (a peer flooding calls cannot make us over-allocate
+ *     or block this completion);
+ *   - bump sc_sends (the in-flight-send refcount the teardown drains before
+ *     ib_drain_qp()).
+ * We then build the reply and ib_post_send() with the lock DROPPED (matching
+ * the recv path, which drops sc_lock across ib_post_recv).  After the post we
+ * reacquire, decrement sc_sends, and wake the teardown if we were the last
+ * in-flight send.  On post failure we release the buffer and close the conn.
+ *
+ * Because svc_rdma_conn_close() publishes SC_CLOSING BEFORE enqueuing the
+ * teardown task, once teardown is pending no NEW reply passes the SC_UP check;
+ * the task's barrier then waits only for already-counted sends to finish their
+ * ib_post_send and decrement.  After sc_sends hits 0 every SEND WR is on the SQ
+ * before ib_drain_qp(), so the SQ drain sentinel catches them all and nothing
+ * posts afterward -- the identical argument the recv barrier makes for the RQ.
+ */
+static void
+svc_rdma_reply(struct svc_rdma_conn *conn, uint32_t xid)
+{
+	struct svc_rdma_send *ss;
+	const struct ib_send_wr *bad_wr;
+	char *p;
+	int i, rc;
+
+	/*
+	 * Claim a free send buffer and arm the send barrier, all while SC_UP,
+	 * in a single sc_lock critical section -- the send-side mirror of the
+	 * repost barrier's "sample SC_UP, bump refcount, drop lock" sequence.
+	 */
+	mtx_lock(&conn->sc_lock);
+	if (conn->sc_state != SC_UP) {
+		mtx_unlock(&conn->sc_lock);
+		return;
+	}
+	ss = NULL;
+	for (i = 0; i < conn->sc_nsend; i++) {
+		if (!conn->sc_send[i].ss_inuse) {
+			ss = &conn->sc_send[i];
+			ss->ss_inuse = true;
+			break;
+		}
+	}
+	if (ss == NULL) {
+		/*
+		 * Bounded pool exhausted (peer is flooding calls faster than
+		 * our sends complete).  Drop this reply -- never block the
+		 * completion, never over-allocate.  Rate-limited because the
+		 * arrival rate is peer-controlled.
+		 */
+		mtx_unlock(&conn->sc_lock);
+		if (ppsratecheck(&svc_rdma_log_last, &svc_rdma_log_pps, 5))
+			printf("nfsrdma: send buffers exhausted, dropping "
+			    "reply (xid=0x%08x)\n", xid);
+		return;
+	}
+	conn->sc_sends++;
+	mtx_unlock(&conn->sc_lock);
+
+	/*
+	 * Build the fixed reply into our own buffer with be32enc (endian- and
+	 * alignment-safe; never cast-and-store).  Layout (all big-endian XDR
+	 * words):
+	 *   RFC 8166 transport header (7 words = RPCRDMA_HDR_MIN):
+	 *     w0 rdma_xid    = echoed opaque xid (the ONLY peer-derived value)
+	 *     w1 rdma_vers   = RPCRDMA_VERSION (1)
+	 *     w2 rdma_credit = conn->sc_nrecv -- the credit we GRANT is exactly the
+	 *                      number of recv buffers we actually posted (NOT the
+	 *                      peer's offered credit, and NOT the SVC_RDMA_RECV_DEPTH
+	 *                      constant: on a device whose max_qp_wr < the constant
+	 *                      we posted fewer, so granting the constant would
+	 *                      over-advertise and invite RNR/stall).  sc_nrecv is set
+	 *                      once at accept time and never mutated, so reading it
+	 *                      here without sc_lock is safe.
+	 *     w3 rdma_proc   = RDMA_MSG (0)
+	 *     w4 read_list   = 0 (empty)
+	 *     w5 write_list  = 0 (empty)
+	 *     w6 reply_chunk = 0 (empty)
+	 *   ONC RPC reply body (RFC 5531, 6 words = 24 bytes):
+	 *     w7  xid           = echoed opaque xid (RPC message xid)
+	 *     w8  mtype         = RPC_REPLY (1)
+	 *     w9  reply_stat    = RPC_MSG_ACCEPTED (0)
+	 *     w10 verf.flavor   = RPC_AUTH_NONE (0)
+	 *     w11 verf.length   = 0 (empty opaque body)
+	 *     w12 accept_stat   = RPC_ACCEPT_SUCCESS (0)
+	 * Total = RPCRDMA_HDR_MIN + 24 = SVC_RDMA_REPLY_LEN, fixed.
+	 */
+	p = ss->ss_buf;
+	be32enc(p +  0, xid);			/* w0  rdma_xid */
+	be32enc(p +  4, RPCRDMA_VERSION);	/* w1  rdma_vers */
+	be32enc(p +  8, (uint32_t)conn->sc_nrecv); /* w2 rdma_credit: posted depth */
+	be32enc(p + 12, RDMA_MSG);		/* w3  rdma_proc */
+	be32enc(p + 16, 0);			/* w4  read_list (empty) */
+	be32enc(p + 20, 0);			/* w5  write_list (empty) */
+	be32enc(p + 24, 0);			/* w6  reply_chunk (empty) */
+	be32enc(p + 28, xid);			/* w7  RPC xid */
+	be32enc(p + 32, RPC_REPLY);		/* w8  mtype = REPLY */
+	be32enc(p + 36, RPC_MSG_ACCEPTED);	/* w9  reply_stat */
+	be32enc(p + 40, RPC_AUTH_NONE);		/* w10 verf.flavor */
+	be32enc(p + 44, 0);			/* w11 verf.length = 0 */
+	be32enc(p + 48, RPC_ACCEPT_SUCCESS);	/* w12 accept_stat = SUCCESS */
+
+	/*
+	 * The DMA mapping is DMA_TO_DEVICE and was set up once at accept time;
+	 * the device reads ss_buf as we just wrote it (CPU-then-device ordering
+	 * is provided by the post doorbell).  Build the prebuilt-shape SGE/WR
+	 * each time with the fixed reply length.
+	 */
+	ss->ss_sge.addr = ss->ss_dma;
+	ss->ss_sge.length = SVC_RDMA_REPLY_LEN;
+	ss->ss_sge.lkey = conn->sc_pd->local_dma_lkey;
+
+	ss->ss_cqe.done = svc_rdma_wc_send;
+	ss->ss_wr.next = NULL;
+	ss->ss_wr.wr_cqe = &ss->ss_cqe;
+	ss->ss_wr.sg_list = &ss->ss_sge;
+	ss->ss_wr.num_sge = 1;
+	ss->ss_wr.opcode = IB_WR_SEND;
+	ss->ss_wr.send_flags = IB_SEND_SIGNALED;
+
+	/*
+	 * Post with the lock dropped (mirroring the recv repost).  bad_wr MUST
+	 * be passed (never NULL): mlx5_ib_post_send dereferences *bad_wr on an
+	 * immediate error, the same defect the recv path was fixed for.
+	 */
+	rc = ib_post_send(conn->sc_id->qp, &ss->ss_wr, &bad_wr);
+
+	mtx_lock(&conn->sc_lock);
+	if (rc != 0) {
+		/*
+		 * The WR never reached the SQ, so no completion will ever fire
+		 * for it: release the buffer here so it is not leaked from the
+		 * pool.  Then drop the send barrier and close the connection.
+		 */
+		ss->ss_inuse = false;
+	}
+	if (--conn->sc_sends == 0)
+		wakeup(&conn->sc_sends);
+	mtx_unlock(&conn->sc_lock);
+
+	if (rc != 0) {
+		if (ppsratecheck(&svc_rdma_log_last, &svc_rdma_log_pps, 5))
+			printf("nfsrdma: ib_post_send (reply) failed: %d\n", rc);
+		svc_rdma_conn_close(conn);
+	}
+}
+
+/*
+ * Send completion (3d).  Dispatched by the CQ core in the same IB_POLL_WORKQUEUE
+ * context as svc_rdma_wc_recv(); keep it short, take no sleepable lock, start no
+ * blocking teardown.  ss_wr.wr_cqe aliases &ss->ss_cqe so container_of()
+ * recovers the send descriptor and ss_conn the owning connection.
+ *
+ * On success the reply has been transmitted and the device is done reading
+ * ss_buf, so return the buffer to the bounded pool (clear ss_inuse under
+ * sc_lock).  IB_WC_WR_FLUSH_ERR is the expected status for any reply WR flushed
+ * when the QP drains during teardown: swallow it silently (the teardown task
+ * unmaps and frees the send buffers, not here -- and it does so only AFTER
+ * ib_drain_qp(), so this completion sees a still-live conn).  Any other error is
+ * a real send fault -> start a deferred teardown.  We do NOT free ss_buf or
+ * unmap here: that is the drained-teardown's exactly-once job, exactly as the
+ * recv completion never frees rr_buf.
+ */
+static void
+svc_rdma_wc_send(struct ib_cq *cq, struct ib_wc *wc)
+{
+	struct svc_rdma_send *ss;
+	struct svc_rdma_conn *conn;
+
+	ss = container_of(wc->wr_cqe, struct svc_rdma_send, ss_cqe);
+	conn = ss->ss_conn;
+
+	if (wc->status != IB_WC_SUCCESS) {
+		/*
+		 * Flushed during teardown: expected, ignore (the buffer is
+		 * reclaimed by the teardown task).  Any other error: the send
+		 * failed for a live connection -> tear it down.  Either way we
+		 * leave ss_inuse as-is; the teardown frees the whole pool.
+		 */
+		if (wc->status != IB_WC_WR_FLUSH_ERR) {
+			if (ppsratecheck(&svc_rdma_log_last,
+			    &svc_rdma_log_pps, 5))
+				printf("nfsrdma: send completion error %u\n",
+				    wc->status);
+			svc_rdma_conn_close(conn);
+		}
+		return;
+	}
+
+	if (ppsratecheck(&svc_rdma_log_last, &svc_rdma_log_pps, 5))
+		printf("nfsrdma: reply sent (send completion)\n");
+
+	/* Return the buffer to the bounded pool. */
+	mtx_lock(&conn->sc_lock);
+	ss->ss_inuse = false;
+	mtx_unlock(&conn->sc_lock);
+}
+
+/*
  * Request a deferred teardown of conn.  Callable from any context, including
  * the CM callback and the recv completion (both of which forbid blocking).
  *
@@ -739,11 +1067,12 @@ svc_rdma_conn_close(struct svc_rdma_conn *conn)
  * fire against the buffers/conn this frees.
  *
  * Order: QP (clears sc_id->qp) -> recv CQ -> send CQ -> unmap+free each recv
- * buffer -> PD.  A CQ is never freed under a live QP, and the PD (whose
- * local_dma_lkey the SGEs reference) outlives every buffer that used it.
- * rdma_destroy_qp() is the cm_id-paired QP destructor: it must only be called
- * when a QP actually exists (sc_id->qp != NULL), and it clears sc_id->qp
- * itself, so we must not poke sc_id->qp by hand.
+ * buffer -> unmap+free each send buffer -> PD.  A CQ is never freed under a
+ * live QP, and the PD (whose local_dma_lkey the recv and send SGEs both
+ * reference) outlives every buffer that used it.  rdma_destroy_qp() is the
+ * cm_id-paired QP destructor: it must only be called when a QP actually exists
+ * (sc_id->qp != NULL), and it clears sc_id->qp itself, so we must not poke
+ * sc_id->qp by hand.
  */
 static void
 svc_rdma_conn_free_verbs(struct svc_rdma_conn *conn)
@@ -787,6 +1116,30 @@ svc_rdma_conn_free_verbs(struct svc_rdma_conn *conn)
 		conn->sc_nrecv = 0;
 	}
 
+	if (conn->sc_send != NULL) {
+		/*
+		 * Send-buffer pool (3d), the exact mirror of the recv unwind.
+		 * Each slot was DMA-mapped DMA_TO_DEVICE exactly once at accept
+		 * time and is unmapped exactly once here; ss_mapped (set true
+		 * only after a successful ib_dma_map_single) gates the unmap so
+		 * a slot whose map failed during a partial build is freed but
+		 * not unmapped.  ib_drain_qp() already ran, so no send
+		 * completion can be reading ss_buf when we free it.
+		 */
+		dev = conn->sc_id->device;
+		for (i = 0; i < conn->sc_nsend; i++) {
+			struct svc_rdma_send *ss = &conn->sc_send[i];
+
+			if (ss->ss_mapped && dev != NULL)
+				ib_dma_unmap_single(dev, ss->ss_dma,
+				    SVC_RDMA_INLINE, DMA_TO_DEVICE);
+			free(ss->ss_buf, M_NFSRDMA);
+		}
+		free(conn->sc_send, M_NFSRDMA);
+		conn->sc_send = NULL;
+		conn->sc_nsend = 0;
+	}
+
 	if (conn->sc_pd != NULL) {
 		ib_dealloc_pd(conn->sc_pd);
 		conn->sc_pd = NULL;
@@ -802,26 +1155,32 @@ svc_rdma_conn_free_verbs(struct svc_rdma_conn *conn)
  * device-removal, AND accept-failure, which all funnel through conn_close().
  *
  * Teardown order, and why it is UAF-free:
- *   1. Repost-quiescence barrier: msleep until sc_reposts == 0.  svc_rdma_conn_close()
- *      published SC_CLOSING before enqueuing this task, so no NEW repost can pass
- *      the SC_UP gate in svc_rdma_wc_recv(); this wait only drains reposts already
- *      counted (between their sc_reposts++ and their ib_post_recv returning).  When
- *      it returns, every WR a completion will ever post is already on the QP, and
- *      none can be posted afterward.  This is the barrier that makes step 2's
- *      "no concurrent posters" precondition true and closes the post-after-drain
- *      UAF (mlx5 ib_post_recv does not reject an ERR-state QP, so a late post would
+ *   1. Post-quiescence barrier: msleep until sc_reposts == 0 AND sc_sends == 0.
+ *      svc_rdma_conn_close() published SC_CLOSING before enqueuing this task, so no
+ *      NEW repost can pass the SC_UP gate in svc_rdma_wc_recv() and no NEW reply send
+ *      can pass the SC_UP gate in svc_rdma_reply(); this wait only drains reposts and
+ *      sends already counted (each between its refcount++ and its ib_post_recv/
+ *      ib_post_send returning).  When it returns, every WR a completion will ever post
+ *      -- on the RQ OR the SQ -- is already on the QP, and none can be posted
+ *      afterward.  This is the barrier that makes step 2/3's "no concurrent posters"
+ *      precondition true (ib_drain_sq/ib_drain_qp explicitly require no concurrent
+ *      WR posters) and closes the post-after-drain UAF on BOTH queues (mlx5
+ *      ib_post_recv/ib_post_send do not reject an ERR-state QP, so a late post would
  *      otherwise slip in behind the drain sentinel).  We run on taskqueue_thread,
- *      distinct from the CQ workqueue running svc_rdma_wc_recv(), and the completion
- *      path holds sc_lock only briefly and never blocks on us, so this cannot
- *      self-deadlock.
+ *      distinct from the CQ workqueue running svc_rdma_wc_recv()/svc_rdma_wc_send(),
+ *      and both completion paths hold sc_lock only briefly and never block on us, so
+ *      this cannot self-deadlock.
  *   2. rdma_disconnect() (if a QP exists) -- best-effort; moves the QP toward
  *      error and tells the peer.  Errors ignored (peer may already be gone).
- *   3. ib_drain_qp() (if a QP exists) -- modifies the QP to IB_QPS_ERR, posts a
- *      sentinel WR on the SQ and RQ, and BLOCKS (wait_for_completion) until the
- *      sentinel CQEs are reaped (ib_verbs.c:2292).  CQs are FIFO, so when this
- *      returns EVERY earlier recv/send completion -- including any flushed WRs
- *      and the now-quiesced reposts from step 1 -- has already run
- *      svc_rdma_wc_recv() to completion.  No completion can fire after this point.
+ *   3. ib_drain_qp() (if a QP exists) -- ib_drain_sq() then ib_drain_rq()
+ *      (ib_verbs.c:2292): each modifies the QP to IB_QPS_ERR, posts a sentinel
+ *      WR on its queue, and BLOCKS (wait_for_completion) until that sentinel CQE
+ *      is reaped.  Step 1 made this safe by guaranteeing no other context is
+ *      still posting on the SQ or RQ (the drain contract requires exactly that).
+ *      CQs are FIFO, so when this returns EVERY earlier recv AND send completion
+ *      -- including any flushed WRs and the now-quiesced reposts/sends from step
+ *      1 -- has already run svc_rdma_wc_recv()/svc_rdma_wc_send() to completion.
+ *      No completion can fire after this point.
  *   4. svc_rdma_conn_free_verbs() -- destroy QP, free CQs, unmap+free buffers,
  *      dealloc PD.  Safe now: step 3 guarantees nothing is touching them.
  *   5. rdma_destroy_id() -- a QP must be destroyed before its id (rdma_cm.h);
@@ -838,10 +1197,22 @@ svc_rdma_conn_destroy(void *arg, int pending __unused)
 {
 	struct svc_rdma_conn *conn = arg;
 
-	/* Step 1: drain in-flight reposts before touching the QP. */
+	/*
+	 * Step 1: drain in-flight reposts AND in-flight reply sends before
+	 * touching the QP.  Both refcounts are armed only while SC_UP, which
+	 * conn_close() already cleared, so this only waits out the WRs already
+	 * counted.  We wake on either &sc_reposts or &sc_sends; loop until both
+	 * are zero so neither an RQ nor an SQ post can slip behind the drain.
+	 */
 	mtx_lock(&conn->sc_lock);
-	while (conn->sc_reposts != 0)
-		msleep(&conn->sc_reposts, &conn->sc_lock, 0, "svcrdrp", 0);
+	while (conn->sc_reposts != 0 || conn->sc_sends != 0) {
+		if (conn->sc_reposts != 0)
+			msleep(&conn->sc_reposts, &conn->sc_lock, 0,
+			    "svcrdrp", 0);
+		if (conn->sc_sends != 0)
+			msleep(&conn->sc_sends, &conn->sc_lock, 0,
+			    "svcrdsn", 0);
+	}
 	mtx_unlock(&conn->sc_lock);
 
 	if (conn->sc_id != NULL && conn->sc_id->qp != NULL) {
@@ -856,6 +1227,20 @@ svc_rdma_conn_destroy(void *arg, int pending __unused)
 
 	if (ppsratecheck(&svc_rdma_log_last, &svc_rdma_log_pps, 5))
 		printf("nfsrdma: connection torn down\n");
+
+	/*
+	 * Remove from the registry exactly once, as the last step before the
+	 * conn is freed.  Done with no sc_lock held (we already dropped it
+	 * above), honoring the conns_lock -> sc_lock order -- and after this the
+	 * conn no longer exists, so a concurrent sweep that already snapshotted
+	 * this entry has its own list-walk serialized by conns_lock: either it
+	 * removed nothing for us (we remove ourselves here) or, if it called
+	 * conn_close() on us, that only set SC_CLOSING (a no-op since the task is
+	 * already running) and never frees -- the single free is here.
+	 */
+	mtx_lock(&svc_rdma_conns_lock);
+	TAILQ_REMOVE(&svc_rdma_conns, conn, sc_link);
+	mtx_unlock(&svc_rdma_conns_lock);
 
 	mtx_destroy(&conn->sc_lock);
 	free(conn, M_NFSRDMA);
@@ -917,6 +1302,22 @@ svc_rdma_accept(struct rdma_cm_id *id)
 	conn->sc_state = SC_CONNECTING;
 	conn->sc_id = id;
 	id->context = conn;
+
+	/*
+	 * Register the connection so listener-stop / module-unload can find and
+	 * reclaim it.  Inserted exactly once, here, the instant it is live and
+	 * before any verbs resource exists, so a failure anywhere below still
+	 * leaves a registered conn that the deferred teardown will REMOVE (once)
+	 * at its end.  This runs entirely inside the CM handler; svc_rdma_accept
+	 * therefore returns -- and thus this insert completes -- before
+	 * svc_rdma_listen_stop()'s rdma_destroy_id() (which waits out the
+	 * handler) can return and start the sweep, so no accept can insert after
+	 * the sweep has run.  conns_lock is the outer lock; we hold no sc_lock
+	 * here, honoring the conns_lock -> sc_lock order.
+	 */
+	mtx_lock(&svc_rdma_conns_lock);
+	TAILQ_INSERT_TAIL(&svc_rdma_conns, conn, sc_link);
+	mtx_unlock(&svc_rdma_conns_lock);
 
 	/*
 	 * Bound the QP/CQ caps by what the device reports, exactly like
@@ -1041,6 +1442,46 @@ svc_rdma_accept(struct rdma_cm_id *id)
 			printf("nfsrdma: ib_post_recv failed: %d\n", rc);
 			goto fail;
 		}
+	}
+
+	/*
+	 * Allocate and DMA-map (DMA_TO_DEVICE) the reply-send buffer pool (3d),
+	 * the send-side mirror of the recv buffers.  Unlike recvs these are NOT
+	 * posted now: a SEND WR is posted on demand by svc_rdma_reply() when a
+	 * call arrives, drawing a free buffer from this bounded pool.  Each
+	 * buffer is a fixed SVC_RDMA_INLINE-byte heap allocation (never stack/
+	 * pageable); the reply we build occupies only the first SVC_RDMA_REPLY_LEN
+	 * bytes, but we map the whole SVC_RDMA_INLINE so the map/unmap size is the
+	 * symmetric mirror of the recv side.  ss_mapped is set true ONLY after a
+	 * successful map so the teardown unmaps each slot exactly once.
+	 *
+	 * sc_nsend is clamped to the QP send cap (max_wr) for the same reason
+	 * sc_nrecv is clamped: a device whose max_qp_wr is below the configured
+	 * depth must not be handed a pool larger than its SQ (which is also why
+	 * the pool can never outrun the send CQ, sized max_wr + 1).
+	 */
+	conn->sc_nsend = (SVC_RDMA_SEND_DEPTH < max_wr) ?
+	    SVC_RDMA_SEND_DEPTH : max_wr;
+	conn->sc_send = malloc(conn->sc_nsend * sizeof(*conn->sc_send),
+	    M_NFSRDMA, M_WAITOK | M_ZERO);
+
+	for (i = 0; i < conn->sc_nsend; i++) {
+		struct svc_rdma_send *ss = &conn->sc_send[i];
+
+		ss->ss_conn = conn;
+		ss->ss_inuse = false;
+		ss->ss_buf = malloc(SVC_RDMA_INLINE, M_NFSRDMA, M_WAITOK);
+		ss->ss_dma = ib_dma_map_single(dev, ss->ss_buf,
+		    SVC_RDMA_INLINE, DMA_TO_DEVICE);
+		if (ib_dma_mapping_error(dev, ss->ss_dma)) {
+			/*
+			 * Map failed: leave ss_mapped false so the unwinder
+			 * skips the unmap for this slot (it still frees ss_buf).
+			 */
+			printf("nfsrdma: ib_dma_map_single (send) failed\n");
+			goto fail;
+		}
+		ss->ss_mapped = true;
 	}
 
 	/*
@@ -1182,22 +1623,50 @@ out_destroy:
 }
 
 /*
- * Tear the listener down.  Safe vs an in-flight CONNECT_REQUEST: we detach the
- * stored pointer under the lock first, then rdma_destroy_id() the listener
- * outside the lock.  rdma_destroy_id() cancels in-flight asynchronous CM
- * operations associated with the id and does not return until the handler is
- * no longer running (verified in TASK_002), so no CONNECT_REQUEST can be in or
- * enter the handler for this listener after it returns.  Idempotent: a second
- * call (or unload after an explicit stop) finds sl_id NULL and does nothing.
+ * Tear the listener down AND reclaim every connection it ever accepted.  Safe
+ * vs an in-flight CONNECT_REQUEST: we detach the stored pointer under the lock
+ * first, then rdma_destroy_id() the listener outside the lock.
+ * rdma_destroy_id() cancels in-flight asynchronous CM operations associated with
+ * the id and does not return until the handler is no longer running (verified in
+ * TASK_002), so no CONNECT_REQUEST can be in or enter the handler for this
+ * listener after it returns -- and therefore no svc_rdma_accept() can still be
+ * running, so every conn it ever created has already been INSERTed into the
+ * registry before we sweep.  Idempotent: a second call finds sl_id NULL.
  *
  * We must drop sl_lock before rdma_destroy_id(): the CM teardown can block, and
  * holding a non-sleepable mtx across it would be wrong; nothing else needs the
  * lock once we have unpublished the pointer.
+ *
+ * Connection sweep (ordering is load-bearing):
+ *   1. Destroy the listener id FIRST (above), so no NEW connection can be
+ *      accepted/inserted after this point -- this is what makes the sweep
+ *      complete: the registry can only shrink from here on.
+ *   2. Under svc_rdma_conns_lock, walk the registry and svc_rdma_conn_close()
+ *      each conn.  conn_close() takes sc_lock (inner) to transition SC_CLOSING
+ *      and enqueues that conn's sc_teardown exactly once -- it never blocks and
+ *      never frees, so it is safe to call while holding the registry lock and
+ *      while iterating (FOREACH, not FOREACH_SAFE: conn_close does not remove
+ *      from or free the list; only the teardown task removes, and it cannot run
+ *      until we drop the lock).  A conn already CLOSING (its teardown already
+ *      enqueued by a disconnect/error) is a harmless no-op.
+ *   3. Drop the lock, then taskqueue_drain_all(taskqueue_thread): block until
+ *      EVERY queued and running sc_teardown has finished.  Each teardown drains
+ *      its QP, frees its verbs resources, rdma_destroy_id()s its id, REMOVEs
+ *      itself from the registry, and frees the conn.  We must drain the WHOLE
+ *      queue, NOT a per-conn task pointer: the task frees the conn, so any
+ *      &conn->sc_teardown would be dangling by the time we waited on it.  When
+ *      drain_all returns, no sc_teardown task and no posted-WR completion
+ *      callback (rr_cqe.done / ss_cqe.done) can run anymore -- critical on the
+ *      unload path, where those callbacks live in ibcore text about to be freed.
+ * After the drain the registry is empty.  The sweep runs unconditionally (even
+ * when sl_id was already NULL): a connection established before an explicit
+ * vfs.nfsrdma.listen=0 outlives the listener id, so unload must still reclaim it.
  */
 void
 svc_rdma_listen_stop(void)
 {
 	struct rdma_cm_id *id;
+	struct svc_rdma_conn *conn;
 
 	mtx_lock(&svc_rdma_listener.sl_lock);
 	id = svc_rdma_listener.sl_id;
@@ -1209,6 +1678,22 @@ svc_rdma_listen_stop(void)
 		rdma_destroy_id(id);
 		printf("nfsrdma: listener stopped\n");
 	}
+
+	/*
+	 * Reclaim every live connection.  conns_lock is the outer lock; conn_close
+	 * takes sc_lock (inner) -- consistent with the documented order.
+	 */
+	mtx_lock(&svc_rdma_conns_lock);
+	TAILQ_FOREACH(conn, &svc_rdma_conns, sc_link)
+		svc_rdma_conn_close(conn);
+	mtx_unlock(&svc_rdma_conns_lock);
+
+	/*
+	 * Wait out every enqueued+running teardown (each removes itself from the
+	 * registry and frees its conn).  Drain the whole queue, never a per-conn
+	 * task pointer -- the task frees the conn.
+	 */
+	taskqueue_drain_all(taskqueue_thread);
 }
 
 /*
@@ -1262,7 +1747,9 @@ SYSCTL_PROC(_vfs_nfsrdma, OID_AUTO, listen,
  * Stop the listener at module unload (and at kernel shutdown for a built-in
  * GENERIC-OFED), before the CM core can go away, so no dangling cm_id is left
  * for a later teardown to destroy through freed CM state.  Safe even if the
- * listener was never started (sl_id NULL -> no-op).
+ * listener was never started (sl_id NULL -> no-op).  svc_rdma_listen_stop() now
+ * also sweeps and drains every accepted connection, so the unload path inherits
+ * full connection reclamation through this single call.
  *
  * Ordering is load-bearing.  The CM core registers its cleanup with
  *	module_exit_order(cma_cleanup, SI_ORDER_FOURTH)	(ib_cma.c:4702)
@@ -1276,6 +1763,17 @@ SYSCTL_PROC(_vfs_nfsrdma, OID_AUTO, listen,
  * SI_ORDER_FOURTH; lowering it below FOURTH reintroduces a use-after-free,
  * because rdma_destroy_id() would then run after cma_cleanup() has torn the
  * CM core down.
+ *
+ * The PER-CONNECTION drained teardown shares this exact ordering constraint.
+ * The connection sweep here runs the registry's sc_teardown tasks SYNCHRONOUSLY
+ * to completion (taskqueue_drain_all in svc_rdma_listen_stop returns only after
+ * every one finishes), and each does rdma_disconnect/ib_drain_qp/rdma_destroy_id
+ * on a child cm_id and its QP.  Those verbs/CM calls require the CM core and the
+ * provider to still be alive, which is exactly what SI_ORDER_FIFTH-before-FOURTH
+ * guarantees: at SI_ORDER_FIFTH cma_cleanup has not yet run, so every per-conn
+ * drain/destroy completes against a live CM core.  Lowering this SI_ORDER below
+ * FOURTH would tear the CM core down before these per-conn teardowns drain --
+ * the same use-after-free as for the listener id, now multiplied across conns.
  */
 static void
 svc_rdma_uninit(void *arg __unused)
