@@ -1511,13 +1511,26 @@ svc_rdma_wc_recv(struct ib_cq *cq, struct ib_wc *wc)
 	 *     On a start error we close; on success we return WITHOUT reposting (the
 	 *     read owns rr_buf until completion).
 	 */
-	if (msg.wr_nchunks != 0 || msg.reply_present ||
+	/*
+	 * A WRITE list (the client's destination for an NFS READ result) still
+	 * needs the write-list RDMA Write case -- deferred; close cleanly.  An
+	 * RDMA_NOMSG with no read list has no inline call body to serve.  Every
+	 * other request with an inline call body (RDMA_MSG) IS served now,
+	 * INCLUDING one that offers a REPLY chunk for an over-inline reply: the
+	 * body is inline, so we dispatch it exactly like any inline call (below);
+	 * the parsed reply chunk travels to the consumer in msg.reply, and the
+	 * consumer's xp_reply replies inline when it fits or RDMA-Writes the reply
+	 * into the reply chunk (TASK_003f-4) when it does not.  A request that ALSO
+	 * carries a read list is handled by the RDMA Read engine below, which
+	 * copies the whole parsed msg -- reply chunk included -- into rs_msg, so
+	 * the post-read dispatch carries the reply chunk too (TASK_003f-5).
+	 */
+	if (msg.wr_nchunks != 0 ||
 	    (msg.rdma_proc == RDMA_NOMSG && msg.rd_nchunks == 0)) {
 		if (ppsratecheck(&svc_rdma_log_last, &svc_rdma_log_pps, 5))
 			printf("nfsrdma: RPC-over-RDMA v1 %s xid=0x%08x "
-			    "credit=%u read_list=%u write_list=%u "
-			    "reply_chunk=%u segs (write/reply-chunk decoded, not "
-			    "yet served: 3f-4), closing\n",
+			    "credit=%u read_list=%u write_list=%u reply_chunk=%u "
+			    "(write-list/bodyless-NOMSG not yet served), closing\n",
 			    msg.rdma_proc == RDMA_NOMSG ? "RDMA_NOMSG" :
 			    "RDMA_MSG", msg.xid, msg.credit, msg.rd_nchunks,
 			    msg.wr_nchunks,
@@ -1546,7 +1559,9 @@ svc_rdma_wc_recv(struct ib_cq *cq, struct ib_wc *wc)
 
 	if (ppsratecheck(&svc_rdma_log_last, &svc_rdma_log_pps, 5))
 		printf("nfsrdma: RPC-over-RDMA v1 RDMA_MSG xid=0x%08x credit=%u "
-		    "inline rpc=%u bytes\n", msg.xid, msg.credit, msg.rpc_len);
+		    "inline rpc=%u bytes reply_chunk=%u (dispatching)\n",
+		    msg.xid, msg.credit, msg.rpc_len,
+		    msg.reply_present ? msg.reply.wc_nsegs : 0);
 
 	/*
 	 * Readiness gate + upcall barrier (TASK_003e-1).  sro_newconn is delivered
