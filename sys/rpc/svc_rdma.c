@@ -231,8 +231,38 @@ struct svc_rdma_listener {
 struct svc_rdma_qent {
 	STAILQ_ENTRY(svc_rdma_qent) sq_link;
 	struct mbuf	*sq_m;		/* one complete inline ONC RPC message */
+	/*
+	 * Reply-chunk carry (TASK_003f-4).  If the request that produced sq_m offered
+	 * an RFC 8166 reply chunk (the client pre-registered memory for an over-inline
+	 * reply -- e.g. the NFSv4 mount-handshake compound), the parsed-and-validated
+	 * reply chunk is captured here by sro_recv (a pure value type, no pointers, so
+	 * copying it is safe past the recv buffer's repost).  xp_recv moves it into the
+	 * per-xprt pending table keyed by xid so xp_reply can RDMA-Write the reply into
+	 * it.  sq_has_reply distinguishes "no reply chunk offered" from a zeroed one.
+	 */
+	bool		sq_has_reply;
+	uint32_t	sq_xid;
+	struct svc_rdma_write_chunk sq_reply;
 };
 STAILQ_HEAD(svc_rdma_qhead, svc_rdma_qent);
+
+/*
+ * Pending reply-chunk table (TASK_003f-4).  A reply chunk captured by sro_recv
+ * must survive from xp_recv (where the request is dispatched) to xp_reply (where
+ * the reply is marshalled), linked only by the ONC RPC xid.  We keep a small
+ * fixed-size per-xprt table keyed by xid: xp_recv inserts the captured chunk,
+ * xp_reply looks it up by msg->rm_xid and consumes it.  The table is bounded by
+ * SVC_RDMA_REPLY_PEND (>= the verbs recv depth, so it cannot be outrun by the
+ * number of concurrently-dispatchable requests); a full table or a missing entry
+ * means "no reply chunk for this reply" -> the inline path (or drop) handles it,
+ * never an over-write.  Guarded by xr_lock.
+ */
+#define	SVC_RDMA_REPLY_PEND	16
+struct svc_rdma_reply_pend {
+	bool		rp_valid;
+	uint32_t	rp_xid;
+	struct svc_rdma_write_chunk rp_reply;
+};
 
 struct svc_rdma_xprt {
 	struct svc_rdma_conn	*xr_conn;	/* verbs conn (NULL after disc.) */
@@ -240,6 +270,7 @@ struct svc_rdma_xprt {
 	struct svc_rdma_qhead	 xr_mq;		/* queued recv messages */
 	uint32_t		 xr_seq;	/* monotonic posted-reply counter */
 	bool			 xr_died;	/* connection gone */
+	struct svc_rdma_reply_pend xr_pend[SVC_RDMA_REPLY_PEND]; /* reply chunks */
 };
 
 /*
@@ -279,6 +310,64 @@ svc_rdma_drain_queue(struct svc_rdma_xprt *xr)
 		m_freem(q->sq_m);
 		free(q, M_SVCRDMA);
 	}
+}
+
+/*
+ * Insert a captured reply chunk into the per-xprt pending table keyed by xid
+ * (TASK_003f-4).  Called from xp_recv when a dispatched request offered a reply
+ * chunk.  Picks the first free slot, or REUSES a slot already holding the same xid
+ * (a client RC-retransmit of the same request re-offers its reply chunk -- the
+ * latest wins).  If the table is full we silently drop the chunk: xp_reply then
+ * finds no pending entry and falls back to the inline-or-drop path, which is
+ * correct (never an over-write).  Guarded by xr_lock.
+ */
+static void
+svc_rdma_reply_pend_insert(struct svc_rdma_xprt *xr, uint32_t xid,
+    const struct svc_rdma_write_chunk *reply)
+{
+	int i, free_slot = -1;
+
+	mtx_lock(&xr->xr_lock);
+	for (i = 0; i < SVC_RDMA_REPLY_PEND; i++) {
+		if (xr->xr_pend[i].rp_valid && xr->xr_pend[i].rp_xid == xid) {
+			free_slot = i;			/* overwrite same-xid slot */
+			break;
+		}
+		if (!xr->xr_pend[i].rp_valid && free_slot < 0)
+			free_slot = i;			/* remember first free */
+	}
+	if (free_slot >= 0) {
+		xr->xr_pend[free_slot].rp_valid = true;
+		xr->xr_pend[free_slot].rp_xid = xid;
+		xr->xr_pend[free_slot].rp_reply = *reply;
+	}
+	mtx_unlock(&xr->xr_lock);
+}
+
+/*
+ * Take (look up and remove) the pending reply chunk for xid, if any
+ * (TASK_003f-4).  Called from xp_reply.  Returns true and fills *reply if a
+ * pending entry existed (and clears the slot); false if none.  Guarded by
+ * xr_lock.
+ */
+static bool
+svc_rdma_reply_pend_take(struct svc_rdma_xprt *xr, uint32_t xid,
+    struct svc_rdma_write_chunk *reply)
+{
+	int i;
+	bool found = false;
+
+	mtx_lock(&xr->xr_lock);
+	for (i = 0; i < SVC_RDMA_REPLY_PEND; i++) {
+		if (xr->xr_pend[i].rp_valid && xr->xr_pend[i].rp_xid == xid) {
+			*reply = xr->xr_pend[i].rp_reply;
+			xr->xr_pend[i].rp_valid = false;
+			found = true;
+			break;
+		}
+	}
+	mtx_unlock(&xr->xr_lock);
+	return (found);
 }
 
 /*
@@ -326,6 +415,16 @@ svc_rdma_xprt_recv(SVCXPRT *xprt, struct rpc_msg *msg,
 			return (FALSE);
 
 		m = q->sq_m;
+
+		/*
+		 * Carry the reply chunk forward (TASK_003f-4).  If this request
+		 * offered a reply chunk, record it in the per-xprt pending table
+		 * keyed by xid so xp_reply can RDMA-Write the over-inline reply into
+		 * it.  Done before freeing the qent.  A full table just means this
+		 * reply falls back to the inline-or-drop path -- never an over-write.
+		 */
+		if (q->sq_has_reply)
+			svc_rdma_reply_pend_insert(xr, q->sq_xid, &q->sq_reply);
 		free(q, M_SVCRDMA);
 
 		/*
@@ -406,20 +505,30 @@ svc_rdma_xprt_ack(SVCXPRT *xprt, uint32_t *ack)
 }
 
 /*
- * xp_reply: marshal an inline RPC-over-RDMA v1 reply and post it.
+ * xp_reply: marshal an RPC-over-RDMA v1 reply and post it -- inline when it fits,
+ * or RDMA-Written into the client's reply chunk when it does not (TASK_003f-4).
  *
  * The ONC RPC reply (header + body) is built into an mbuf chain exactly as
  * svc_vc_reply does: xdr_replymsg() encodes the reply header, and on the
  * accepted/success path the caller's body mbuf m is appended via xdr_putmbuf().
- * Instead of a TCP record marker we then PREPEND the 28-byte RFC 8166 transport
- * header (RDMA_MSG, all chunk lists empty), linearize the whole chain into one
- * contiguous local buffer, and hand it to svc_rdma_conn_send() (which copies it
- * into the connection's DMA send buffer and posts the SEND WR).
  *
- * INLINE ONLY: if the marshalled reply exceeds SVC_RDMA_INLINE it needs RDMA
- * Write chunks (TASK_003f); we drop-with-log and return FALSE rather than
- * overflow the bounded send buffer.  A drop is not fatal -- the client's RC
- * retransmit / a later op proceeds; the recv side is unaffected.
+ * INLINE path (fits SVC_RDMA_INLINE): PREPEND the 28-byte RFC 8166 transport
+ * header (RDMA_MSG, all chunk lists empty), linearize, and hand to
+ * svc_rdma_conn_send() (which copies it into the connection's DMA send buffer and
+ * posts the SEND WR) -- unchanged from 3d/3e.
+ *
+ * REPLY-CHUNK path (TASK_003f-4): if the marshalled reply exceeds SVC_RDMA_INLINE
+ * AND the request offered a reply chunk (captured during sro_recv, looked up here
+ * by xid), linearize the marshalled ONC RPC reply ALONE (no RFC 8166 header) and
+ * hand it to svc_rdma_conn_reply_chunk(), which RDMA-Writes it into the client's
+ * reply-chunk memory and SENDs an RDMA_NOMSG header reporting the length.  THIS is
+ * what unblocks a usable NFSv4 mount: the mount-handshake compound reply is too big
+ * for inline and the client always offers a reply chunk for it.
+ *
+ * If the reply is over-inline and NO reply chunk was offered (or the reply exceeds
+ * the offered chunk's capacity), we drop-with-log and return FALSE rather than
+ * overflow -- a drop is not fatal (the client's RC retransmit / a later op
+ * proceeds; the recv side is unaffected).
  */
 static bool_t
 svc_rdma_xprt_reply(SVCXPRT *xprt, struct rpc_msg *msg,
@@ -427,6 +536,7 @@ svc_rdma_xprt_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 {
 	struct svc_rdma_xprt *xr = (struct svc_rdma_xprt *)xprt->xp_p1;
 	struct svc_rdma_conn *conn;
+	struct svc_rdma_write_chunk reply;
 	struct mbuf *mrep;
 	char *buf;
 	XDR xdrs;
@@ -435,6 +545,7 @@ svc_rdma_xprt_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 	u_int rlen, total;
 	int rc;
 	bool_t stat = TRUE;
+	bool have_reply_chunk;
 
 	/*
 	 * Build the ONC RPC reply into a fresh pkthdr mbuf, mirroring
@@ -481,17 +592,67 @@ svc_rdma_xprt_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 	total = RPCRDMA_HDR_MIN + rlen;
 
 	/*
-	 * INLINE bound.  RPCRDMA_HDR_MIN + reply must fit one inline send
-	 * buffer.  Larger replies (big READDIR/READLINK/READ) require RDMA Write
-	 * chunks -- TASK_003f.  Drop-with-log; never overflow the send buffer.
+	 * Take this xid's pending reply chunk (TASK_003f-4), if the request offered
+	 * one.  We take it unconditionally (so the slot is always reclaimed) and use it
+	 * only on the over-inline path below; if the reply fits inline we simply drop
+	 * the (taken) chunk and reply inline, which RFC 8166 permits.
+	 */
+	have_reply_chunk = svc_rdma_reply_pend_take(xr, msg->rm_xid, &reply);
+
+	/*
+	 * INLINE bound.  RPCRDMA_HDR_MIN + reply must fit one inline send buffer.  A
+	 * larger reply (big READDIR/READLINK/READ, or the NFSv4 mount-handshake
+	 * compound) is the RDMA Write engine's job (TASK_003f-4): if the client offered
+	 * a reply chunk, RDMA-Write the marshalled ONC RPC reply into it and SEND an
+	 * RDMA_NOMSG header reporting the length.  With no reply chunk offered we cannot
+	 * deliver an over-inline reply -- drop-with-log (never overflow the send
+	 * buffer); the verbs layer's reply_chunk also returns EMSGSIZE if the reply
+	 * exceeds the offered chunk, which we treat as the same drop.
 	 */
 	if (total > SVC_RDMA_INLINE) {
+		if (have_reply_chunk) {
+			/*
+			 * Linearize the marshalled ONC RPC reply ALONE (no RFC 8166
+			 * header -- the verbs layer builds the RDMA_NOMSG header).  Post
+			 * under xr_lock so we observe a stable live xr_conn (SF1/SF2
+			 * race window, identical to the inline path below).
+			 */
+			buf = malloc(rlen, M_SVCRDMA, M_WAITOK);
+			m_copydata(mrep, 0, rlen, buf);
+			m_freem(mrep);
+
+			mtx_lock(&xr->xr_lock);
+			conn = xr->xr_conn;
+			if (conn != NULL && svc_rdma_verbs != NULL &&
+			    svc_rdma_verbs->svo_conn_reply_chunk != NULL) {
+				rc = svc_rdma_verbs->svo_conn_reply_chunk(conn,
+				    msg->rm_xid, &reply, buf, rlen);
+				if (rc == 0)
+					seqval = ++xr->xr_seq;
+			} else
+				rc = ENOTCONN;
+			mtx_unlock(&xr->xr_lock);
+
+			free(buf, M_SVCRDMA);
+
+			if (rc != 0) {
+				if (rc != ENOTCONN &&
+				    ppsratecheck(&svc_rdma_log_last,
+				    &svc_rdma_log_pps, 5))
+					printf("svc_rdma: reply-chunk post failed: "
+					    "%d (xid=0x%08x, %u bytes)\n", rc,
+					    msg->rm_xid, rlen);
+				return (FALSE);
+			}
+			if (seq != NULL)
+				*seq = seqval;
+			return (TRUE);
+		}
 		m_freem(mrep);
 		if (ppsratecheck(&svc_rdma_log_last, &svc_rdma_log_pps, 5))
-			printf("svc_rdma: inline reply too large (%u > %u), "
-			    "dropping (xid=0x%08x); needs RDMA Write chunks "
-			    "(TASK_003f)\n", total, SVC_RDMA_INLINE,
-			    msg->rm_xid);
+			printf("svc_rdma: over-inline reply (%u > %u) with no reply "
+			    "chunk, dropping (xid=0x%08x)\n", total,
+			    SVC_RDMA_INLINE, msg->rm_xid);
 		return (FALSE);
 	}
 
@@ -717,6 +878,20 @@ svc_rdma_sro_recv(void *ctx, struct svc_rdma_conn *conn,
 	m->m_pkthdr.len = msg->rpc_len;
 	q->sq_m = m;
 
+	/*
+	 * Capture the reply chunk (TASK_003f-4) if the client offered one for this
+	 * request: the whole RPC reply will be too large for inline and must be
+	 * RDMA-Written into the client's reply-chunk memory.  msg->reply is a pure
+	 * value type (a fixed-size validated segment array, no pointers), so copying it
+	 * here is safe even though msg itself is valid only for this call.  We key it on
+	 * the ONC RPC xid so xp_reply (a later pool thread) can find it.
+	 */
+	q->sq_has_reply = msg->reply_present;
+	if (msg->reply_present) {
+		q->sq_xid = msg->xid;
+		q->sq_reply = msg->reply;
+	}
+
 	mtx_lock(&xr->xr_lock);
 	STAILQ_INSERT_TAIL(&xr->xr_mq, q, sq_link);
 	mtx_unlock(&xr->xr_lock);
@@ -825,6 +1000,7 @@ svc_rdma_register_verbs(const struct svc_rdma_verbs_ops *ops)
 
 	if (ops == NULL || ops->svo_listen_start == NULL ||
 	    ops->svo_listen_stop == NULL || ops->svo_conn_send == NULL ||
+	    ops->svo_conn_reply_chunk == NULL ||
 	    ops->svo_conn_set_ctx == NULL || ops->svo_conn_get_ctx == NULL ||
 	    ops->svo_conn_credits == NULL)
 		return (EINVAL);
