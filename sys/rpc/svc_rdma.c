@@ -518,12 +518,12 @@ svc_rdma_xprt_ack(SVCXPRT *xprt, uint32_t *ack)
  * svc_vc_reply does: xdr_replymsg() encodes the reply header, and on the
  * accepted/success path the caller's body mbuf m is appended via xdr_putmbuf().
  *
- * INLINE path (fits SVC_RDMA_INLINE): PREPEND the 28-byte RFC 8166 transport
+ * INLINE path (fits SVC_RDMA_REPLY_INLINE): PREPEND the 28-byte RFC 8166 transport
  * header (RDMA_MSG, all chunk lists empty), linearize, and hand to
  * svc_rdma_conn_send() (which copies it into the connection's DMA send buffer and
  * posts the SEND WR) -- unchanged from 3d/3e.
  *
- * REPLY-CHUNK path (TASK_003f-4): if the marshalled reply exceeds SVC_RDMA_INLINE
+ * REPLY-CHUNK path (TASK_003f-4): if the marshalled reply exceeds SVC_RDMA_REPLY_INLINE
  * AND the request offered a reply chunk (captured during sro_recv, looked up here
  * by xid), linearize the marshalled ONC RPC reply ALONE (no RFC 8166 header) and
  * hand it to svc_rdma_conn_reply_chunk(), which RDMA-Writes it into the client's
@@ -658,7 +658,7 @@ svc_rdma_xprt_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 		if (ppsratecheck(&svc_rdma_log_last, &svc_rdma_log_pps, 5))
 			printf("svc_rdma: over-inline reply (%u > %u) with no reply "
 			    "chunk, dropping (xid=0x%08x)\n", total,
-			    SVC_RDMA_INLINE, msg->rm_xid);
+			    SVC_RDMA_REPLY_INLINE, msg->rm_xid);
 		return (FALSE);
 	}
 
