@@ -804,15 +804,24 @@ svc_rdma_sro_newconn(void *ctx, struct svc_rdma_conn *conn)
 	 * wide monotonic counter (atomic; wrap is astronomically distant and would
 	 * at worst momentarily share a DRC bucket, never corrupt it).
 	 *
-	 * Known boundary for inline NFS-over-RDMA: xp_rtaddr is left zeroed
-	 * (AF_UNSPEC) -- the verbs layer does not yet surface the peer sockaddr
-	 * through the consumer header, so svc_getrpccaller() returns an unspec
-	 * address and NFS export-address checks that need the real client address
-	 * are a follow-on.  Inline bring-up (NULL/GETATTR/LOOKUP) does not depend
-	 * on it.  The DRC itself is keyed on xp_sockref (above), not on the peer
-	 * address, so it is unaffected.
+	 * Peer address (TASK_003f-6): surface the RDMA-CM resolved client
+	 * sockaddr into xp_rtaddr so NFS export-address checks
+	 * (svc_getrpccaller -> xp_rtaddr) match the client against -network/-host
+	 * exports, exactly as svc_vc does for a TCP peer.  If the verbs layer
+	 * cannot supply it (older provider, or an unknown address family) it stays
+	 * AF_UNSPEC and only unrestricted exports match -- the prior behavior.
+	 * The DRC is keyed on xp_sockref (below), independent of the peer address.
 	 */
 	xprt->xp_sockref = atomic_fetchadd_64(&svc_rdma_sockref_gen, 1) + 1;
+
+	if (svc_rdma_verbs != NULL && svc_rdma_verbs->svo_conn_peeraddr != NULL) {
+		struct sockaddr_storage ss;
+
+		svc_rdma_verbs->svo_conn_peeraddr(conn, &ss);
+		if (ss.ss_family != AF_UNSPEC && ss.ss_len != 0 &&
+		    ss.ss_len <= sizeof(xprt->xp_rtaddr))
+			memcpy(&xprt->xp_rtaddr, &ss, ss.ss_len);
+	}
 
 	xprt_register(xprt);
 	svc_rdma_conn_set_ctx_wrap(conn, xprt);
