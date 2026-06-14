@@ -220,4 +220,71 @@ void	*svc_rdma_conn_get_ctx(struct svc_rdma_conn *conn);
 int	svc_rdma_conn_send(struct svc_rdma_conn *conn, const void *buf,
 	    uint32_t len);
 
+/*
+ * ===========================================================================
+ * Cross-module verbs-ops registration (TASK_003e-2a).
+ *
+ * Module layering (docs/16-svcxprt-rdma-integration.md "Module layering"): the
+ * verbs entry points above (svc_rdma_listen_start_ops / svc_rdma_conn_send /
+ * svc_rdma_conn_set_ctx / svc_rdma_conn_get_ctx) are DEFINED in the ibcore
+ * module (svc_verbs.c).  The SVCXPRT/krpc consumer (sys/rpc/svc_rdma.c) is built
+ * INTO the kernel, and a kernel built-in cannot hard-link a loadable module's
+ * symbols.  So the call direction is inverted at link time: the krpc layer
+ * EXPORTS the two registration entry points below as built-in kernel symbols,
+ * and ibcore -- which CAN resolve a built-in kernel symbol -- calls
+ * svc_rdma_register_verbs() at module load to hand krpc a table of the verbs
+ * entry points (svc_rdma_verbs_ops).  krpc thereafter reaches the verbs only
+ * through that registered table; with no table registered (ibcore not loaded)
+ * krpc refuses to create an RDMA transport (returns ENXIO) instead of chasing a
+ * NULL or an unresolved symbol.
+ *
+ * struct svc_rdma_verbs_ops mirrors the verbs entry points one-for-one:
+ *   svo_listen_start  -> svc_rdma_listen_start_ops
+ *   svo_listen_stop   -> svc_rdma_listen_stop
+ *   svo_conn_send     -> svc_rdma_conn_send
+ *   svo_conn_set_ctx  -> svc_rdma_conn_set_ctx
+ *   svo_conn_get_ctx  -> svc_rdma_conn_get_ctx
+ * (svc_rdma_listen_stop() is declared privately in svc_verbs.c, not in this
+ * consumer header, because a consumer never calls it directly -- it reaches it
+ * only through svo_listen_stop.  The signature here matches it.)
+ *
+ * The ops table the caller passes MUST outlive every call krpc can make through
+ * it: ibcore passes a static const table and must svc_rdma_unregister_verbs()
+ * before that table (its module text) can go away.  Registration is single-
+ * provider: a second svc_rdma_register_verbs() while one is registered is
+ * rejected.
+ */
+struct svc_rdma_verbs_ops {
+	int	(*svo_listen_start)(uint16_t port,
+		    const struct svc_rdma_ops *ops, void *ctx);
+	void	(*svo_listen_stop)(void);
+	int	(*svo_conn_send)(struct svc_rdma_conn *conn, const void *buf,
+		    uint32_t len);
+	void	(*svo_conn_set_ctx)(struct svc_rdma_conn *conn, void *cctx);
+	void	*(*svo_conn_get_ctx)(struct svc_rdma_conn *conn);
+};
+
+/*
+ * Register / unregister the ibcore verbs-ops table with the krpc layer.  These
+ * are DEFINED in sys/rpc/svc_rdma.c (built into the kernel) and CALLED from
+ * ibcore (svc_verbs.c) at module load / unload.  register returns 0 on success
+ * or EBUSY if a table is already registered (or EINVAL for a NULL/incomplete
+ * table); unregister is idempotent.  ops MUST outlive the registration window
+ * (register .. unregister).
+ *
+ * Registration is OWNER-KEYED.  svc_rdma_unregister_verbs() takes the SAME ops
+ * pointer that the matching svc_rdma_register_verbs() recorded, and is a no-op
+ * unless that pointer is the one currently registered.  This is load-bearing in
+ * the shipping GENERIC-OFED config: options OFED compiles the provider IN-KERNEL
+ * (which registers at boot) AND also builds ibcore.ko carrying a DUPLICATE
+ * register/unregister pair over its OWN &ibcore_verbs_ops.  A kldload ibcore on
+ * such a kernel finds a provider already registered and gets EBUSY (its
+ * &ibcore_verbs_ops never becomes the owner); a later kldunload must then NOT
+ * tear down the in-kernel provider's live listener.  Owner-keying guarantees
+ * exactly that: the module's unregister(&module_ibcore_verbs_ops) does not match
+ * the in-kernel owner and returns without touching the global or the listener.
+ */
+int	svc_rdma_register_verbs(const struct svc_rdma_verbs_ops *ops);
+void	svc_rdma_unregister_verbs(const struct svc_rdma_verbs_ops *ops);
+
 #endif	/* _RDMA_SVC_RDMA_H */
