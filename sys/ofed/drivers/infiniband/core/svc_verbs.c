@@ -55,6 +55,7 @@
 #include <linux/dma-mapping.h>	/* DMA_FROM_DEVICE */
 #include <rdma/rdma_cm.h>
 #include <rdma/ib_verbs.h>
+#include <rdma/svc_rdma.h>	/* consumer upcall interface (TASK_003e-1) */
 
 #include <sys/param.h>
 #include <sys/systm.h>
@@ -88,14 +89,29 @@
  * The CONNECT_REQUEST path does NOT touch sl_id: that event is delivered on a
  * fresh child cm_id (the handler's id argument), which is declined and
  * destroyed by the CM core, independent of the listener.
+ *
+ * sl_ops/sl_ctx (TASK_003e-1) are the consumer upcall table and its opaque
+ * context, set once by svc_rdma_listen_start_ops() before the listener is
+ * published and cleared on stop.  The sysctl self-test path passes
+ * &svc_rdma_default_ops (and a NULL ctx), preserving the original accept ->
+ * parse -> stub reply -> teardown behavior.  They are read under sl_lock at
+ * accept time and COPIED onto each connection (sc_ops/sc_ctx), so completions
+ * and the teardown task never chase the listener pointer (which may be torn
+ * down out from under a live conn): a conn carries its own immutable copy for
+ * its whole lifetime.  ops is a const function-pointer table the consumer owns
+ * and must outlive the listener; ctx must outlive svc_rdma_listen_stop().
  */
 struct svc_rdma_listener {
 	struct mtx		 sl_lock;
 	struct rdma_cm_id	*sl_id;
+	const struct svc_rdma_ops *sl_ops;
+	void			*sl_ctx;
 };
 
 static struct svc_rdma_listener svc_rdma_listener = {
 	.sl_id = NULL,
+	.sl_ops = NULL,
+	.sl_ctx = NULL,
 };
 
 MALLOC_DEFINE(M_NFSRDMA, "nfsrdma", "NFS over RDMA server");
@@ -176,19 +192,14 @@ enum {
 };
 
 /*
- * Parsed inline RPC-over-RDMA call.  rpc/rpc_len point into the recv buffer (no
- * copy); they are only valid while that buffer is owned by the completion that
- * produced them.  3c only locates the payload -- decoding the ONC RPC body is
- * the krpc layer's job (3e).
+ * struct svc_rdma_msg (the parsed inline RPC-over-RDMA call) and the opaque
+ * struct svc_rdma_conn forward declaration now live in <rdma/svc_rdma.h>, the
+ * shared consumer contract included above; that definition is authoritative.
+ * rpc/rpc_len point into the recv buffer (no copy); they are only valid while
+ * that buffer is owned by the completion that produced them (and, for a
+ * consumer, only for the duration of the sro_recv upcall).  3c only locates the
+ * payload -- decoding the ONC RPC body is the krpc layer's job (3e).
  */
-struct svc_rdma_msg {
-	uint32_t	 xid;		/* word0, echoed opaque */
-	uint32_t	 credit;	/* word2, flow control */
-	const void	*rpc;		/* inline RPC payload (buf + RPCRDMA_HDR_MIN) */
-	uint32_t	 rpc_len;	/* payload length (len - RPCRDMA_HDR_MIN) */
-};
-
-struct svc_rdma_conn;
 
 /*
  * One posted receive buffer.  rr_cqe.done is the completion callback the CQ
@@ -239,17 +250,31 @@ struct svc_rdma_send {
  * lifetime essay above svc_rdma_conn_destroy().
  *
  * sc_reposts, also under sc_lock, counts recv reposts currently in flight in
- * svc_rdma_wc_recv() (incremented while still SC_UP, decremented after
- * ib_post_recv returns).  The teardown task waits for it to reach 0 (msleep on
- * &sc_reposts) BEFORE ib_drain_qp(), so no late WR can be posted after the
- * drain sentinel -- this is the post-after-drain UAF barrier.
+ * svc_rdma_wc_recv() (incremented while not SC_CLOSING, decremented after
+ * ib_post_recv returns).  The teardown task waits for it to reach 0 BEFORE
+ * ib_drain_qp(), so no late WR can be posted after the drain sentinel -- this is
+ * the post-after-drain UAF barrier.
  *
  * sc_sends is the send-side mirror of sc_reposts (3d): it counts reply sends
- * currently in flight in svc_rdma_reply() (incremented while still SC_UP under
- * sc_lock, decremented after ib_post_send returns).  The teardown task waits
- * for sc_sends == 0 in the SAME barrier that waits for sc_reposts == 0, BEFORE
- * ib_drain_qp(), so no late SEND WR can be posted behind the SQ drain sentinel
- * -- the identical post-after-drain UAF barrier applied to the send queue.
+ * currently in flight in svc_rdma_conn_send() (incremented while still SC_UP
+ * under sc_lock, decremented after ib_post_send returns).  The teardown task
+ * waits for sc_sends == 0 in the SAME barrier that waits for sc_reposts == 0,
+ * BEFORE ib_drain_qp(), so no late SEND WR can be posted behind the SQ drain
+ * sentinel -- the identical post-after-drain UAF barrier applied to the SQ.
+ *
+ * sc_upcalls (TASK_003e-1) extends that quiescence pattern to the CONSUMER
+ * upcalls: it counts in-flight sro_newconn + sro_recv calls (incremented under
+ * sc_lock at the SC_UP win / the SC_UP-and-newconn-done recv gate, decremented
+ * after the upcall returns).  The teardown drains it in the SAME barrier, BEFORE
+ * delivering sro_disconnect, so no sro_recv (or the sro_newconn) can overlap
+ * sro_disconnect and the consumer may free its per-conn state inside disconnect.
+ *
+ * All three counters share ONE wakeup channel, &sc_upcalls: every decrement site
+ * (repost, send, upcall) does wakeup(&sc_upcalls), and the teardown msleeps on
+ * &sc_upcalls re-checking all three.  A single channel cannot lose a wakeup (any
+ * decrement wakes the sleeper, which re-evaluates the full predicate) and cannot
+ * self-deadlock (the teardown runs on taskqueue_thread; the decrementers run on
+ * the CQ workqueue / CM contexts and only ever hold sc_lock briefly).
  */
 struct svc_rdma_conn {
 	struct rdma_cm_id	*sc_id;		/* child cm_id; QP is sc_id->qp */
@@ -270,6 +295,44 @@ struct svc_rdma_conn {
 	int			 sc_sends;	/* in-flight reply sends (sc_lock) */
 	struct task		 sc_teardown;	/* deferred (sleepable) unwind */
 	TAILQ_ENTRY(svc_rdma_conn) sc_link;	/* registry (svc_rdma_conns_lock) */
+
+	/*
+	 * Consumer upcall binding (TASK_003e-1).  sc_ops/sc_ctx are the
+	 * IMMUTABLE copy of the listener's sl_ops/sl_ctx taken at accept time,
+	 * so a completion or the teardown task reaches the consumer without
+	 * touching the listener (which can be stopped while this conn is still
+	 * live).  Both are set once in svc_rdma_accept() before the conn goes
+	 * live and never mutated, so they are read without sc_lock.
+	 *
+	 * sc_cctx is the consumer's OWN per-connection state, set/cleared by the
+	 * consumer via svc_rdma_conn_set_ctx() (typically from sro_newconn) and
+	 * read back via svc_rdma_conn_get_ctx().  The verbs layer never
+	 * dereferences it; it is guarded by sc_lock only to give the set/get a
+	 * defined memory ordering against the upcalls.
+	 *
+	 * The two upcall-lifecycle latches, both under sc_lock, distinguish the
+	 * "about to call sro_newconn" instant from the "sro_newconn has returned"
+	 * instant -- they are NOT redundant:
+	 *   sc_newconn_fired is set in the SC_UP-winning section BEFORE sro_newconn
+	 *     is called.  It is the DURABLE pairing token: the teardown delivers
+	 *     sro_disconnect iff sc_newconn_fired, so a teardown that lands in the
+	 *     post-sro_newconn / pre-sc_newconn_done window still pairs correctly
+	 *     (the upcall ran; disconnect must follow).  Set once, never cleared.
+	 *   sc_newconn_done is set STRICTLY AFTER sro_newconn returns.  It is the
+	 *     recv DISPATCH gate: the recv path dispatches sro_recv only while
+	 *     (SC_UP && sc_newconn_done), so no sro_recv can run before sro_newconn
+	 *     has fully completed.
+	 *
+	 * sc_upcalls counts in-flight consumer upcalls (sro_newconn + sro_recv); see
+	 * the quiescence-barrier note above.  The teardown drains it to 0 before
+	 * sro_disconnect, so disconnect never overlaps another upcall.
+	 */
+	const struct svc_rdma_ops *sc_ops;	/* consumer upcalls (immutable) */
+	void			*sc_ctx;	/* consumer listener ctx (immut.) */
+	void			*sc_cctx;	/* consumer per-conn state (sc_lock) */
+	bool			 sc_newconn_fired; /* sro_newconn entered (sc_lock) */
+	bool			 sc_newconn_done; /* sro_newconn returned (sc_lock) */
+	int			 sc_upcalls;	/* in-flight consumer upcalls (sc_lock) */
 };
 
 /*
@@ -347,6 +410,25 @@ static void svc_rdma_reply(struct svc_rdma_conn *conn, uint32_t xid);
 static void svc_rdma_wc_send(struct ib_cq *cq, struct ib_wc *wc);
 
 /*
+ * Default consumer ops (TASK_003e-1) -- the in-tree self-test policy that
+ * preserves the original sysctl behavior: ESTABLISHED logs, a parsed call gets
+ * the fixed stub reply via svc_rdma_reply(), and teardown logs.  The plain
+ * vfs.nfsrdma.listen sysctl binds these, so its observable behavior (accept ->
+ * parse -> stub reply -> teardown, with every barrier/registry intact) is
+ * unchanged from 3d.
+ */
+static void svc_rdma_default_newconn(void *ctx, struct svc_rdma_conn *conn);
+static int svc_rdma_default_recv(void *ctx, struct svc_rdma_conn *conn,
+    const struct svc_rdma_msg *msg);
+static void svc_rdma_default_disconnect(void *ctx, struct svc_rdma_conn *conn);
+
+static const struct svc_rdma_ops svc_rdma_default_ops = {
+	.sro_newconn	= svc_rdma_default_newconn,
+	.sro_recv	= svc_rdma_default_recv,
+	.sro_disconnect	= svc_rdma_default_disconnect,
+};
+
+/*
  * CM event handler for the *listener* cm_id and for the child cm_ids it
  * spawns.  Runs in the rdma_cm work context.
  *
@@ -396,7 +478,7 @@ svc_rdma_cm_event_handler(struct rdma_cm_id *id, struct rdma_cm_event *event)
 	struct svc_rdma_conn *conn;
 	const struct sockaddr *sa;
 	const struct sockaddr_in *sin;
-	bool owned;
+	bool owned, deliver;
 
 	/*
 	 * Connection events: id->context is the per-connection object, not the
@@ -411,16 +493,58 @@ svc_rdma_cm_event_handler(struct rdma_cm_id *id, struct rdma_cm_event *event)
 		switch (event->event) {
 		case RDMA_CM_EVENT_ESTABLISHED:
 			/*
-			 * Recv buffers were posted before rdma_accept(), so the
-			 * peer's first inline call may already be completing.
-			 * Just publish SC_UP (under sc_lock, so we do not race
-			 * a teardown that a recv-error completion may have
-			 * already started) and log once, rate-limited.
+			 * The ESTABLISHED CM event is the SOLE deliverer of
+			 * sro_newconn (TASK_003e-1).  Recv buffers are posted
+			 * before rdma_accept(), so the peer's first inline call can
+			 * complete and reach svc_rdma_wc_recv() in the recv CQ
+			 * context BEFORE this event runs -- but that recv path does
+			 * NOT deliver newconn; it gates its sro_recv dispatch on
+			 * (SC_UP && sc_newconn_done) and simply drops+reposts an
+			 * early call until this handler has run.  Making ESTABLISHED
+			 * the single deliverer removes every two-deliverer race.
+			 *
+			 * Win the SC_CONNECTING -> SC_UP transition under sc_lock
+			 * (so we do not race a teardown a recv-error completion may
+			 * have already started); only the winner delivers.  In that
+			 * same section set sc_newconn_fired (the DURABLE pairing
+			 * token -- set BEFORE the upcall, so a teardown landing in the
+			 * post-upcall/pre-done window still pairs disconnect with it)
+			 * and bump sc_upcalls (this sro_newconn is now an in-flight
+			 * consumer upcall the teardown must drain before disconnect).
+			 *
+			 * Deliver sro_newconn with the lock DROPPED (the consumer may
+			 * xprt_register etc. in this sleepable CM-handler context),
+			 * and ONLY AFTER it returns set sc_newconn_done and drop the
+			 * sc_upcalls refcount under sc_lock.  Ordering is load-bearing:
+			 * sc_newconn_done becomes true strictly after sro_newconn has
+			 * completed, so the recv path's (SC_UP && sc_newconn_done)
+			 * dispatch gate is satisfied only once newconn has finished.
+			 * Because we are the sole SC_UP winner, exactly one thread ever
+			 * does this, so newconn is delivered exactly once.
+			 *
+			 * Publishing SC_UP here keeps the sysctl self-test behavior:
+			 * SC_UP enables the repost/send paths even though the default
+			 * ops' newconn is a no-op.
 			 */
 			mtx_lock(&conn->sc_lock);
-			if (conn->sc_state == SC_CONNECTING)
+			deliver = (conn->sc_state == SC_CONNECTING);
+			if (deliver) {
 				conn->sc_state = SC_UP;
+				conn->sc_newconn_fired = true;
+				conn->sc_upcalls++;
+			}
 			mtx_unlock(&conn->sc_lock);
+			if (deliver) {
+				if (conn->sc_ops != NULL &&
+				    conn->sc_ops->sro_newconn != NULL)
+					conn->sc_ops->sro_newconn(conn->sc_ctx,
+					    conn);
+				mtx_lock(&conn->sc_lock);
+				conn->sc_newconn_done = true;
+				if (--conn->sc_upcalls == 0)
+					wakeup(&conn->sc_upcalls);
+				mtx_unlock(&conn->sc_lock);
+			}
 			if (ppsratecheck(&svc_rdma_log_last,
 			    &svc_rdma_log_pps, 5))
 				printf("nfsrdma: connection established\n");
@@ -551,6 +675,9 @@ svc_rdma_cm_event_handler(struct rdma_cm_id *id, struct rdma_cm_event *event)
 		owned = (id == svc_rdma_listener.sl_id);
 		if (owned) {
 			svc_rdma_listener.sl_id = NULL;
+			/* Clear the consumer binding with sl_id (see listen_stop). */
+			svc_rdma_listener.sl_ops = NULL;
+			svc_rdma_listener.sl_ctx = NULL;
 			svc_rdma_listen_port = 0;
 		}
 		mtx_unlock(&svc_rdma_listener.sl_lock);
@@ -680,6 +807,7 @@ svc_rdma_wc_recv(struct ib_cq *cq, struct ib_wc *wc)
 	const struct ib_recv_wr *bad_wr;
 	uint32_t len;
 	int rc;
+	bool ready;
 
 	rr = container_of(wc->wr_cqe, struct svc_rdma_recv, rr_cqe);
 	conn = rr->rr_conn;
@@ -752,44 +880,114 @@ svc_rdma_wc_recv(struct ib_cq *cq, struct ib_wc *wc)
 		    "inline rpc=%u bytes\n", msg.xid, msg.credit, msg.rpc_len);
 
 	/*
-	 * 3d: marshal and post an inline RPC-over-RDMA reply echoing this
-	 * call's opaque xid.  svc_rdma_reply() grabs a free send buffer, builds
-	 * the fixed reply, and posts it under the SC_UP-gated sc_sends barrier
-	 * (the send-side mirror of the repost barrier below).  It trusts NOTHING
-	 * from the call except msg.xid.  If the connection is no longer SC_UP or
-	 * the bounded send pool is exhausted it drops the reply (rate-limited
-	 * log) rather than blocking this completion or over-allocating.  We
-	 * still repost the recv buffer below regardless, so a dropped reply does
-	 * not starve the receive queue.
+	 * Readiness gate + upcall barrier (TASK_003e-1).  sro_newconn is delivered
+	 * SOLELY by the ESTABLISHED CM handler, which sets sc_newconn_done strictly
+	 * AFTER sro_newconn returns and only on the SC_CONNECTING -> SC_UP win.  This
+	 * recv path never delivers newconn; it only DISPATCHES sro_recv, and must do
+	 * so only once the consumer is ready.  In ONE sc_lock section capture
+	 *   ready == (sc_state == SC_UP && sc_newconn_done)
+	 * and, if ready, bump sc_upcalls (this sro_recv becomes an in-flight consumer
+	 * upcall that the teardown drains before sro_disconnect -- the send-side
+	 * mirror of the sc_reposts/sc_sends arm).  The two conjuncts guarantee (a)
+	 * sro_newconn has fully completed and (b) the conn is SC_UP, so a synchronous
+	 * svc_rdma_conn_send() from sro_recv does not hit the SC_UP gate's ENOTCONN.
+	 *
+	 * If not ready, skip the dispatch and fall through to the repost barrier.
+	 * Two cases reach !ready, both benign:
+	 *   - a rare recv that completed BEFORE the ESTABLISHED event (recv CQ and
+	 *     CM work queue are independent contexts): SC_CONNECTING / not-yet-set
+	 *     newconn -> drop this call and repost (the repost gate now admits
+	 *     SC_CONNECTING, so the RQ does not deplete); the RC client retransmits
+	 *     the RPC, and a later recv dispatches once ESTABLISHED has delivered
+	 *     newconn and published SC_UP.  No reply is fabricated for an
+	 *     undispatched call, so the client sees only a one-retransmit delay on
+	 *     its very first op, then success.
+	 *   - the conn is already SC_CLOSING (a disconnect/error raced this
+	 *     completion): the repost barrier below sees SC_CLOSING and declines
+	 *     the repost; the teardown reclaims the buffer.
 	 */
-	svc_rdma_reply(conn, msg.xid);
+	mtx_lock(&conn->sc_lock);
+	ready = (conn->sc_state == SC_UP && conn->sc_newconn_done);
+	if (ready)
+		conn->sc_upcalls++;
+	mtx_unlock(&conn->sc_lock);
+	if (!ready)
+		goto repost;
+
+	/*
+	 * Hand the parsed call to the consumer (TASK_003e-1).  This REPLACES the
+	 * former direct svc_rdma_reply() call: the default ops' sro_recv is what
+	 * now marshals and posts the stub reply (preserving 3d behavior), while a
+	 * real consumer (krpc) enqueues the message and calls xprt_active().
+	 *
+	 * Contract honored here: the ready gate above guarantees sro_newconn has
+	 * already COMPLETED for this conn and the conn is SC_UP, so a consumer's
+	 * sro_recv may safely svc_rdma_conn_get_ctx() the state its sro_newconn
+	 * attached, and a synchronous svc_rdma_conn_send() will not see ENOTCONN.
+	 * sro_recv runs in THIS completion context and MUST NOT sleep; msg (and
+	 * msg.rpc, which points into rr_buf) is valid only for the duration of this
+	 * call -- we repost rr_buf right after, so a consumer that needs the bytes
+	 * must copy them before returning.  A consumer may call svc_rdma_conn_send()
+	 * synchronously from within sro_recv (the default ops does, exactly as the
+	 * old code did).
+	 *
+	 * After the upcall returns we drop the sc_upcalls refcount (waking the
+	 * teardown if it was the last) BEFORE acting on the result.  sro_recv
+	 * returns 0 to continue (fall through to repost) or nonzero to close (the
+	 * consumer rejected the call).  Decrementing first is essential: a close
+	 * publishes SC_CLOSING and enqueues the teardown, whose barrier waits for
+	 * sc_upcalls == 0 -- if we still held the refcount it would wait on us
+	 * forever.  After the decrement we close and return; we do NOT repost a
+	 * connection we are tearing down (identical to the parse-error path above).
+	 */
+	rc = 0;
+	if (conn->sc_ops != NULL && conn->sc_ops->sro_recv != NULL)
+		rc = conn->sc_ops->sro_recv(conn->sc_ctx, conn, &msg);
+
+	mtx_lock(&conn->sc_lock);
+	if (--conn->sc_upcalls == 0)
+		wakeup(&conn->sc_upcalls);
+	mtx_unlock(&conn->sc_lock);
+
+	if (rc != 0) {
+		svc_rdma_conn_close(conn);
+		return;
+	}
+
+repost:
 
 	/*
 	 * Repost the same buffer to keep the receive queue from starving --
-	 * but ONLY while the connection is still SC_UP, and under an in-flight
-	 * repost refcount (sc_reposts) that the teardown task drains before it
-	 * calls ib_drain_qp().  This closes a post-after-drain UAF: mlx5's
-	 * ib_post_recv does NOT reject an ERR-state QP, so without the barrier a
-	 * repost that sampled SC_UP, dropped the lock, then lost the CPU could
-	 * enqueue a WR AFTER the drain sentinel; that WR's flush completion
-	 * would fire against an already-freed conn/recv.
+	 * while the connection is NOT SC_CLOSING (admitting SC_CONNECTING as well
+	 * as SC_UP), and under an in-flight repost refcount (sc_reposts) that the
+	 * teardown task drains before it calls ib_drain_qp().  This closes a
+	 * post-after-drain UAF: mlx5's ib_post_recv does NOT reject an ERR-state QP,
+	 * so without the barrier a repost that sampled a non-closing state, dropped
+	 * the lock, then lost the CPU could enqueue a WR AFTER the drain sentinel;
+	 * that WR's flush completion would fire against an already-freed conn/recv.
 	 *
-	 * Sequence: take sc_lock; if no longer SC_UP, bail (the teardown owns
-	 * this buffer and reclaims it after ib_drain_qp(), so skipping the
-	 * repost cannot leak).  Otherwise bump sc_reposts and drop the lock
-	 * before the (non-sleeping; mlx5_ib_post_recv only takes the RQ
-	 * spinlock, mlx5_ib_qp.c:4211) ib_post_recv.  Reacquire, decrement, and
-	 * wake the teardown if we were the last in-flight repost.
-	 *
-	 * Because svc_rdma_conn_close() publishes SC_CLOSING BEFORE enqueuing
-	 * the teardown task, once teardown is pending no NEW repost passes the
-	 * SC_UP check; the task's msleep loop then waits only for already
-	 * counted reposts to finish their ib_post_recv and decrement.  After
-	 * the count hits 0 every posted WR is on the QP before ib_drain_qp(),
+	 * The gate is SC_CLOSING-based, not SC_UP-based (TASK_003e-1 SHOULD-FIX): a
+	 * peer that sends an RPC before ESTABLISHED leaves the conn SC_CONNECTING,
+	 * and the recv path drops+reposts that early call -- if the repost required
+	 * SC_UP it would decline, depleting the RQ one buffer per early call until
+	 * RNR.  Admitting SC_CONNECTING recycles the buffer so the RQ stays full.
+	 * Post-after-drain safety is UNCHANGED: svc_rdma_conn_close() publishes
+	 * SC_CLOSING under sc_lock BEFORE enqueuing the teardown, so once teardown
+	 * is pending NO new repost passes the SC_CLOSING check (whether the conn was
+	 * SC_CONNECTING or SC_UP when it closed); the task's barrier then waits only
+	 * for already-counted reposts to finish their ib_post_recv and decrement.
+	 * After the count hits 0 every posted WR is on the QP before ib_drain_qp(),
 	 * so the drain catches them all and nothing posts afterward.
+	 *
+	 * Sequence: take sc_lock; if SC_CLOSING, bail (the teardown owns this buffer
+	 * and reclaims it after ib_drain_qp(), so skipping the repost cannot leak).
+	 * Otherwise bump sc_reposts and drop the lock before the (non-sleeping;
+	 * mlx5_ib_post_recv only takes the RQ spinlock, mlx5_ib_qp.c:4211)
+	 * ib_post_recv.  Reacquire, decrement, and wake the teardown (on the shared
+	 * &sc_upcalls channel) if we were the last in-flight repost.
 	 */
 	mtx_lock(&conn->sc_lock);
-	if (conn->sc_state != SC_UP) {
+	if (conn->sc_state == SC_CLOSING) {
 		mtx_unlock(&conn->sc_lock);
 		return;
 	}
@@ -805,7 +1003,7 @@ svc_rdma_wc_recv(struct ib_cq *cq, struct ib_wc *wc)
 
 	mtx_lock(&conn->sc_lock);
 	if (--conn->sc_reposts == 0)
-		wakeup(&conn->sc_reposts);
+		wakeup(&conn->sc_upcalls);
 	mtx_unlock(&conn->sc_lock);
 
 	if (rc != 0) {
@@ -817,34 +1015,50 @@ svc_rdma_wc_recv(struct ib_cq *cq, struct ib_wc *wc)
 }
 
 /*
- * Marshal and post an inline RPC-over-RDMA version 1 reply (3d), echoing the
- * call's opaque xid.  Called from svc_rdma_wc_recv() after a good parse, in the
- * CQ workqueue context, so it must not sleep and must not take a sleepable lock.
+ * svc_rdma_conn_send() -- copy a caller-marshalled inline reply into a free
+ * send buffer and post it (TASK_003e-1).  This is the reusable send-pool path:
+ * the former svc_rdma_reply() body, generalized so the bytes come from a caller
+ * buffer (buf/len) instead of being built in-place from fixed constants.  Both
+ * the in-tree default ops (via svc_rdma_reply) and an external consumer's
+ * sro_recv post replies through here, so the SC_UP gate, bounded-pool free-list,
+ * and sc_sends quiescence barrier are honored IDENTICALLY for every caller --
+ * unchanged from 3d.
  *
- * UNTRUSTED PEER.  The ONLY peer-derived datum that enters the reply is the
- * 32-bit opaque xid, which we echo verbatim per RFC 5531 -- nothing else from
- * the call body or header is trusted.  Every other field is our own fixed
- * constant.  The credit we GRANT is conn->sc_nrecv -- the number of recv
- * buffers we actually posted -- NOT the client's offered credit and NOT the
- * SVC_RDMA_RECV_DEPTH constant (which can exceed what a small-cap device let us
- * post).  The reply is a fixed SVC_RDMA_REPLY_LEN bytes that we build ourselves
- * into a buffer we own, well under SVC_RDMA_INLINE, so no peer length can size
- * or overflow it.
+ * PUBLIC entry point (declared in <rdma/svc_rdma.h>).  Context: callable from
+ * the recv completion (IB_POLL_WORKQUEUE) -- it does NOT sleep and takes only
+ * sc_lock briefly, exactly as before.  A consumer MAY call it synchronously from
+ * within sro_recv (the default ops does).  It MUST NOT be called after this
+ * conn's sro_disconnect has returned (the teardown owns the pool by then); the
+ * SC_UP gate makes a stray late call a harmless drop rather than a UAF, but the
+ * consumer must not rely on that.
+ *
+ * buf is caller-owned and only read here: we COPY len bytes into ss_buf (no
+ * ownership transfer), so the caller may free/reuse buf the instant this
+ * returns.  len must be <= SVC_RDMA_INLINE (the mapped buffer size); a longer
+ * reply needs RDMA Write chunks (3f) and is rejected with EINVAL rather than
+ * truncated.
+ *
+ * UNTRUSTED PEER.  This routine copies exactly the bytes the caller marshalled;
+ * it trusts nothing from the wire itself.  The default ops echoes only the
+ * 32-bit opaque xid into an otherwise-fixed reply (see svc_rdma_reply); a real
+ * consumer is responsible for bounds-checking anything peer-derived BEFORE
+ * handing the marshalled reply here.
  *
  * Bounded pool + send-quiescence barrier (the send-side mirror of the recv
- * repost barrier).  Under sc_lock, in one critical section, we:
- *   - bail if the connection is no longer SC_UP (a teardown is in progress; the
- *     send pool is reclaimed by that task after ib_drain_qp(), so dropping the
- *     reply here cannot leak and must not post behind the drain sentinel);
+ * repost barrier), UNCHANGED from 3d.  Under sc_lock, in one critical section:
+ *   - bail (ENOTCONN) if the connection is no longer SC_UP (a teardown is in
+ *     progress; the send pool is reclaimed by that task after ib_drain_qp(), so
+ *     dropping the reply here cannot leak and must not post behind the drain
+ *     sentinel);
  *   - claim a free send buffer (ss_inuse) from the bounded pool, dropping the
- *     reply if none is free (a peer flooding calls cannot make us over-allocate
- *     or block this completion);
+ *     reply (EBUSY) if none is free (a peer flooding calls cannot make us
+ *     over-allocate or block this completion);
  *   - bump sc_sends (the in-flight-send refcount the teardown drains before
  *     ib_drain_qp()).
- * We then build the reply and ib_post_send() with the lock DROPPED (matching
- * the recv path, which drops sc_lock across ib_post_recv).  After the post we
- * reacquire, decrement sc_sends, and wake the teardown if we were the last
- * in-flight send.  On post failure we release the buffer and close the conn.
+ * We then copy + ib_post_send() with the lock DROPPED (matching the recv path,
+ * which drops sc_lock across ib_post_recv).  After the post we reacquire,
+ * decrement sc_sends, and wake the teardown if we were the last in-flight send.
+ * On post failure we release the buffer and close the conn.
  *
  * Because svc_rdma_conn_close() publishes SC_CLOSING BEFORE enqueuing the
  * teardown task, once teardown is pending no NEW reply passes the SC_UP check;
@@ -853,13 +1067,19 @@ svc_rdma_wc_recv(struct ib_cq *cq, struct ib_wc *wc)
  * before ib_drain_qp(), so the SQ drain sentinel catches them all and nothing
  * posts afterward -- the identical argument the recv barrier makes for the RQ.
  */
-static void
-svc_rdma_reply(struct svc_rdma_conn *conn, uint32_t xid)
+int
+svc_rdma_conn_send(struct svc_rdma_conn *conn, const void *buf, uint32_t len)
 {
 	struct svc_rdma_send *ss;
 	const struct ib_send_wr *bad_wr;
-	char *p;
 	int i, rc;
+
+	/*
+	 * The reply must fit a single mapped send buffer.  A fixed local bound,
+	 * not peer-derived; a larger reply is a chunk path (3f), not a truncation.
+	 */
+	if (len == 0 || len > SVC_RDMA_INLINE)
+		return (EINVAL);
 
 	/*
 	 * Claim a free send buffer and arm the send barrier, all while SC_UP,
@@ -869,7 +1089,7 @@ svc_rdma_reply(struct svc_rdma_conn *conn, uint32_t xid)
 	mtx_lock(&conn->sc_lock);
 	if (conn->sc_state != SC_UP) {
 		mtx_unlock(&conn->sc_lock);
-		return;
+		return (ENOTCONN);
 	}
 	ss = NULL;
 	for (i = 0; i < conn->sc_nsend; i++) {
@@ -883,69 +1103,25 @@ svc_rdma_reply(struct svc_rdma_conn *conn, uint32_t xid)
 		/*
 		 * Bounded pool exhausted (peer is flooding calls faster than
 		 * our sends complete).  Drop this reply -- never block the
-		 * completion, never over-allocate.  Rate-limited because the
-		 * arrival rate is peer-controlled.
+		 * completion, never over-allocate.
 		 */
 		mtx_unlock(&conn->sc_lock);
-		if (ppsratecheck(&svc_rdma_log_last, &svc_rdma_log_pps, 5))
-			printf("nfsrdma: send buffers exhausted, dropping "
-			    "reply (xid=0x%08x)\n", xid);
-		return;
+		return (EBUSY);
 	}
 	conn->sc_sends++;
 	mtx_unlock(&conn->sc_lock);
 
 	/*
-	 * Build the fixed reply into our own buffer with be32enc (endian- and
-	 * alignment-safe; never cast-and-store).  Layout (all big-endian XDR
-	 * words):
-	 *   RFC 8166 transport header (7 words = RPCRDMA_HDR_MIN):
-	 *     w0 rdma_xid    = echoed opaque xid (the ONLY peer-derived value)
-	 *     w1 rdma_vers   = RPCRDMA_VERSION (1)
-	 *     w2 rdma_credit = conn->sc_nrecv -- the credit we GRANT is exactly the
-	 *                      number of recv buffers we actually posted (NOT the
-	 *                      peer's offered credit, and NOT the SVC_RDMA_RECV_DEPTH
-	 *                      constant: on a device whose max_qp_wr < the constant
-	 *                      we posted fewer, so granting the constant would
-	 *                      over-advertise and invite RNR/stall).  sc_nrecv is set
-	 *                      once at accept time and never mutated, so reading it
-	 *                      here without sc_lock is safe.
-	 *     w3 rdma_proc   = RDMA_MSG (0)
-	 *     w4 read_list   = 0 (empty)
-	 *     w5 write_list  = 0 (empty)
-	 *     w6 reply_chunk = 0 (empty)
-	 *   ONC RPC reply body (RFC 5531, 6 words = 24 bytes):
-	 *     w7  xid           = echoed opaque xid (RPC message xid)
-	 *     w8  mtype         = RPC_REPLY (1)
-	 *     w9  reply_stat    = RPC_MSG_ACCEPTED (0)
-	 *     w10 verf.flavor   = RPC_AUTH_NONE (0)
-	 *     w11 verf.length   = 0 (empty opaque body)
-	 *     w12 accept_stat   = RPC_ACCEPT_SUCCESS (0)
-	 * Total = RPCRDMA_HDR_MIN + 24 = SVC_RDMA_REPLY_LEN, fixed.
+	 * Copy the caller's already-marshalled reply into our DMA-mapped send
+	 * buffer.  The mapping is DMA_TO_DEVICE and was set up once at accept
+	 * time; the device reads ss_buf as we just wrote it (CPU-then-device
+	 * ordering is provided by the post doorbell).  Build the prebuilt-shape
+	 * SGE/WR each time with this reply's length (<= SVC_RDMA_INLINE).
 	 */
-	p = ss->ss_buf;
-	be32enc(p +  0, xid);			/* w0  rdma_xid */
-	be32enc(p +  4, RPCRDMA_VERSION);	/* w1  rdma_vers */
-	be32enc(p +  8, (uint32_t)conn->sc_nrecv); /* w2 rdma_credit: posted depth */
-	be32enc(p + 12, RDMA_MSG);		/* w3  rdma_proc */
-	be32enc(p + 16, 0);			/* w4  read_list (empty) */
-	be32enc(p + 20, 0);			/* w5  write_list (empty) */
-	be32enc(p + 24, 0);			/* w6  reply_chunk (empty) */
-	be32enc(p + 28, xid);			/* w7  RPC xid */
-	be32enc(p + 32, RPC_REPLY);		/* w8  mtype = REPLY */
-	be32enc(p + 36, RPC_MSG_ACCEPTED);	/* w9  reply_stat */
-	be32enc(p + 40, RPC_AUTH_NONE);		/* w10 verf.flavor */
-	be32enc(p + 44, 0);			/* w11 verf.length = 0 */
-	be32enc(p + 48, RPC_ACCEPT_SUCCESS);	/* w12 accept_stat = SUCCESS */
+	memcpy(ss->ss_buf, buf, len);
 
-	/*
-	 * The DMA mapping is DMA_TO_DEVICE and was set up once at accept time;
-	 * the device reads ss_buf as we just wrote it (CPU-then-device ordering
-	 * is provided by the post doorbell).  Build the prebuilt-shape SGE/WR
-	 * each time with the fixed reply length.
-	 */
 	ss->ss_sge.addr = ss->ss_dma;
-	ss->ss_sge.length = SVC_RDMA_REPLY_LEN;
+	ss->ss_sge.length = len;
 	ss->ss_sge.lkey = conn->sc_pd->local_dma_lkey;
 
 	ss->ss_cqe.done = svc_rdma_wc_send;
@@ -973,14 +1149,166 @@ svc_rdma_reply(struct svc_rdma_conn *conn, uint32_t xid)
 		ss->ss_inuse = false;
 	}
 	if (--conn->sc_sends == 0)
-		wakeup(&conn->sc_sends);
+		wakeup(&conn->sc_upcalls);	/* shared quiesce channel */
 	mtx_unlock(&conn->sc_lock);
 
 	if (rc != 0) {
 		if (ppsratecheck(&svc_rdma_log_last, &svc_rdma_log_pps, 5))
 			printf("nfsrdma: ib_post_send (reply) failed: %d\n", rc);
 		svc_rdma_conn_close(conn);
+		return (rc < 0 ? -rc : rc);
 	}
+	return (0);
+}
+
+/*
+ * Attach/retrieve the consumer's per-connection state (TASK_003e-1).  The verbs
+ * layer never interprets or frees sc_cctx; it is opaque consumer-owned state
+ * that the consumer sets (typically from sro_newconn) and reclaims (from
+ * sro_disconnect).  We take sc_lock only to give set/get a defined ordering
+ * against the upcall contexts; the verbs layer itself does not read sc_cctx.
+ * Declared in <rdma/svc_rdma.h>.
+ */
+void
+svc_rdma_conn_set_ctx(struct svc_rdma_conn *conn, void *cctx)
+{
+
+	mtx_lock(&conn->sc_lock);
+	conn->sc_cctx = cctx;
+	mtx_unlock(&conn->sc_lock);
+}
+
+void *
+svc_rdma_conn_get_ctx(struct svc_rdma_conn *conn)
+{
+	void *cctx;
+
+	mtx_lock(&conn->sc_lock);
+	cctx = conn->sc_cctx;
+	mtx_unlock(&conn->sc_lock);
+	return (cctx);
+}
+
+/*
+ * Marshal and post the in-tree STUB inline RPC-over-RDMA version 1 reply (3d),
+ * echoing the call's opaque xid.  This is now the DEFAULT-OPS reply policy: it
+ * builds the fixed bytes and hands them to svc_rdma_conn_send() (the reusable
+ * send-pool path), so its observable behavior is identical to 3d.  Called from
+ * svc_rdma_default_recv() in the CQ workqueue context, so it must not sleep.
+ *
+ * UNTRUSTED PEER.  The ONLY peer-derived datum that enters the reply is the
+ * 32-bit opaque xid, which we echo verbatim per RFC 5531 -- nothing else from
+ * the call body or header is trusted.  Every other field is our own fixed
+ * constant.  The credit we GRANT is conn->sc_nrecv -- the number of recv
+ * buffers we actually posted -- NOT the client's offered credit and NOT the
+ * SVC_RDMA_RECV_DEPTH constant (which can exceed what a small-cap device let us
+ * post).  The reply is a fixed SVC_RDMA_REPLY_LEN bytes built into a local
+ * stack buffer we own, well under SVC_RDMA_INLINE, so no peer length can size or
+ * overflow it; svc_rdma_conn_send() copies it into the DMA buffer.
+ *
+ * A drop (pool exhausted / connection closing) returns from svc_rdma_conn_send()
+ * with EBUSY/ENOTCONN; we rate-limit-log and ignore it -- the receive queue is
+ * still reposted by the caller, so a dropped reply never starves the RQ, exactly
+ * as in 3d.
+ */
+static void
+svc_rdma_reply(struct svc_rdma_conn *conn, uint32_t xid)
+{
+	char reply[SVC_RDMA_REPLY_LEN];
+	char *p = reply;
+	int rc;
+
+	/*
+	 * Build the fixed reply with be32enc (endian- and alignment-safe; never
+	 * cast-and-store).  Layout (all big-endian XDR words):
+	 *   RFC 8166 transport header (7 words = RPCRDMA_HDR_MIN):
+	 *     w0 rdma_xid    = echoed opaque xid (the ONLY peer-derived value)
+	 *     w1 rdma_vers   = RPCRDMA_VERSION (1)
+	 *     w2 rdma_credit = conn->sc_nrecv -- the credit we GRANT is exactly the
+	 *                      number of recv buffers we actually posted (NOT the
+	 *                      peer's offered credit, and NOT the SVC_RDMA_RECV_DEPTH
+	 *                      constant: on a device whose max_qp_wr < the constant
+	 *                      we posted fewer, so granting the constant would
+	 *                      over-advertise and invite RNR/stall).  sc_nrecv is set
+	 *                      once at accept time and never mutated, so reading it
+	 *                      here without sc_lock is safe.
+	 *     w3 rdma_proc   = RDMA_MSG (0)
+	 *     w4 read_list   = 0 (empty)
+	 *     w5 write_list  = 0 (empty)
+	 *     w6 reply_chunk = 0 (empty)
+	 *   ONC RPC reply body (RFC 5531, 6 words = 24 bytes):
+	 *     w7  xid           = echoed opaque xid (RPC message xid)
+	 *     w8  mtype         = RPC_REPLY (1)
+	 *     w9  reply_stat    = RPC_MSG_ACCEPTED (0)
+	 *     w10 verf.flavor   = RPC_AUTH_NONE (0)
+	 *     w11 verf.length   = 0 (empty opaque body)
+	 *     w12 accept_stat   = RPC_ACCEPT_SUCCESS (0)
+	 * Total = RPCRDMA_HDR_MIN + 24 = SVC_RDMA_REPLY_LEN, fixed.
+	 */
+	be32enc(p +  0, xid);			/* w0  rdma_xid */
+	be32enc(p +  4, RPCRDMA_VERSION);	/* w1  rdma_vers */
+	be32enc(p +  8, (uint32_t)conn->sc_nrecv); /* w2 rdma_credit: posted depth */
+	be32enc(p + 12, RDMA_MSG);		/* w3  rdma_proc */
+	be32enc(p + 16, 0);			/* w4  read_list (empty) */
+	be32enc(p + 20, 0);			/* w5  write_list (empty) */
+	be32enc(p + 24, 0);			/* w6  reply_chunk (empty) */
+	be32enc(p + 28, xid);			/* w7  RPC xid */
+	be32enc(p + 32, RPC_REPLY);		/* w8  mtype = REPLY */
+	be32enc(p + 36, RPC_MSG_ACCEPTED);	/* w9  reply_stat */
+	be32enc(p + 40, RPC_AUTH_NONE);		/* w10 verf.flavor */
+	be32enc(p + 44, 0);			/* w11 verf.length = 0 */
+	be32enc(p + 48, RPC_ACCEPT_SUCCESS);	/* w12 accept_stat = SUCCESS */
+
+	rc = svc_rdma_conn_send(conn, reply, SVC_RDMA_REPLY_LEN);
+	if (rc != 0 && ppsratecheck(&svc_rdma_log_last, &svc_rdma_log_pps, 5)) {
+		if (rc == EBUSY)
+			printf("nfsrdma: send buffers exhausted, dropping "
+			    "reply (xid=0x%08x)\n", xid);
+		else if (rc == ENOTCONN)
+			; /* connection tearing down; silent (expected) */
+		else
+			printf("nfsrdma: stub reply post failed: %d "
+			    "(xid=0x%08x)\n", rc, xid);
+	}
+}
+
+/*
+ * Default consumer ops (TASK_003e-1) -- the in-tree self-test policy bound by
+ * the plain vfs.nfsrdma.listen sysctl.  These preserve the exact 3d behavior so
+ * the sysctl self-test path is unchanged when no external consumer is
+ * registered.  ctx is always NULL for the default ops (the self-test carries no
+ * consumer state).
+ */
+static void
+svc_rdma_default_newconn(void *ctx __unused, struct svc_rdma_conn *conn __unused)
+{
+
+	/* Behavior-preserving: the original ESTABLISHED handler only logged,
+	 * which the CM event path still does; nothing extra to do here. */
+}
+
+static int
+svc_rdma_default_recv(void *ctx __unused, struct svc_rdma_conn *conn,
+    const struct svc_rdma_msg *msg)
+{
+
+	/*
+	 * The original recv path called svc_rdma_reply(conn, msg->xid) directly
+	 * after a good parse.  Do exactly that here.  Return 0 so the verbs layer
+	 * reposts the recv buffer and awaits the next call -- a dropped reply
+	 * (pool exhausted / closing) is NOT a close, identical to 3d.
+	 */
+	svc_rdma_reply(conn, msg->xid);
+	return (0);
+}
+
+static void
+svc_rdma_default_disconnect(void *ctx __unused,
+    struct svc_rdma_conn *conn __unused)
+{
+
+	/* Behavior-preserving: teardown already logs "connection torn down";
+	 * the self-test has no per-conn consumer state to release. */
 }
 
 /*
@@ -1155,21 +1483,25 @@ svc_rdma_conn_free_verbs(struct svc_rdma_conn *conn)
  * device-removal, AND accept-failure, which all funnel through conn_close().
  *
  * Teardown order, and why it is UAF-free:
- *   1. Post-quiescence barrier: msleep until sc_reposts == 0 AND sc_sends == 0.
+ *   1. Unified quiescence barrier: msleep on the shared &sc_upcalls channel until
+ *      sc_reposts == 0 AND sc_sends == 0 AND sc_upcalls == 0.
  *      svc_rdma_conn_close() published SC_CLOSING before enqueuing this task, so no
- *      NEW repost can pass the SC_UP gate in svc_rdma_wc_recv() and no NEW reply send
- *      can pass the SC_UP gate in svc_rdma_reply(); this wait only drains reposts and
- *      sends already counted (each between its refcount++ and its ib_post_recv/
- *      ib_post_send returning).  When it returns, every WR a completion will ever post
- *      -- on the RQ OR the SQ -- is already on the QP, and none can be posted
- *      afterward.  This is the barrier that makes step 2/3's "no concurrent posters"
- *      precondition true (ib_drain_sq/ib_drain_qp explicitly require no concurrent
- *      WR posters) and closes the post-after-drain UAF on BOTH queues (mlx5
- *      ib_post_recv/ib_post_send do not reject an ERR-state QP, so a late post would
- *      otherwise slip in behind the drain sentinel).  We run on taskqueue_thread,
- *      distinct from the CQ workqueue running svc_rdma_wc_recv()/svc_rdma_wc_send(),
- *      and both completion paths hold sc_lock only briefly and never block on us, so
- *      this cannot self-deadlock.
+ *      NEW repost passes the non-SC_CLOSING gate in svc_rdma_wc_recv(), no NEW reply
+ *      send passes the SC_UP gate in svc_rdma_conn_send(), and no NEW sro_recv/
+ *      sro_newconn passes its dispatch gate; this wait only drains work already
+ *      counted (each between its refcount++ and the matching decrement).  When it
+ *      returns, every WR a completion will ever post -- on the RQ OR the SQ -- is on
+ *      the QP and none can be posted afterward, AND no consumer upcall is in flight.
+ *      This makes step 2/3's "no concurrent posters" precondition true
+ *      (ib_drain_sq/ib_drain_qp require it) and closes the post-after-drain UAF on
+ *      both queues (mlx5 ib_post_recv/ib_post_send do not reject an ERR-state QP).
+ *      We run on taskqueue_thread, distinct from the CQ workqueue (reposts/sends/
+ *      sro_recv) and the CM work context (sro_newconn); those decrementers hold
+ *      sc_lock only briefly and never block on us, so this cannot self-deadlock.
+ *   1b. sro_disconnect (TASK_003e-1): delivered here, after the sc_upcalls drain (so
+ *      it never overlaps an sro_recv/sro_newconn) and gated on the durable
+ *      sc_newconn_fired token, so it is exactly-once and paired with sro_newconn.
+ *      The consumer may free its per-conn state in it.
  *   2. rdma_disconnect() (if a QP exists) -- best-effort; moves the QP toward
  *      error and tells the peer.  Errors ignored (peer may already be gone).
  *   3. ib_drain_qp() (if a QP exists) -- ib_drain_sq() then ib_drain_rq()
@@ -1198,22 +1530,53 @@ svc_rdma_conn_destroy(void *arg, int pending __unused)
 	struct svc_rdma_conn *conn = arg;
 
 	/*
-	 * Step 1: drain in-flight reposts AND in-flight reply sends before
-	 * touching the QP.  Both refcounts are armed only while SC_UP, which
-	 * conn_close() already cleared, so this only waits out the WRs already
-	 * counted.  We wake on either &sc_reposts or &sc_sends; loop until both
-	 * are zero so neither an RQ nor an SQ post can slip behind the drain.
+	 * Step 1 (TASK_003e-1): unified quiescence barrier.  Drain in-flight recv
+	 * reposts (sc_reposts), reply sends (sc_sends), AND consumer upcalls
+	 * (sc_upcalls) before touching the QP or delivering sro_disconnect.  All
+	 * three are armed only while not-closing / SC_UP, which conn_close() already
+	 * cleared (SC_CLOSING is published before this task is enqueued), so this
+	 * only waits out work already counted.  All three decrement sites wake the
+	 * SINGLE shared channel &sc_upcalls; we msleep on it and re-check the whole
+	 * predicate on every wake, so no decrement can be missed (any of the three
+	 * hitting 0 re-evaluates all three) and there is no lost wakeup.  We run on
+	 * taskqueue_thread, distinct from the CQ workqueue (reposts/sends/sro_recv)
+	 * and the CM work context (sro_newconn); those decrementers hold sc_lock
+	 * only briefly and never block on us, so this cannot self-deadlock.
+	 *
+	 * When it returns: every recv/send WR a completion will ever post is on the
+	 * QP (the post-after-drain barrier for steps 2/3, unchanged), AND no
+	 * sro_newconn or sro_recv is in flight -- so the sro_disconnect below cannot
+	 * overlap another consumer upcall, and the consumer may free its per-conn
+	 * state inside disconnect.
 	 */
 	mtx_lock(&conn->sc_lock);
-	while (conn->sc_reposts != 0 || conn->sc_sends != 0) {
-		if (conn->sc_reposts != 0)
-			msleep(&conn->sc_reposts, &conn->sc_lock, 0,
-			    "svcrdrp", 0);
-		if (conn->sc_sends != 0)
-			msleep(&conn->sc_sends, &conn->sc_lock, 0,
-			    "svcrdsn", 0);
-	}
+	while (conn->sc_reposts != 0 || conn->sc_sends != 0 ||
+	    conn->sc_upcalls != 0)
+		msleep(&conn->sc_upcalls, &conn->sc_lock, 0, "svcrdq", 0);
 	mtx_unlock(&conn->sc_lock);
+
+	/*
+	 * Step 1b (TASK_003e-1): deliver sro_disconnect, exactly once, paired with
+	 * sro_newconn via the DURABLE sc_newconn_fired token.  sc_newconn_fired is
+	 * set in the SC_UP-winning section BEFORE sro_newconn is called, so even a
+	 * teardown that raced into the post-sro_newconn / pre-sc_newconn_done window
+	 * still observes it -- disconnect is never skipped for a conn the consumer
+	 * was told about.  A conn that never won the SC_CONNECTING -> SC_UP
+	 * transition (accept-path failure, or a disconnect/error before establish)
+	 * never set sc_newconn_fired, so it fires NO sro_disconnect.  Set-once /
+	 * never-cleared by the sole deliverer + this task running once (sc_state
+	 * guard) makes it exactly-once; no read-clear is needed.
+	 *
+	 * This runs AFTER the sc_upcalls drain (so no sro_recv overlaps it) but
+	 * before the verbs drain/free, in the sleepable taskqueue_thread context the
+	 * contract promises.  SC_CLOSING is published, so any svc_rdma_conn_send()
+	 * the consumer might still issue from disconnect is a harmless SC_UP-gated
+	 * drop; the consumer holds only the opaque conn handle, never a verbs
+	 * resource this task is about to free.
+	 */
+	if (conn->sc_newconn_fired && conn->sc_ops != NULL &&
+	    conn->sc_ops->sro_disconnect != NULL)
+		conn->sc_ops->sro_disconnect(conn->sc_ctx, conn);
 
 	if (conn->sc_id != NULL && conn->sc_id->qp != NULL) {
 		rdma_disconnect(conn->sc_id);
@@ -1302,6 +1665,22 @@ svc_rdma_accept(struct rdma_cm_id *id)
 	conn->sc_state = SC_CONNECTING;
 	conn->sc_id = id;
 	id->context = conn;
+
+	/*
+	 * Bind the consumer ops/ctx to this connection NOW (TASK_003e-1), reading
+	 * the listener's sl_ops/sl_ctx under sl_lock and stashing an IMMUTABLE
+	 * copy on the conn.  After this the completions and the teardown task
+	 * reach the consumer through conn->sc_ops/sc_ctx, never through the
+	 * listener -- so a svc_rdma_listen_stop() that clears the listener while
+	 * this conn is still live cannot pull the ops out from under an in-flight
+	 * completion.  We are in the CONNECT_REQUEST handler, which runs only
+	 * while the listening cm_id (and thus its sl_ops/sl_ctx, set before the
+	 * listener was published) is alive, so the snapshot is well-defined.
+	 */
+	mtx_lock(&svc_rdma_listener.sl_lock);
+	conn->sc_ops = svc_rdma_listener.sl_ops;
+	conn->sc_ctx = svc_rdma_listener.sl_ctx;
+	mtx_unlock(&svc_rdma_listener.sl_lock);
 
 	/*
 	 * Register the connection so listener-stop / module-unload can find and
@@ -1532,25 +1911,32 @@ fail:
 
 /*
  * Bring up the passive listener on the wildcard AF_INET address and the given
- * (host-order) port.  Leak-free unwind: any failure destroys the cm_id we
- * created and leaves sl_id NULL.  Idempotent-safe against double start: a
- * second start while one is up is rejected (EBUSY) rather than leaking the
- * first cm_id.
+ * (host-order) port, bound to the supplied consumer ops/ctx (TASK_003e-1).
+ * Leak-free unwind: any failure destroys the cm_id we created and leaves sl_id
+ * NULL (and sl_ops/sl_ctx NULL).  Idempotent-safe against double start: a second
+ * start while one is up is rejected (EBUSY) rather than leaking the first cm_id.
+ *
+ * ops MUST be non-NULL (it is the consumer's upcall table; the sysctl path
+ * passes &svc_rdma_default_ops).  ops and ctx are PUBLISHED with sl_id, in the
+ * same sl_lock critical section, so any racing CONNECT_REQUEST snapshots a
+ * consistent (id, ops, ctx) triple onto the conn.  ops must outlive the listener
+ * and ctx must outlive svc_rdma_listen_stop().
  *
  * Returns a POSITIVE errno on failure.  The FreeBSD rdma_*() helpers return
  * NEGATIVE Linux errnos (rdma_bind_addr/rdma_listen, ib_cma.c), and
  * rdma_create_id reports via ERR_PTR; this function normalizes all of them to
- * positive so callers (the sysctl below, and the future SVCXPRT wiring) get a
- * conventional FreeBSD errno.
+ * positive so callers (the sysctl below, and the SVCXPRT wiring) get a
+ * conventional FreeBSD errno.  Declared in <rdma/svc_rdma.h>.
  */
 int
-svc_rdma_listen_start(uint16_t port)
+svc_rdma_listen_start_ops(uint16_t port, const struct svc_rdma_ops *ops,
+    void *ctx)
 {
 	struct sockaddr_in sin;
 	struct rdma_cm_id *id;
 	int rc;
 
-	if (port == 0)
+	if (port == 0 || ops == NULL)
 		return (EINVAL);
 
 	mtx_lock(&svc_rdma_listener.sl_lock);
@@ -1603,7 +1989,15 @@ svc_rdma_listen_start(uint16_t port)
 		rc = EBUSY;
 		goto out_destroy;
 	}
+	/*
+	 * Publish (id, ops, ctx) atomically under sl_lock so the accept path's
+	 * snapshot is always consistent: no CONNECT_REQUEST can see sl_id set with
+	 * a stale/NULL ops.  sl_ops/sl_ctx are cleared again in
+	 * svc_rdma_listen_stop() alongside sl_id.
+	 */
 	svc_rdma_listener.sl_id = id;
+	svc_rdma_listener.sl_ops = ops;
+	svc_rdma_listener.sl_ctx = ctx;
 	/* Publish the port under the same lock that guards sl_id (NIT). */
 	svc_rdma_listen_port = port;
 	mtx_unlock(&svc_rdma_listener.sl_lock);
@@ -1620,6 +2014,20 @@ out_destroy:
 	rdma_destroy_id(id);
 	rc = (rc < 0) ? -rc : rc;
 	return (rc != 0 ? rc : EINVAL);
+}
+
+/*
+ * Bring up the listener with the in-tree DEFAULT ops (the self-test policy).
+ * This is the entry point the temporary vfs.nfsrdma.listen sysctl uses, so its
+ * behavior is preserved: accept -> parse -> stub reply (svc_rdma_default_recv ->
+ * svc_rdma_reply) -> teardown, with no external consumer.  ctx is NULL because
+ * the default ops carries no consumer state.
+ */
+int
+svc_rdma_listen_start(uint16_t port)
+{
+
+	return (svc_rdma_listen_start_ops(port, &svc_rdma_default_ops, NULL));
 }
 
 /*
@@ -1671,6 +2079,15 @@ svc_rdma_listen_stop(void)
 	mtx_lock(&svc_rdma_listener.sl_lock);
 	id = svc_rdma_listener.sl_id;
 	svc_rdma_listener.sl_id = NULL;
+	/*
+	 * Clear the consumer binding alongside sl_id so a later start begins
+	 * fresh.  This does NOT disturb live connections: each already carries an
+	 * immutable copy (sc_ops/sc_ctx) taken at accept time, so the sweep below
+	 * and every in-flight completion/teardown still reach the consumer through
+	 * the conn, not through the listener we are clearing here.
+	 */
+	svc_rdma_listener.sl_ops = NULL;
+	svc_rdma_listener.sl_ctx = NULL;
 	svc_rdma_listen_port = 0;	/* keep read-back in sync (NIT) */
 	mtx_unlock(&svc_rdma_listener.sl_lock);
 
