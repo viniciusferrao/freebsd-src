@@ -70,6 +70,60 @@
 struct svc_rdma_conn;
 
 /*
+ * RFC 8166 chunk metadata, decoded and BOUNDS-VALIDATED by svc_verbs.c
+ * (TASK_003f-1) into the fixed-capacity structures below.  These describe the
+ * peer-registered memory regions a later increment (3f-3 RDMA Read / 3f-4 RDMA
+ * Write) will operate on; 3f-1 only DECODES and VALIDATES them -- no verbs are
+ * posted from the parser.
+ *
+ * EVERY field here is peer-supplied and therefore UNTRUSTED, but by the time a
+ * consumer sees them the parser has already enforced: a per-message segment cap
+ * (SVC_RDMA_MAX_SEGS) and chunk cap (SVC_RDMA_MAX_CHUNKS) -- so the arrays are
+ * FIXED-SIZE and a hostile peer can never drive an allocation or an array index
+ * past these bounds; a nonzero, sane per-segment length (0 < length <=
+ * SVC_RDMA_MAX_SEG_LEN); and a running total that cannot overflow uint32_t.  A
+ * message that violates any of these is REJECTED by the parser and never
+ * reaches the consumer.  The caps are deliberately small fixed constants, not
+ * peer counts: if the peer declares more it is a clean reject, not a larger
+ * struct.
+ */
+#define	SVC_RDMA_MAX_SEGS	16	/* max rdma_segments in one chunk */
+#define	SVC_RDMA_MAX_CHUNKS	8	/* max chunks in read/write list */
+#define	SVC_RDMA_MAX_SEG_LEN	(1U << 30)	/* sane per-segment length cap */
+
+/*
+ * One RFC 8166 rdma_segment: { handle (rkey), length, offset (virtual addr) }.
+ * 4 XDR words = 16 wire bytes.  rs_length is already validated 0 < len <=
+ * SVC_RDMA_MAX_SEG_LEN by the parser.
+ */
+struct svc_rdma_segment {
+	uint32_t	 rs_handle;	/* registered memory handle (rkey) */
+	uint32_t	 rs_length;	/* segment length in bytes (validated) */
+	uint64_t	 rs_offset;	/* segment virtual address */
+};
+
+/*
+ * One read-list entry: an rdma_position plus a single rdma_segment.  The read
+ * list is a flat array of these (the parser flattens the RFC 8166 1/0-terminated
+ * chain into rd_nchunks entries, capped at SVC_RDMA_MAX_CHUNKS).
+ */
+struct svc_rdma_read_chunk {
+	uint32_t	 rc_position;	/* position in the XDR stream */
+	struct svc_rdma_segment rc_seg;	/* the single target segment */
+};
+
+/*
+ * One write chunk (also the shape of the reply chunk): a COUNTED array of
+ * rdma_segments, capped at SVC_RDMA_MAX_SEGS.  wc_total is the validated sum of
+ * the segment lengths (cannot overflow uint32_t).
+ */
+struct svc_rdma_write_chunk {
+	uint32_t	 wc_nsegs;	/* number of valid wc_segs (<= cap) */
+	uint32_t	 wc_total;	/* sum of segment lengths (validated) */
+	struct svc_rdma_segment wc_segs[SVC_RDMA_MAX_SEGS];
+};
+
+/*
  * A parsed inline RPC-over-RDMA v1 (RFC 8166) call, handed to the consumer's
  * sro_recv upcall.  This mirrors the verbs-internal definition in svc_verbs.c
  * (which stays authoritative); it exposes exactly what a consumer needs to
@@ -82,12 +136,34 @@ struct svc_rdma_conn;
  *             layer's recv buffer and is valid ONLY for the duration of the
  *             sro_recv call (see the lifetime rule below).
  *   rpc_len - length in bytes of the inline RPC payload (may be 0).
+ *
+ * Chunk metadata (TASK_003f-1).  rdma_proc is word3, distinguishing RDMA_MSG
+ * (inline body follows the chunk lists) from RDMA_NOMSG (no inline body; the
+ * whole call/reply travels by chunk).  The three chunk descriptions are decoded
+ * from the read list / write list / reply chunk that follow word3, each into a
+ * fixed-capacity holder above:
+ *   reads        - rd_nchunks read-list entries (each position + one segment).
+ *   writes       - wr_nchunks write-list chunks (each a counted segment array).
+ *   reply        - the optional reply chunk; reply_present says whether it was
+ *                  encoded by the peer.
+ * For a pure inline call (all three lists empty -- the only shape pre-3f) all
+ * counts are 0, reply_present is false, and rpc/rpc_len locate the inline body
+ * exactly as before.  Consumers that do not yet handle chunks (3f-1 itself)
+ * MUST treat any nonzero count / present reply as "not yet served".
  */
 struct svc_rdma_msg {
 	uint32_t	 xid;		/* word0, echoed opaque */
 	uint32_t	 credit;	/* word2, flow control */
-	const void	*rpc;		/* inline RPC payload (buf + 28) */
+	uint32_t	 rdma_proc;	/* word3, RDMA_MSG / RDMA_NOMSG */
+	const void	*rpc;		/* inline RPC payload (buf + header) */
 	uint32_t	 rpc_len;	/* payload length */
+
+	uint32_t	 rd_nchunks;	/* valid entries in reads[] (<= cap) */
+	uint32_t	 wr_nchunks;	/* valid entries in writes[] (<= cap) */
+	bool		 reply_present;	/* a reply chunk was encoded */
+	struct svc_rdma_read_chunk  reads[SVC_RDMA_MAX_CHUNKS];
+	struct svc_rdma_write_chunk writes[SVC_RDMA_MAX_CHUNKS];
+	struct svc_rdma_write_chunk reply;
 };
 
 /*
