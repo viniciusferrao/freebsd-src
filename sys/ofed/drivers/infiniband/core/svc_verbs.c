@@ -1842,7 +1842,12 @@ svc_rdma_read_start(struct svc_rdma_conn *conn, struct svc_rdma_recv *rr,
 	 * is the only peer-influenced allocation, and it is bounded by
 	 * SVC_RDMA_MAX_READ.  M_NOWAIT: we are in the completion context.
 	 */
-	rs->rs_buf = malloc(rs->rs_total, M_NFSRDMA, M_NOWAIT);
+	/* contigmalloc: rs_buf must be PHYSICALLY contiguous -- ib_dma_map_single maps
+	 * one contiguous region (vtophys of the first page); a scattered multi-page
+	 * malloc buffer would land the RDMA-Read data in the wrong physical pages
+	 * (TASK_003f-3 data-corruption fix).  Freed with free() (contigfree deprecated). */
+	rs->rs_buf = contigmalloc(rs->rs_total, M_NFSRDMA, M_NOWAIT, 0,
+	    ~(vm_paddr_t)0, PAGE_SIZE, 0);
 	if (rs->rs_buf == NULL) {
 		free(rs->rs_head, M_NFSRDMA);
 		rs->rs_head = NULL;
