@@ -37,6 +37,7 @@
 #include "opt_inet6.h"
 #include "opt_kgssapi.h"
 #include "opt_kern_tls.h"
+#include "opt_ofed.h"
 
 #include <fs/nfs/nfsport.h>
 
@@ -115,6 +116,57 @@ VNET_DEFINE(int, nfsrv_numnfsd) = 0;
 VNET_DEFINE(struct nfsv4lock, nfsd_suspend_lock);
 
 VNET_DEFINE_STATIC(bool, nfsrvd_inited) = false;
+
+#ifdef OFED
+/*
+ * NFS-over-RDMA listen hook (TASK_003e-2c).  svc_rdma_nfsd_listen() is a built-
+ * in kernel symbol exported by the krpc RDMA transport (sys/rpc/svc_rdma.c,
+ * "optional ofed").  It starts/stops the RDMA-CM listener bound to THIS nfsd's
+ * SVCPOOL (VNET(nfsrvd_pool)), so accepted RDMA connections register as SVCXPRTs
+ * in the nfsd pool and the existing nfsd dispatch serves them -- the FreeBSD
+ * analogue of Linux's `echo "rdma 20049" > /proc/fs/nfsd/portlist`.
+ *
+ * vfs.nfsd.rdma_listen: write a nonzero port to start, 0 to stop.  Compiled only
+ * when options OFED is configured (the krpc symbol exists only then); on a non-
+ * OFED kernel the sysctl is absent.  This is the bring-up control; a netconfig-
+ * driven path (rdma/rdma6 netids) is the clean end state.
+ */
+int	svc_rdma_nfsd_listen(SVCPOOL *pool, int port);
+
+/* Last started RDMA port for read-back; 0 means the listener is down. */
+VNET_DEFINE_STATIC(int, nfsrvd_rdma_port) = 0;
+
+static int
+sysctl_nfsd_rdma_listen(SYSCTL_HANDLER_ARGS)
+{
+	int error, port;
+
+	port = VNET(nfsrvd_rdma_port);
+	error = sysctl_handle_int(oidp, &port, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (port < 0 || port > 65535)
+		return (EINVAL);
+
+	/*
+	 * The nfsd pool must exist (nfsd has been initialized) before we can
+	 * register RDMA transports into it.  nfsrvd_init() creates it; a NULL
+	 * pool means the server has not started.
+	 */
+	if (port != 0 && VNET(nfsrvd_pool) == NULL)
+		return (ENXIO);
+
+	error = svc_rdma_nfsd_listen(VNET(nfsrvd_pool), port);
+	if (error == 0)
+		VNET(nfsrvd_rdma_port) = port;
+	return (error);
+}
+SYSCTL_PROC(_vfs_nfsd, OID_AUTO, rdma_listen,
+    CTLTYPE_INT | CTLFLAG_VNET | CTLFLAG_MPSAFE | CTLFLAG_RW, NULL, 0,
+    sysctl_nfsd_rdma_listen, "I",
+    "Nonzero port starts the NFS-over-RDMA listener on the nfsd pool, 0 stops "
+    "it; ENXIO if ibcore is not loaded or nfsd has not started");
+#endif /* OFED */
 
 /*
  * NFS server system calls
@@ -679,6 +731,17 @@ nfsrvd_init(int terminating)
 	if (terminating) {
 		VNET(nfsd_master_proc) = NULL;
 		NFSD_UNLOCK();
+#ifdef OFED
+		/*
+		 * Stop the NFS-over-RDMA listener before closing the pool, so no
+		 * newly-accepted RDMA connection can xprt_register into a pool
+		 * that is being torn down.  svc_rdma_nfsd_listen(_, 0) only needs
+		 * the verbs table (it ignores the pool argument on stop) and is a
+		 * no-op if no listener is up or ibcore is not loaded.
+		 */
+		(void)svc_rdma_nfsd_listen(VNET(nfsrvd_pool), 0);
+		VNET(nfsrvd_rdma_port) = 0;
+#endif
 		nfsrv_freealllayoutsanddevids();
 		nfsrv_freeallbackchannel_xprts();
 		svcpool_close(VNET(nfsrvd_pool));
