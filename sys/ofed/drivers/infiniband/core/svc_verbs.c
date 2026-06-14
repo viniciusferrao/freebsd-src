@@ -208,6 +208,26 @@ MALLOC_DEFINE(M_NFSRDMA, "nfsrdma", "NFS over RDMA server");
 #define	SVC_RDMA_MAX_READ_SEGS	SVC_RDMA_MAX_CHUNKS
 
 /*
+ * RDMA Write engine sizing (TASK_003f-4) -- the OUTBOUND data path.
+ *
+ * SVC_RDMA_MAX_WRITE is the hard cap on the total length we will RDMA-Write into
+ * a client's reply-chunk (or write-list) segments for one reply.  Like
+ * SVC_RDMA_MAX_READ it is a FIXED LOCAL constant, never a peer sum: the source is
+ * the server's own marshalled reply, whose length we KNOW, and we refuse to size
+ * a transfer past this cap.  1 MiB covers a large NFS READ result / READDIR reply
+ * while bounding one transfer.  The source buffer is sized by the SERVER-KNOWN
+ * reply length (bounded by this), never by a raw peer field.
+ *
+ * SVC_RDMA_MAX_WRITE_SEGS is the cap on how many IB_WR_RDMA_WRITE WRs we chain for
+ * one reply.  A reply chunk / write chunk carries up to SVC_RDMA_MAX_SEGS segments
+ * (the parser cap); we write the reply across at most that many segments, so this
+ * is that same fixed cap.  Each WR consumes one SQ slot, so it must fit the SQ
+ * head-room reserved at accept time (see max_send_wr).
+ */
+#define	SVC_RDMA_MAX_WRITE	(1U << 20)	/* 1 MiB whole-reply cap */
+#define	SVC_RDMA_MAX_WRITE_SEGS	SVC_RDMA_MAX_SEGS
+
+/*
  * Size of the inline RPC-over-RDMA v1 reply we marshal in 3d.  It is a fixed
  * local constant -- the 7-word (28-byte) RFC 8166 transport header followed by
  * a minimal 6-word (24-byte) ONC RPC MSG_ACCEPTED/SUCCESS reply body (RFC 5531)
@@ -343,6 +363,61 @@ struct svc_rdma_read_state {
 	int			 rs_nwr;
 	struct ib_rdma_wr	 rs_wr[SVC_RDMA_MAX_READ_SEGS];
 	struct ib_sge		 rs_sge[SVC_RDMA_MAX_READ_SEGS];
+};
+
+/*
+ * Durable outbound-write state (TASK_003f-4) -- the OUTBOUND data path's analogue
+ * of svc_rdma_read_state.
+ *
+ * THE LIFETIME FIX (mirroring 3f-3).  A reply-chunk RDMA Write originates from the
+ * consumer's xp_reply (a krpc pool thread), not from a recv buffer, so this state
+ * has no natural durable home like rr_rs.  It is malloc'd on demand by
+ * svc_rdma_conn_reply_chunk() and THREADED on the per-conn sc_writes list so the
+ * drained teardown can reclaim a write still in flight at close.  The RDMA Write
+ * chain + the header SEND complete LATER (async on the SQ), so the source bytes
+ * (the marshalled reply) and the header bytes must outlive the xp_reply call:
+ * both are COPIED into ws_src / ws_hdr here, never aliasing the caller's buffer.
+ *
+ *   ws_link  - sc_writes registry linkage (sc_lock); inserted at post, removed on
+ *              the first completion (or by the drained teardown).
+ *   ws_cqe   - completion callback for the chain (aliased by every WR's wr_cqe;
+ *              the chain signals ONLY the tail header SEND, so a single completion
+ *              lands in svc_rdma_wc_rdma_write with this ws via container_of).
+ *   ws_src   - the source buffer the RDMA Writes read FROM (the marshalled ONC RPC
+ *              reply), malloc'd ws_srclen bytes, DMA-mapped DMA_TO_DEVICE.
+ *   ws_srclen- the reply length (server-known, bounded <= SVC_RDMA_MAX_WRITE).
+ *   ws_src_dma / ws_src_mapped - ws_src DMA map + its idempotency token (sc_lock).
+ *   ws_hdr   - the RDMA_NOMSG transport-header SEND buffer, malloc'd, DMA-mapped
+ *              DMA_TO_DEVICE; carries the reply-chunk list with the actual length.
+ *   ws_hdrlen- valid header bytes.
+ *   ws_hdr_dma / ws_hdr_mapped - ws_hdr DMA map + its idempotency token (sc_lock).
+ *   ws_active- the COMPLETION ONE-SHOT guard (sc_lock): set before the post,
+ *              test-and-cleared at the top of svc_rdma_wc_rdma_write so exactly the
+ *              FIRST of possibly-several completions (a partially-committed chained
+ *              post can flush multiple WRs) does the free; later completions no-op.
+ *              It does NOT gate reclaim (ws_*_mapped/ws_src/ws_hdr do).
+ *   ws_nwr   - number of chained RDMA Write WRs (<= SVC_RDMA_MAX_WRITE_SEGS).
+ *   ws_wr/ws_sge - the per-segment RDMA Write WR + its one SGE (into ws_src).
+ *   ws_sndwr/ws_sndsge - the tail header SEND WR + its SGE (into ws_hdr).
+ */
+struct svc_rdma_write_state {
+	TAILQ_ENTRY(svc_rdma_write_state) ws_link;
+	struct ib_cqe		 ws_cqe;
+	struct svc_rdma_conn	*ws_conn;
+	void			*ws_src;	/* RDMA Write source (reply bytes) */
+	uint32_t		 ws_srclen;
+	u64			 ws_src_dma;
+	bool			 ws_src_mapped;
+	void			*ws_hdr;	/* RDMA_NOMSG header SEND buffer */
+	uint32_t		 ws_hdrlen;
+	u64			 ws_hdr_dma;
+	bool			 ws_hdr_mapped;
+	bool			 ws_active;	/* completion one-shot guard (sc_lock) */
+	int			 ws_nwr;
+	struct ib_rdma_wr	 ws_wr[SVC_RDMA_MAX_WRITE_SEGS];
+	struct ib_sge		 ws_sge[SVC_RDMA_MAX_WRITE_SEGS];
+	struct ib_send_wr	 ws_sndwr;
+	struct ib_sge		 ws_sndsge;
 };
 
 /*
@@ -494,6 +569,17 @@ struct svc_rdma_conn {
 	}			 sc_state;
 	int			 sc_reposts;	/* in-flight reposts (sc_lock) */
 	int			 sc_sends;	/* in-flight reply sends (sc_lock) */
+	/*
+	 * Outbound RDMA Write state registry (TASK_003f-4).  A reply-chunk write is
+	 * malloc'd on demand (it has no recv-buffer home) and threaded here under
+	 * sc_lock so the drained teardown can reclaim a write still in flight at
+	 * close -- the exact analogue of how rr_rs lets the teardown reclaim an
+	 * in-flight read.  Each in-flight write's WR chain is accounted in sc_sends
+	 * (armed only under SC_UP), so it is already drained by the sc_sends barrier
+	 * before ib_drain_qp(); this list only owns the EXACTLY-ONCE free of the
+	 * write state's source/header buffers + DMA maps after the drain.
+	 */
+	TAILQ_HEAD(, svc_rdma_write_state) sc_writes;	/* in-flight writes (sc_lock) */
 	struct task		 sc_teardown;	/* deferred (sleepable) unwind */
 	TAILQ_ENTRY(svc_rdma_conn) sc_link;	/* registry (svc_rdma_conns_lock) */
 
@@ -620,6 +706,8 @@ static void svc_rdma_wc_rdma_read(struct ib_cq *cq, struct ib_wc *wc);
 static void svc_rdma_read_free(struct svc_rdma_conn *conn,
     struct svc_rdma_recv *rr);
 static void svc_rdma_repost(struct svc_rdma_conn *conn, struct svc_rdma_recv *rr);
+static void svc_rdma_wc_rdma_write(struct ib_cq *cq, struct ib_wc *wc);
+static void svc_rdma_write_free(struct svc_rdma_write_state *ws);
 
 /*
  * Default consumer ops (TASK_003e-1) -- the in-tree self-test policy that
@@ -2098,6 +2186,466 @@ svc_rdma_wc_rdma_read(struct ib_cq *cq, struct ib_wc *wc)
 
 /*
  * ===========================================================================
+ * RDMA Write engine -- outbound NFS READ result / large reply (TASK_003f-4).
+ *
+ * For a reply that does not fit the inline send buffer, the CLIENT pre-registered
+ * memory it wants us to RDMA-WRITE INTO: a REPLY CHUNK (the whole RPC reply, the
+ * NFSv4 mount-handshake case -- THIS increment) or a WRITE LIST (NFS READ data).
+ * Each segment is a peer-supplied { rs_handle(rkey), rs_offset(remote virtual
+ * address), rs_length }.  We push the server's marshalled reply OUT into those
+ * segments and then SEND a small RPC-over-RDMA header reporting the lengths
+ * written: RDMA_NOMSG + the reply-chunk list for a reply chunk (RFC 8166 4.3).
+ *
+ * UNTRUSTED PEER (RFC 8166 5) -- re-validated AT POST TIME, not trusted from the
+ * parse, and the source is SERVER-KNOWN so we NEVER write more than the client
+ * offered:
+ *   - every rs_length re-checked in (0, SVC_RDMA_MAX_SEG_LEN];
+ *   - the segment/WR count re-checked <= SVC_RDMA_MAX_WRITE_SEGS;
+ *   - the running SUM of segment lengths (the client's offered capacity) computed
+ *     with no uint32 overflow; the reply length (our own, bounded by
+ *     SVC_RDMA_MAX_WRITE) must be <= that capacity -- if the reply is LARGER than
+ *     the client's reply chunk we return EMSGSIZE and write NOTHING, never an
+ *     over-write of the client's memory;
+ *   - we write at most rs_length bytes into each segment (min(remaining, len)),
+ *     so a segment is never over-written even if a later segment is short;
+ *   - rs_handle(rkey) and rs_offset are passed VERBATIM to the HCA: the hardware
+ *     enforces the rkey against the client's MR, so a bad rkey/addr fails the WR
+ *     with an error completion, which we handle by CLOSING -- never by trusting.
+ *
+ * COMPLETION-vs-TEARDOWN lifetime (the #1 hazard), mirroring 3f-3 EXACTLY:
+ *   - the RDMA Write chain + the header SEND are accounted in sc_sends (armed only
+ *     under SC_UP), so the drained teardown's barrier waits them out before
+ *     ib_drain_qp();
+ *   - the write state (source + header buffers + DMA maps) lives in a malloc'd
+ *     svc_rdma_write_state threaded on conn->sc_writes and is freed/unmapped
+ *     EXACTLY ONCE -- on the (tail-SEND) completion, or by the teardown for a write
+ *     still in flight at close (ws_active one-shot + ws_*_mapped idempotency, the
+ *     sm_sg_mapped pattern);
+ *   - svc_rdma_conn_close() publishes SC_CLOSING before enqueuing the teardown, so
+ *     once teardown is pending no new write passes the SC_UP gate.
+ *
+ * PARTIAL-POST rule (mlx5 commits prefix WQEs even on -ENOMEM): on ib_post_send
+ * rc != 0 we do NOT reclaim inline -- a committed prefix is live and will flush; we
+ * leave the write state on sc_writes for the drained teardown to reclaim, exactly
+ * as svc_rdma_read_start does (BLOCKER 2 there).
+ * ===========================================================================
+ */
+
+/*
+ * Release one outbound write state: remove it from the registry, unmap+free the
+ * source and header buffers, EXACTLY ONCE.  RECLAIM IS DRIVEN BY the idempotent
+ * ws_src_mapped/ws_hdr_mapped (unmap) and ws_src/ws_hdr != NULL (free) tokens --
+ * NOT by ws_active (the completion one-shot, a separate concern this routine
+ * merely clears defensively).  The two legitimate reclaimers -- the first
+ * completion and the drained teardown -- can each call this and the SECOND is a
+ * harmless no-op.  Callable WITHOUT sc_lock (the first completion) or WITH the
+ * registry already emptied by the teardown loop; it only ib_dma_unmap_single /
+ * free, neither sleeps.  The caller has already detached ws from sc_writes (or is
+ * the teardown draining the whole list), so this never touches the list itself --
+ * the detach is done at the call site under sc_lock to keep the registry coherent.
+ *
+ * The DMA / write-vs-teardown rule: the source mapping MUST stay live until the
+ * device is done READING it (the write completion) or the QP is drained
+ * (teardown); ib_drain_qp() guarantees no write completion can fire after it, so
+ * the teardown calling this for a write that never completed is safe.
+ */
+static void
+svc_rdma_write_free(struct svc_rdma_write_state *ws)
+{
+	struct svc_rdma_conn *conn = ws->ws_conn;
+	struct ib_device *dev;
+
+	dev = (conn != NULL && conn->sc_id != NULL) ? conn->sc_id->device : NULL;
+
+	if (ws->ws_src_mapped) {
+		if (dev != NULL)
+			ib_dma_unmap_single(dev, ws->ws_src_dma, ws->ws_srclen,
+			    DMA_TO_DEVICE);
+		ws->ws_src_mapped = false;
+	}
+	if (ws->ws_hdr_mapped) {
+		if (dev != NULL)
+			ib_dma_unmap_single(dev, ws->ws_hdr_dma, ws->ws_hdrlen,
+			    DMA_TO_DEVICE);
+		ws->ws_hdr_mapped = false;
+	}
+	if (ws->ws_src != NULL) {
+		free(ws->ws_src, M_NFSRDMA);
+		ws->ws_src = NULL;
+	}
+	if (ws->ws_hdr != NULL) {
+		free(ws->ws_hdr, M_NFSRDMA);
+		ws->ws_hdr = NULL;
+	}
+	ws->ws_active = false;
+	free(ws, M_NFSRDMA);
+}
+
+/*
+ * RDMA-Write a too-large-for-inline reply into the client's reply chunk and SEND
+ * the RDMA_NOMSG header reporting the bytes written (TASK_003f-4).  PUBLIC entry
+ * point (declared in <rdma/svc_rdma.h>); the krpc consumer's xp_reply calls it
+ * when a marshalled reply exceeds the inline size and the request carried a reply
+ * chunk.  Context: a krpc pool thread under the consumer's per-conn lock (the
+ * caller-reference rule that keeps conn alive, identical to svc_rdma_conn_send);
+ * it does NOT sleep.
+ *
+ * buf/len are the marshalled ONC RPC reply BODY ONLY; reply is the parsed,
+ * validated reply chunk the client offered (a pure value type the consumer
+ * captured during sro_recv).  On success an RDMA Write chain + the header SEND are
+ * on the SQ, accounted in sc_sends, and the write state is on sc_writes until the
+ * completion (or teardown) frees it.  Returns 0 or a positive errno; on nonzero it
+ * has already released everything it allocated for a NEVER-posted attempt (a
+ * posted-but-failed chain is left for the drained teardown -- the partial-post
+ * rule).
+ */
+int
+svc_rdma_conn_reply_chunk(struct svc_rdma_conn *conn, uint32_t xid,
+    const struct svc_rdma_write_chunk *reply, const void *buf, uint32_t len)
+{
+	struct svc_rdma_write_state *ws;
+	struct ib_device *dev = conn->sc_id->device;
+	const struct ib_send_wr *bad_wr;
+	uint64_t capacity;
+	uint32_t i, n, off, remaining, hdrlen;
+	char *h;
+	int rc;
+
+	/*
+	 * Validate the reply LENGTH (server-known, bounded).  A 0-length reply is a
+	 * caller bug; a reply over the whole-reply cap is refused rather than written
+	 * (we never size a transfer past SVC_RDMA_MAX_WRITE).  len is the server's own
+	 * marshalled reply size, NOT a peer field.
+	 */
+	if (len == 0 || len > SVC_RDMA_MAX_WRITE)
+		return (EINVAL);
+
+	/*
+	 * Re-validate the reply-chunk SHAPE at post time (untrusted peer).  The parser
+	 * already enforced wc_nsegs <= SVC_RDMA_MAX_SEGS and each rs_length in
+	 * (0, SVC_RDMA_MAX_SEG_LEN]; re-assert here so this engine is correct
+	 * independent of the parser and so a future parser change cannot let an
+	 * over-cap reply chunk reach the HCA.
+	 */
+	n = reply->wc_nsegs;
+	if (n == 0 || n > SVC_RDMA_MAX_WRITE_SEGS)
+		return (EINVAL);
+
+	/*
+	 * Compute the client's offered CAPACITY (sum of segment lengths) with no
+	 * uint32 overflow, re-checking each length.  The reply must FIT: len <=
+	 * capacity, else the client did not offer enough reply-chunk space -> EMSGSIZE
+	 * and we write nothing.  This is the never-over-write invariant: we will write
+	 * exactly len bytes, spread across segments, each capped at its own rs_length.
+	 */
+	capacity = 0;
+	for (i = 0; i < n; i++) {
+		uint32_t slen = reply->wc_segs[i].rs_length;
+
+		if (slen == 0 || slen > SVC_RDMA_MAX_SEG_LEN)
+			return (EINVAL);
+		capacity += slen;
+	}
+	if ((uint64_t)len > capacity)
+		return (EMSGSIZE);
+
+	/*
+	 * Allocate the durable write state (it outlives this call -- the writes and the
+	 * header SEND complete async).  M_NOWAIT: xp_reply may run under the consumer's
+	 * leaf mutex, so do not block.  Zeroed so every token starts false/NULL.
+	 */
+	ws = malloc(sizeof(*ws), M_NFSRDMA, M_NOWAIT | M_ZERO);
+	if (ws == NULL)
+		return (ENOMEM);
+	ws->ws_conn = conn;
+
+	/*
+	 * Copy the reply bytes into the DMA source buffer and map it DMA_TO_DEVICE (the
+	 * HCA READS this buffer to push it into the client).  Sized by the SERVER-KNOWN
+	 * len (bounded by SVC_RDMA_MAX_WRITE), never a raw peer field.
+	 */
+	ws->ws_srclen = len;
+	ws->ws_src = malloc(len, M_NFSRDMA, M_NOWAIT);
+	if (ws->ws_src == NULL) {
+		free(ws, M_NFSRDMA);
+		return (ENOMEM);
+	}
+	memcpy(ws->ws_src, buf, len);
+	ws->ws_src_dma = ib_dma_map_single(dev, ws->ws_src, len, DMA_TO_DEVICE);
+	if (ib_dma_mapping_error(dev, ws->ws_src_dma)) {
+		free(ws->ws_src, M_NFSRDMA);
+		free(ws, M_NFSRDMA);
+		return (EIO);
+	}
+	ws->ws_src_mapped = true;	/* mark live IMMEDIATELY (BLOCKER 1 rule) */
+
+	/*
+	 * Build the RDMA_NOMSG transport header: the fixed 4-word prefix, two empty
+	 * lists (read list, write list), then the reply chunk present marker + the
+	 * counted write chunk whose segments echo the client's { handle, offset } with
+	 * the LENGTH updated to the bytes we actually wrote into each segment.  Layout
+	 * (big-endian XDR words, RFC 8166 4.3):
+	 *   w0 rdma_xid, w1 rdma_vers(1), w2 rdma_credit, w3 rdma_proc(RDMA_NOMSG),
+	 *   w4 read_list=0, w5 write_list=0,
+	 *   w6 reply_chunk_present=1, w7 nsegs,
+	 *   then nsegs * { handle, length(written), offset(64) } (4 words each).
+	 * The header is a fixed local size (<= a few hundred bytes for <= 16 segs), so
+	 * we size it exactly and it can never be driven past SVC_RDMA_INLINE by a peer.
+	 */
+	hdrlen = RPCRDMA_HDR_FIXED + 2 * RPCRDMA_WORD +	/* prefix + 2 empty lists */
+	    2 * RPCRDMA_WORD +				/* present + nsegs */
+	    n * (RPCRDMA_SEG_WORDS * RPCRDMA_WORD);	/* the segments */
+	ws->ws_hdrlen = hdrlen;
+	ws->ws_hdr = malloc(hdrlen, M_NFSRDMA, M_NOWAIT);
+	if (ws->ws_hdr == NULL) {
+		svc_rdma_write_free(ws);	/* unmaps ws_src, frees ws */
+		return (ENOMEM);
+	}
+	h = ws->ws_hdr;
+	be32enc(h +  0, xid);				/* w0  rdma_xid */
+	be32enc(h +  4, RPCRDMA_VERSION);		/* w1  rdma_vers */
+	be32enc(h +  8, (uint32_t)conn->sc_nrecv);	/* w2  rdma_credit (granted) */
+	be32enc(h + 12, RDMA_NOMSG);			/* w3  rdma_proc */
+	be32enc(h + 16, 0);				/* w4  read_list (empty) */
+	be32enc(h + 20, 0);				/* w5  write_list (empty) */
+	be32enc(h + 24, 1);				/* w6  reply chunk present */
+	be32enc(h + 28, n);				/* w7  nsegs */
+	off = 32;
+	remaining = len;
+	for (i = 0; i < n; i++) {
+		uint32_t slen = reply->wc_segs[i].rs_length;
+		uint32_t wlen = (remaining < slen) ? remaining : slen;
+
+		be32enc(h + off + 0, reply->wc_segs[i].rs_handle);
+		be32enc(h + off + 4, wlen);		/* bytes written into this seg */
+		be64enc(h + off + 8, reply->wc_segs[i].rs_offset);
+		off += RPCRDMA_SEG_WORDS * RPCRDMA_WORD;
+		remaining -= wlen;
+	}
+	ws->ws_hdr_dma = ib_dma_map_single(dev, ws->ws_hdr, hdrlen,
+	    DMA_TO_DEVICE);
+	if (ib_dma_mapping_error(dev, ws->ws_hdr_dma)) {
+		svc_rdma_write_free(ws);	/* unmaps ws_src, frees both + ws */
+		return (EIO);
+	}
+	ws->ws_hdr_mapped = true;
+
+	/*
+	 * Build the RDMA Write WR chain: one IB_WR_RDMA_WRITE per segment that carries
+	 * bytes, each with a single local SGE into ws_src at the running source offset
+	 * (lkey = the PD's local_dma_lkey -- the source is local memory, no FRWR
+	 * registration needed for the SOURCE of a write), and the peer's { rkey,
+	 * remote_addr } passed VERBATIM.  Chain them next->next; all UNSIGNALED.  Then
+	 * chain the header SEND last and SIGNAL ONLY IT, so a single completion fires
+	 * for the whole chain.  ws_cqe.done routes that completion to
+	 * svc_rdma_wc_rdma_write; every WR's wr_cqe aliases &ws_cqe.
+	 *
+	 * We emit a WR only for a segment that actually carries bytes (wlen > 0); once
+	 * the reply is exhausted, trailing client segments get length 0 in the header
+	 * and no WR (we never write 0 bytes nor over-write a spare segment).
+	 */
+	ws->ws_cqe.done = svc_rdma_wc_rdma_write;
+	off = 0;			/* source offset within ws_src */
+	remaining = len;
+	ws->ws_nwr = 0;
+	for (i = 0; i < n && remaining > 0; i++) {
+		uint32_t slen = reply->wc_segs[i].rs_length;
+		uint32_t wlen = (remaining < slen) ? remaining : slen;
+		int k = ws->ws_nwr;
+
+		ws->ws_sge[k].addr = ws->ws_src_dma + off;
+		ws->ws_sge[k].length = wlen;
+		ws->ws_sge[k].lkey = conn->sc_pd->local_dma_lkey;
+
+		memset(&ws->ws_wr[k], 0, sizeof(ws->ws_wr[k]));
+		ws->ws_wr[k].wr.wr_cqe = &ws->ws_cqe;
+		ws->ws_wr[k].wr.sg_list = &ws->ws_sge[k];
+		ws->ws_wr[k].wr.num_sge = 1;
+		ws->ws_wr[k].wr.opcode = IB_WR_RDMA_WRITE;
+		ws->ws_wr[k].wr.send_flags = 0;		/* unsignaled */
+		ws->ws_wr[k].remote_addr = reply->wc_segs[i].rs_offset;
+		ws->ws_wr[k].rkey = reply->wc_segs[i].rs_handle;
+		ws->ws_nwr++;
+		off += wlen;		/* bounded by len, no overflow */
+		remaining -= wlen;
+	}
+
+	/* The tail header SEND, signaled -- one completion for the whole chain. */
+	ws->ws_sndsge.addr = ws->ws_hdr_dma;
+	ws->ws_sndsge.length = hdrlen;
+	ws->ws_sndsge.lkey = conn->sc_pd->local_dma_lkey;
+	memset(&ws->ws_sndwr, 0, sizeof(ws->ws_sndwr));
+	ws->ws_sndwr.wr_cqe = &ws->ws_cqe;
+	ws->ws_sndwr.sg_list = &ws->ws_sndsge;
+	ws->ws_sndwr.num_sge = 1;
+	ws->ws_sndwr.opcode = IB_WR_SEND;
+	ws->ws_sndwr.send_flags = IB_SEND_SIGNALED;
+	ws->ws_sndwr.next = NULL;
+
+	/* Link writes -> ... -> header SEND. */
+	for (i = 0; i + 1 < (uint32_t)ws->ws_nwr; i++)
+		ws->ws_wr[i].wr.next = &ws->ws_wr[i + 1].wr;
+	if (ws->ws_nwr > 0)
+		ws->ws_wr[ws->ws_nwr - 1].wr.next = &ws->ws_sndwr;
+
+	/*
+	 * Arm the send-side teardown barrier and post, IDENTICALLY to
+	 * svc_rdma_read_start / svc_rdma_conn_send: in one sc_lock section verify
+	 * SC_UP, register the write on sc_writes, mark it in flight (ws_active -- with
+	 * ws_*_mapped already set after the maps), and bump sc_sends; then ib_post_send
+	 * with the lock dropped; then reacquire, decrement sc_sends, wake the teardown
+	 * if last.  ws_active is set BEFORE the post (the one-shot token): a partially-
+	 * committed chained post flushes its prefix, whose completions must find
+	 * ws_active set so the one-shot guard claims reclaim correctly.
+	 */
+	mtx_lock(&conn->sc_lock);
+	if (conn->sc_state != SC_UP) {
+		mtx_unlock(&conn->sc_lock);
+		/*
+		 * Tearing down before we posted anything: no WR reached the SQ, so no
+		 * completion will fire.  Reclaim inline (it is not yet on sc_writes) and
+		 * return ENOTCONN.  Safe precisely because nothing was posted.
+		 */
+		svc_rdma_write_free(ws);
+		return (ENOTCONN);
+	}
+	TAILQ_INSERT_TAIL(&conn->sc_writes, ws, ws_link);
+	ws->ws_active = true;
+	conn->sc_sends++;
+	mtx_unlock(&conn->sc_lock);
+
+	/*
+	 * Post the chain (RDMA Writes... + header SEND).  If ws_nwr == 0 (degenerate:
+	 * a 0-length reply was rejected above, so this cannot happen for len > 0), the
+	 * head is the SEND itself.  bad_wr MUST be passed (mlx5 dereferences it on an
+	 * immediate error).
+	 */
+	rc = ib_post_send(conn->sc_id->qp,
+	    ws->ws_nwr > 0 ? &ws->ws_wr[0].wr : &ws->ws_sndwr, &bad_wr);
+
+	/*
+	 * PARTIAL-POST rule (mlx5 commits the built prefix on a mid-chain failure while
+	 * returning -ENOMEM): on rc != 0 do NOT reclaim inline -- a committed prefix is
+	 * live and its flush/error completion will run svc_rdma_wc_rdma_write via
+	 * container_of on ws.  Leave ws on sc_writes with ws_active/ws_*_mapped intact;
+	 * the DRAINED teardown (svc_rdma_conn_free_verbs, after ib_drain_qp) is the
+	 * single reclaimer.  We DO still decrement sc_sends (the posting op finished) so
+	 * the barrier can reach 0 and drain the committed prefix, then close.
+	 */
+	mtx_lock(&conn->sc_lock);
+	if (--conn->sc_sends == 0)
+		wakeup(&conn->sc_upcalls);
+	mtx_unlock(&conn->sc_lock);
+
+	if (rc != 0) {
+		if (ppsratecheck(&svc_rdma_log_last, &svc_rdma_log_pps, 5))
+			printf("nfsrdma: ib_post_send (RDMA Write) failed: %d "
+			    "(prefix may be committed; drain reclaims)\n", rc);
+		svc_rdma_conn_close(conn);
+		return (rc < 0 ? -rc : rc);
+	}
+	return (0);
+}
+
+/*
+ * RDMA Write completion (TASK_003f-4).  Dispatched by the CQ core in the same
+ * IB_POLL_WORKQUEUE context as the read/send handlers; keep it short, take no
+ * sleepable lock, start no blocking teardown.  The signaled tail SEND's wr_cqe
+ * aliases &ws->ws_cqe, so container_of recovers the write state, then the conn.
+ *
+ * ONE-SHOT (the multi-completion guard).  A partially-committed chained post can
+ * deliver MORE THAN ONE completion for a single write (flush/error CQEs fire for
+ * the unsignaled prefix WRs too), so this handler can be invoked >1x for one ws.
+ * Unlike svc_rdma_wc_rdma_read -- whose rs_active state is EMBEDDED in the recv and
+ * never freed at completion -- the write state is a STANDALONE malloc the first
+ * completion FREES, so a duplicate completion must NEVER dereference ws (it may be
+ * freed).  We therefore recover conn from cq->cq_context (== conn, set at
+ * ib_alloc_cq) WITHOUT touching ws, then under sc_lock prove ownership by SEARCHING
+ * sc_writes for the exact ws pointer: comparing the (possibly dangling) candidate
+ * address against live list entries is legal; dereferencing it is not.  Only if ws
+ * is still ON the list (and ws_active) do we own it -- remove it, clear ws_active,
+ * and proceed to dereference/free it.  A duplicate finds ws already off the list
+ * and returns having dereferenced nothing.  Per-conn completions are serialized by
+ * the single IB_POLL_WORKQUEUE thread, so the first completion fully frees ws
+ * before any duplicate runs -- the list search is the safe membership test across
+ * that free.  sc_sends is NOT touched here (decremented once at the post site).
+ *
+ * SUCCESS (first completion): the reply has been RDMA-Written into the client's
+ * reply chunk and the RDMA_NOMSG header SEND has been transmitted, so the device
+ * is done reading ws_src/ws_hdr -- free the write state.
+ *
+ * ERROR/FLUSH (first completion): a bad client rkey/addr/length fails the WR (the
+ * HCA enforced the rkey), or the chain flushed during teardown.  IB_WC_WR_FLUSH_ERR
+ * is swallowed; any other status closes.  In BOTH cases we have already removed ws
+ * from sc_writes under the one-shot, so we free it here (the teardown will no longer
+ * see it); ib_drain_qp() (FIFO, after the sc_sends barrier) guarantees no other
+ * completion for this ws can still be in flight.
+ */
+static void
+svc_rdma_wc_rdma_write(struct ib_cq *cq, struct ib_wc *wc)
+{
+	struct svc_rdma_write_state *cand, *ws;
+	struct svc_rdma_conn *conn;
+
+	/* Same single-workqueue-thread invariant as the other wc handlers (N2). */
+	MPASS(cq->poll_ctx == IB_POLL_WORKQUEUE);
+
+	/*
+	 * Recover conn from the CQ context (NOT from the candidate ws -- ws may have
+	 * been freed by a prior completion).  cand is only an ADDRESS to match against
+	 * the registry; we do not dereference it until proven still-live below.
+	 */
+	conn = cq->cq_context;
+	cand = container_of(wc->wr_cqe, struct svc_rdma_write_state, ws_cqe);
+
+	/*
+	 * Prove ownership: search sc_writes for the exact cand pointer.  If present and
+	 * still active, this is the FIRST completion -- remove it (clearing ws_active)
+	 * and we own the free.  If absent, this is a DUPLICATE (the first completion, or
+	 * the drained teardown, already removed+freed it); return having dereferenced
+	 * nothing.  Detaching here keeps the registry coherent and makes ownership
+	 * unambiguous: whoever removes ws from the list owns its free.
+	 */
+	ws = NULL;
+	mtx_lock(&conn->sc_lock);
+	{
+		struct svc_rdma_write_state *p;
+
+		TAILQ_FOREACH(p, &conn->sc_writes, ws_link) {
+			if (p == cand && p->ws_active) {
+				p->ws_active = false;
+				TAILQ_REMOVE(&conn->sc_writes, p, ws_link);
+				ws = p;
+				break;
+			}
+		}
+	}
+	mtx_unlock(&conn->sc_lock);
+	if (ws == NULL)
+		return;
+
+	if (wc->status != IB_WC_SUCCESS) {
+		if (wc->status != IB_WC_WR_FLUSH_ERR) {
+			if (ppsratecheck(&svc_rdma_log_last,
+			    &svc_rdma_log_pps, 5))
+				printf("nfsrdma: RDMA Write completion error %u "
+				    "(bad rkey/addr/len or fault), closing\n",
+				    wc->status);
+			svc_rdma_conn_close(conn);
+		}
+		svc_rdma_write_free(ws);
+		return;
+	}
+
+	if (ppsratecheck(&svc_rdma_log_last, &svc_rdma_log_pps, 5))
+		printf("nfsrdma: reply chunk written + RDMA_NOMSG header sent "
+		    "(%u bytes)\n", ws->ws_srclen);
+
+	svc_rdma_write_free(ws);
+}
+
+/*
+ * ===========================================================================
  * FRWR memory-registration substrate (TASK_003f-2).
  *
  * This is ONLY the registration plumbing the RDMA Read (3f-3) and RDMA Write
@@ -2899,6 +3447,34 @@ svc_rdma_conn_free_verbs(struct svc_rdma_conn *conn)
 	if (conn->sc_id != NULL && conn->sc_id->qp != NULL)
 		rdma_destroy_qp(conn->sc_id);
 
+	/*
+	 * Reclaim any outbound RDMA Write (TASK_003f-4) still in flight at close.
+	 * svc_rdma_conn_destroy() has already run the sc_sends barrier + ib_drain_qp()
+	 * before calling us, so no RDMA Write completion can still be touching a write
+	 * state or its DMA mappings -- every committed (even partially-posted) write WR
+	 * has flushed, but its completion handler only FREES a write whose one-shot it
+	 * won; a write left on sc_writes here is one whose completion never ran (closed
+	 * before establish, or a never-posted attempt that a racing close stranded), so
+	 * WE are its single reclaimer.  Detach each under sc_lock and free it (unmaps
+	 * ws_src/ws_hdr via the idempotent mapped tokens, frees the state) -- exactly
+	 * once.  We take sc_lock only to pop the list; svc_rdma_write_free does not
+	 * sleep, but we drop the lock across it to avoid holding it over the frees.
+	 */
+	for (;;) {
+		struct svc_rdma_write_state *ws;
+
+		mtx_lock(&conn->sc_lock);
+		ws = TAILQ_FIRST(&conn->sc_writes);
+		if (ws != NULL) {
+			TAILQ_REMOVE(&conn->sc_writes, ws, ws_link);
+			ws->ws_active = false;
+		}
+		mtx_unlock(&conn->sc_lock);
+		if (ws == NULL)
+			break;
+		svc_rdma_write_free(ws);
+	}
+
 	if (conn->sc_rcq != NULL) {
 		ib_free_cq(conn->sc_rcq);
 		conn->sc_rcq = NULL;
@@ -3201,6 +3777,7 @@ svc_rdma_accept(struct rdma_cm_id *id)
 	 */
 	mtx_init(&conn->sc_lock, "nfsrdma_conn", NULL, MTX_DEF);
 	TASK_INIT(&conn->sc_teardown, 0, svc_rdma_conn_destroy, conn);
+	TAILQ_INIT(&conn->sc_writes);	/* in-flight RDMA Write registry (3f-4) */
 	conn->sc_state = SC_CONNECTING;
 	conn->sc_id = id;
 	id->context = conn;
@@ -3246,26 +3823,31 @@ svc_rdma_accept(struct rdma_cm_id *id)
 	 *
 	 * max_wr is the RECV cap (and the reply-send pool depth).  max_send_wr is
 	 * the SEND-queue cap: the reply depth PLUS FRWR head-room (3f-2) PLUS RDMA
-	 * Read head-room (3f-3).  The SQ carries reply SENDs, REG_MR + LOCAL_INV WRs,
-	 * AND RDMA Read WR chains, so it must hold them all without overflow.  We
-	 * reserve:
+	 * Read head-room (3f-3) PLUS RDMA Write head-room (3f-4).  The SQ carries reply
+	 * SENDs, REG_MR + LOCAL_INV WRs, RDMA Read WR chains, AND RDMA Write WR chains
+	 * (+ their header SEND), so it must hold them all without overflow.  We reserve:
 	 *   - 2 WRs per MR slot (one REG_MR + one LOCAL_INV), 2 * SVC_RDMA_MR_DEPTH;
 	 *   - one RDMA Read WR per chunk per concurrently-readable recv: at most
 	 *     SVC_RDMA_MAX_READ_SEGS WRs per recv buffer (one read in flight per
 	 *     recv, never reposted while its read is outstanding) across max_wr
-	 *     recvs -> max_wr * SVC_RDMA_MAX_READ_SEGS.
-	 * All are FIXED LOCAL bounds, never peer counts (the parser caps the read
-	 * list at SVC_RDMA_MAX_CHUNKS == SVC_RDMA_MAX_READ_SEGS).  Both caps are
-	 * clamped to the device's max_qp_wr; on a small-cap device the clamp wins and
-	 * a read chain that would overflow simply fails ib_post_send -> clean close,
-	 * never a panic.
+	 *     recvs -> max_wr * SVC_RDMA_MAX_READ_SEGS;
+	 *   - one RDMA Write chain + its header SEND per concurrently-replyable request:
+	 *     at most SVC_RDMA_MAX_WRITE_SEGS write WRs + 1 SEND per in-flight reply,
+	 *     bounded by the request depth (max_wr) -> max_wr * (SVC_RDMA_MAX_WRITE_SEGS
+	 *     + 1).
+	 * All are FIXED LOCAL bounds, never peer counts (the parser caps the read list
+	 * at SVC_RDMA_MAX_CHUNKS and the reply chunk at SVC_RDMA_MAX_SEGS ==
+	 * SVC_RDMA_MAX_WRITE_SEGS).  Every cap is clamped to the device's max_qp_wr; on
+	 * a small-cap device the clamp wins and a chain that would overflow simply fails
+	 * ib_post_send -> clean close, never a panic.
 	 */
 	max_wr = SVC_RDMA_RECV_DEPTH;
 	if (dev->attrs.max_qp_wr > 0 &&
 	    (u32)dev->attrs.max_qp_wr < max_wr)
 		max_wr = dev->attrs.max_qp_wr;
 	max_send_wr = max_wr + 2 * SVC_RDMA_MR_DEPTH +
-	    max_wr * SVC_RDMA_MAX_READ_SEGS;
+	    max_wr * SVC_RDMA_MAX_READ_SEGS +
+	    max_wr * (SVC_RDMA_MAX_WRITE_SEGS + 1);
 	if (dev->attrs.max_qp_wr > 0 &&
 	    (u32)dev->attrs.max_qp_wr < max_send_wr)
 		max_send_wr = dev->attrs.max_qp_wr;
@@ -3846,6 +4428,7 @@ static const struct svc_rdma_verbs_ops ibcore_verbs_ops = {
 	.svo_listen_start	= svc_rdma_listen_start_ops,
 	.svo_listen_stop	= svc_rdma_listen_stop,
 	.svo_conn_send		= svc_rdma_conn_send,
+	.svo_conn_reply_chunk	= svc_rdma_conn_reply_chunk,
 	.svo_conn_set_ctx	= svc_rdma_conn_set_ctx,
 	.svo_conn_get_ctx	= svc_rdma_conn_get_ctx,
 	.svo_conn_credits	= svc_rdma_conn_credits,
