@@ -186,6 +186,28 @@ MALLOC_DEFINE(M_NFSRDMA, "nfsrdma", "NFS over RDMA server");
 #define	SVC_RDMA_MR_PAGES	256
 
 /*
+ * RDMA Read engine sizing (TASK_003f-3).
+ *
+ * SVC_RDMA_MAX_READ is the hard cap on the total inbound length we will pull
+ * from a peer's read-list chunks into a single server destination buffer.  It is
+ * a FIXED LOCAL constant, NEVER a peer sum: a request whose summed read-list
+ * length exceeds it is a clean close, not a larger allocation.  1 MiB covers the
+ * common NFS WRITE rsize/wsize (up to 1 MiB) while bounding what one hostile call
+ * can make us malloc.  The 3f-1 parser already overflow-checks each per-segment
+ * length (<= SVC_RDMA_MAX_SEG_LEN) and the per-chunk total; this is an additional
+ * whole-request cap re-asserted at post time.
+ *
+ * SVC_RDMA_MAX_READ_SEGS is the cap on how many RDMA Read WRs we will chain for
+ * one request.  The read list itself is already capped at SVC_RDMA_MAX_CHUNKS
+ * entries (each a single segment) by the parser, so this is that same fixed cap;
+ * naming it here documents the post-time re-check and keeps the WR-chain bound
+ * explicit.  Each WR consumes one SQ slot, so this must fit the SQ head-room
+ * reserved at accept time (see max_send_wr).
+ */
+#define	SVC_RDMA_MAX_READ	(1U << 20)	/* 1 MiB whole-request cap */
+#define	SVC_RDMA_MAX_READ_SEGS	SVC_RDMA_MAX_CHUNKS
+
+/*
  * Size of the inline RPC-over-RDMA v1 reply we marshal in 3d.  It is a fixed
  * local constant -- the 7-word (28-byte) RFC 8166 transport header followed by
  * a minimal 6-word (24-byte) ONC RPC MSG_ACCEPTED/SUCCESS reply body (RFC 5531)
@@ -256,13 +278,84 @@ enum {
  * that buffer is owned by the completion that produced them (and, for a
  * consumer, only for the duration of the sro_recv upcall).  3c only locates the
  * payload -- decoding the ONC RPC body is the krpc layer's job (3e).
+ *
+ * Budget guard (TASK_003f-3).  We keep a DURABLE per-recv copy of this struct
+ * (rr_rs.rs_msg below) so the parsed chunk arrays survive past the recv handler
+ * until the async RDMA Read completes.  Assert its size stays within a sane
+ * budget so a future grow of the fixed-capacity chunk arrays cannot silently
+ * bloat per-recv (or per-conn) memory.  4 KiB comfortably holds the current
+ * 2608-byte layout (16 segs x 8 chunks + reply) with head-room.
  */
+CTASSERT(sizeof(struct svc_rdma_msg) <= 4096);
+
+/*
+ * Durable inbound-read state (TASK_003f-3), embedded in each recv descriptor.
+ *
+ * THE LIFETIME FIX.  The 3f-1 parser fills a struct svc_rdma_msg whose rpc/
+ * segment pointers reference rr_buf, and 3b reposts rr_buf the instant the recv
+ * handler returns.  An RDMA Read completes LATER (async on the SQ), so both the
+ * chunk metadata AND the inline head bytes the read splices into must outlive the
+ * recv handler.  This struct provides that durable storage: when a request bears
+ * a read list we COPY the parsed msg (rs_msg -- the bounded chunk arrays) and the
+ * inline head (rs_head, the bytes before the read-list splice point) into here,
+ * post the read into rs_buf, and DO NOT repost rr_buf until the read completes and
+ * the assembled body has been dispatched.  Nothing here points into rr_buf after
+ * the recv handler returns.
+ *
+ *   rs_cqe   - completion callback for the read WRs (aliased by every WR in the
+ *              chain's wr_cqe; the chain is signaled only on the LAST WR, so a
+ *              single completion lands in svc_rdma_wc_rdma_read with this rs_* via
+ *              container_of on the owning rr).
+ *   rs_msg   - the durable COPY of the parsed call (chunk arrays + xid/credit/
+ *              proc).  rs_msg.rpc is re-pointed at the ASSEMBLED body (rs_buf-
+ *              based) before dispatch, never at rr_buf.
+ *   rs_head  - a copy of the inline head: the inline bytes that precede the
+ *              read-list splice position (rc_position), capped at SVC_RDMA_INLINE.
+ *   rs_headlen - valid bytes in rs_head.
+ *   rs_buf   - the server destination buffer the read pulls into (malloc'd, size
+ *              rs_total), or the assembled body buffer; freed exactly once.
+ *   rs_total - summed read-list length, re-bounded <= SVC_RDMA_MAX_READ.
+ *   rs_dma   - ib_dma_map_single address of rs_buf (DMA_FROM_DEVICE; the device
+ *              WRITES the read data into it).
+ *   rs_mapped - DMA-map idempotency token (sc_lock): guards the single
+ *              ib_dma_unmap_single in svc_rdma_read_free; set right after a
+ *              successful map (BEFORE the SC_UP post gate), cleared on unmap.
+ *   rs_active - the COMPLETION ONE-SHOT guard (sc_lock): set before the post,
+ *              test-and-cleared at the top of svc_rdma_wc_rdma_read so exactly the
+ *              FIRST of possibly-several completions (a chained/partially-committed
+ *              post can flush multiple unsignaled prefix WRs) does the
+ *              dispatch+free+repost; later completions no-op.  It does NOT gate
+ *              reclaim (rs_mapped/rs_buf do) -- the drained teardown reclaims a
+ *              never-completed read regardless of rs_active.
+ *   rs_nwr   - number of chained read WRs (== rd_nchunks, <= SVC_RDMA_MAX_READ_SEGS).
+ *   rs_wr/rs_sge - the per-segment RDMA Read WR + its one SGE (sg into rs_buf).
+ */
+struct svc_rdma_read_state {
+	struct ib_cqe		 rs_cqe;
+	struct svc_rdma_msg	 rs_msg;
+	char			*rs_head;	/* inline head copy (<= INLINE) */
+	uint32_t		 rs_headlen;
+	void			*rs_buf;	/* read destination / assembled body */
+	uint32_t		 rs_total;	/* summed read length (bounded) */
+	u64			 rs_dma;	/* rs_buf DMA map (DMA_FROM_DEVICE) */
+	bool			 rs_mapped;	/* rs_dma is a live mapping (sc_lock) */
+	bool			 rs_active;	/* completion one-shot guard (sc_lock) */
+	int			 rs_nwr;
+	struct ib_rdma_wr	 rs_wr[SVC_RDMA_MAX_READ_SEGS];
+	struct ib_sge		 rs_sge[SVC_RDMA_MAX_READ_SEGS];
+};
 
 /*
  * One posted receive buffer.  rr_cqe.done is the completion callback the CQ
  * core dispatches (ib_cq.c: wc->wr_cqe->done(cq, wc)); rr_wr.wr_cqe aliases
  * &rr_cqe in the ib_recv_wr union, so a completion for this WR lands in
  * svc_rdma_wc_recv() with this exact rr_* in hand via container_of.
+ *
+ * rr_rs (TASK_003f-3) is this recv's durable inbound-read state.  At most ONE
+ * RDMA Read is in flight per recv buffer at a time: the recv buffer is NOT
+ * reposted while its read is outstanding (rr_rs.rs_active), so the read engine
+ * never reuses rr_rs under a live read.  rr_rs.rs_cqe.rr is recovered by
+ * container_of from rr_rs back to rr (see svc_rdma_wc_rdma_read).
  */
 struct svc_rdma_recv {
 	struct ib_cqe		 rr_cqe;
@@ -272,6 +365,7 @@ struct svc_rdma_recv {
 	bool			 rr_mapped;	/* rr_dma is a live mapping */
 	struct ib_sge		 rr_sge;
 	struct ib_recv_wr	 rr_wr;
+	struct svc_rdma_read_state rr_rs;	/* durable inbound-read state */
 };
 
 /*
@@ -520,6 +614,12 @@ static int svc_rdma_mr_reg(struct svc_rdma_conn *conn, struct svc_rdma_mr *sm,
 static void svc_rdma_mr_unmap(struct svc_rdma_conn *conn, struct svc_rdma_mr *sm);
 static void svc_rdma_wc_reg(struct ib_cq *cq, struct ib_wc *wc);
 static void svc_rdma_mr_selftest(struct svc_rdma_conn *conn);
+static int svc_rdma_read_start(struct svc_rdma_conn *conn,
+    struct svc_rdma_recv *rr, const struct svc_rdma_msg *msg, uint32_t len);
+static void svc_rdma_wc_rdma_read(struct ib_cq *cq, struct ib_wc *wc);
+static void svc_rdma_read_free(struct svc_rdma_conn *conn,
+    struct svc_rdma_recv *rr);
+static void svc_rdma_repost(struct svc_rdma_conn *conn, struct svc_rdma_recv *rr);
 
 /*
  * Default consumer ops (TASK_003e-1) -- the in-tree self-test policy that
@@ -888,13 +988,24 @@ svc_rdma_decode_segment(const void *buf, uint32_t len, uint32_t *offp,
  * "1" (more) word, then { rdma_position, rdma_segment }, terminated by a "0".
  * Flattens into out->reads[], capping at SVC_RDMA_MAX_CHUNKS.  A "more" word
  * that is neither 0 nor 1 is malformed.  Returns 0 or a positive errno.
+ *
+ * SINGLE rdma_position constraint (TASK_003f-3, NIT).  RFC 8166 4.3 permits a
+ * read list whose segments carry DIFFERING rdma_position values (data spliced
+ * into the XDR stream at several offsets).  The 3f-3 RDMA Read engine assembles
+ * the read data as ONE contiguous run spliced at a SINGLE position
+ * (reads[0].rc_position), so a multi-position read list would be mis-assembled.
+ * We therefore REJECT (EOPNOTSUPP -- well-formed but not served) any read list
+ * whose entries do not all share reads[0].rc_position.  This is the safe choice
+ * the reviewer preferred over silently assuming a single position; a Linux NFS/
+ * RDMA client always sends a single position for an NFS WRITE, so this rejects
+ * only genuinely multi-position lists we do not yet handle.
  */
 static int
 svc_rdma_decode_read_list(const void *buf, uint32_t len, uint32_t *offp,
     struct svc_rdma_msg *out)
 {
 	uint32_t off = *offp;
-	uint32_t more;
+	uint32_t more, position;
 	int rc;
 
 	out->rd_nchunks = 0;
@@ -917,9 +1028,18 @@ svc_rdma_decode_read_list(const void *buf, uint32_t len, uint32_t *offp,
 		/* rdma_position (1 word) + rdma_segment (4 words). */
 		if (!svc_rdma_need(off, RPCRDMA_WORD, len))
 			return (EBADMSG);
-		out->reads[out->rd_nchunks].rc_position =
-		    be32dec((const char *)buf + off);
+		position = be32dec((const char *)buf + off);
 		off += RPCRDMA_WORD;
+
+		/*
+		 * Enforce the single-position constraint: every entry must repeat
+		 * reads[0].rc_position.  A differing position is a well-formed list
+		 * the single-splice assembler cannot serve -> EOPNOTSUPP.
+		 */
+		if (out->rd_nchunks != 0 &&
+		    position != out->reads[0].rc_position)
+			return (EOPNOTSUPP);
+		out->reads[out->rd_nchunks].rc_position = position;
 
 		rc = svc_rdma_decode_segment(buf, len, &off,
 		    &out->reads[out->rd_nchunks].rc_seg);
@@ -1191,7 +1311,6 @@ svc_rdma_wc_recv(struct ib_cq *cq, struct ib_wc *wc)
 	struct svc_rdma_recv *rr;
 	struct svc_rdma_conn *conn;
 	struct svc_rdma_msg msg;
-	const struct ib_recv_wr *bad_wr;
 	uint32_t len;
 	int rc;
 	bool ready;
@@ -1279,27 +1398,56 @@ svc_rdma_wc_recv(struct ib_cq *cq, struct ib_wc *wc)
 	}
 
 	/*
-	 * Well-formed and within caps.  If the request carries ANY chunk (a read
-	 * or write list entry, a reply chunk, or RDMA_NOMSG -- which always moves
-	 * the whole call by chunk), the metadata is now decoded into bounded
-	 * structs but the RDMA Read/Write engine that would act on it is 3f-3/3f-4.
-	 * Log the decoded chunk summary and close the connection cleanly: this is
-	 * the 3f-1 milestone (DECODE + VALIDATE), NOT yet service.  We must NOT
-	 * fall through to the consumer dispatch -- the inline stub would fabricate
-	 * an inline reply and ignore the client's chunks (a protocol error).
+	 * Well-formed and within caps.  Route by chunk shape:
+	 *
+	 *   - A request bearing a WRITE list or a REPLY chunk (NFS READ result /
+	 *     large reply), or RDMA_NOMSG whose whole call travels by chunk with NO
+	 *     read list to pull, is the RDMA Write engine's job (3f-4) -- still
+	 *     decoded-but-not-served here.  Closing cleanly is correct: the inline
+	 *     stub would fabricate an inline reply and ignore the client's chunks.
+	 *
+	 *   - A request bearing a READ list (NFS WRITE / large call argument) and NO
+	 *     write list / reply chunk is the RDMA Read engine's job (3f-3, THIS
+	 *     increment).  We must NOT repost rr_buf yet and must NOT dispatch inline:
+	 *     the call body is not fully in our memory until the async RDMA Read
+	 *     completes.  Hand off to svc_rdma_read_start(), which copies the chunk
+	 *     metadata + inline head into the recv's DURABLE rr_rs (so nothing points
+	 *     into rr_buf once we return), allocates+maps a server buffer, and posts
+	 *     the read chain.  The read completion (svc_rdma_wc_rdma_read) assembles
+	 *     the body, dispatches sro_recv, frees the buffer, and reposts rr_buf.
+	 *     On a start error we close; on success we return WITHOUT reposting (the
+	 *     read owns rr_buf until completion).
 	 */
-	if (msg.rd_nchunks != 0 || msg.wr_nchunks != 0 || msg.reply_present ||
-	    msg.rdma_proc == RDMA_NOMSG) {
+	if (msg.wr_nchunks != 0 || msg.reply_present ||
+	    (msg.rdma_proc == RDMA_NOMSG && msg.rd_nchunks == 0)) {
 		if (ppsratecheck(&svc_rdma_log_last, &svc_rdma_log_pps, 5))
 			printf("nfsrdma: RPC-over-RDMA v1 %s xid=0x%08x "
-			    "credit=%u read_list=%u segs write_list=%u "
-			    "reply_chunk=%u segs (decoded, not yet served: "
-			    "3f-3/4), closing\n",
+			    "credit=%u read_list=%u write_list=%u "
+			    "reply_chunk=%u segs (write/reply-chunk decoded, not "
+			    "yet served: 3f-4), closing\n",
 			    msg.rdma_proc == RDMA_NOMSG ? "RDMA_NOMSG" :
 			    "RDMA_MSG", msg.xid, msg.credit, msg.rd_nchunks,
 			    msg.wr_nchunks,
 			    msg.reply_present ? msg.reply.wc_nsegs : 0);
 		svc_rdma_conn_close(conn);
+		return;
+	}
+
+	if (msg.rd_nchunks != 0) {
+		if (ppsratecheck(&svc_rdma_log_last, &svc_rdma_log_pps, 5))
+			printf("nfsrdma: RPC-over-RDMA v1 %s xid=0x%08x credit=%u "
+			    "read_list=%u segs inline head=%u bytes (RDMA Read)\n",
+			    msg.rdma_proc == RDMA_NOMSG ? "RDMA_NOMSG" :
+			    "RDMA_MSG", msg.xid, msg.credit, msg.rd_nchunks,
+			    msg.rpc_len);
+		rc = svc_rdma_read_start(conn, rr, &msg, len);
+		if (rc != 0)
+			svc_rdma_conn_close(conn);
+		/*
+		 * On success the read owns rr_buf until svc_rdma_wc_rdma_read
+		 * reposts it; on failure the conn is closing and the teardown
+		 * reclaims rr_buf.  Either way: do NOT repost here.
+		 */
 		return;
 	}
 
@@ -1383,37 +1531,50 @@ svc_rdma_wc_recv(struct ib_cq *cq, struct ib_wc *wc)
 	}
 
 repost:
+	svc_rdma_repost(conn, rr);
+}
 
-	/*
-	 * Repost the same buffer to keep the receive queue from starving --
-	 * while the connection is NOT SC_CLOSING (admitting SC_CONNECTING as well
-	 * as SC_UP), and under an in-flight repost refcount (sc_reposts) that the
-	 * teardown task drains before it calls ib_drain_qp().  This closes a
-	 * post-after-drain UAF: mlx5's ib_post_recv does NOT reject an ERR-state QP,
-	 * so without the barrier a repost that sampled a non-closing state, dropped
-	 * the lock, then lost the CPU could enqueue a WR AFTER the drain sentinel;
-	 * that WR's flush completion would fire against an already-freed conn/recv.
-	 *
-	 * The gate is SC_CLOSING-based, not SC_UP-based (TASK_003e-1 SHOULD-FIX): a
-	 * peer that sends an RPC before ESTABLISHED leaves the conn SC_CONNECTING,
-	 * and the recv path drops+reposts that early call -- if the repost required
-	 * SC_UP it would decline, depleting the RQ one buffer per early call until
-	 * RNR.  Admitting SC_CONNECTING recycles the buffer so the RQ stays full.
-	 * Post-after-drain safety is UNCHANGED: svc_rdma_conn_close() publishes
-	 * SC_CLOSING under sc_lock BEFORE enqueuing the teardown, so once teardown
-	 * is pending NO new repost passes the SC_CLOSING check (whether the conn was
-	 * SC_CONNECTING or SC_UP when it closed); the task's barrier then waits only
-	 * for already-counted reposts to finish their ib_post_recv and decrement.
-	 * After the count hits 0 every posted WR is on the QP before ib_drain_qp(),
-	 * so the drain catches them all and nothing posts afterward.
-	 *
-	 * Sequence: take sc_lock; if SC_CLOSING, bail (the teardown owns this buffer
-	 * and reclaims it after ib_drain_qp(), so skipping the repost cannot leak).
-	 * Otherwise bump sc_reposts and drop the lock before the (non-sleeping;
-	 * mlx5_ib_post_recv only takes the RQ spinlock, mlx5_ib_qp.c:4211)
-	 * ib_post_recv.  Reacquire, decrement, and wake the teardown (on the shared
-	 * &sc_upcalls channel) if we were the last in-flight repost.
-	 */
+/*
+ * Repost one recv buffer to keep the receive queue from starving -- while the
+ * connection is NOT SC_CLOSING (admitting SC_CONNECTING as well as SC_UP), and
+ * under an in-flight repost refcount (sc_reposts) that the teardown task drains
+ * before it calls ib_drain_qp().  This closes a post-after-drain UAF: mlx5's
+ * ib_post_recv does NOT reject an ERR-state QP, so without the barrier a repost
+ * that sampled a non-closing state, dropped the lock, then lost the CPU could
+ * enqueue a WR AFTER the drain sentinel; that WR's flush completion would fire
+ * against an already-freed conn/recv.
+ *
+ * Factored out of svc_rdma_wc_recv (TASK_003f-3) so the RDMA Read completion can
+ * repost the SAME recv buffer once it has consumed the inbound data -- a recv
+ * whose request bore a read list is NOT reposted by the recv handler; the read
+ * completion reposts it here after the assembled body is dispatched.  Behavior is
+ * byte-for-byte the former inline repost block.
+ *
+ * The gate is SC_CLOSING-based, not SC_UP-based (TASK_003e-1 SHOULD-FIX): a peer
+ * that sends an RPC before ESTABLISHED leaves the conn SC_CONNECTING, and the
+ * recv path drops+reposts that early call -- if the repost required SC_UP it
+ * would decline, depleting the RQ one buffer per early call until RNR.  Admitting
+ * SC_CONNECTING recycles the buffer so the RQ stays full.  Post-after-drain
+ * safety is UNCHANGED: svc_rdma_conn_close() publishes SC_CLOSING under sc_lock
+ * BEFORE enqueuing the teardown, so once teardown is pending NO new repost passes
+ * the SC_CLOSING check; the task's barrier then waits only for already-counted
+ * reposts to finish their ib_post_recv and decrement.  After the count hits 0
+ * every posted WR is on the QP before ib_drain_qp(), so the drain catches them
+ * all and nothing posts afterward.
+ *
+ * Sequence: take sc_lock; if SC_CLOSING, bail (the teardown owns this buffer and
+ * reclaims it after ib_drain_qp(), so skipping the repost cannot leak).
+ * Otherwise bump sc_reposts and drop the lock before the (non-sleeping;
+ * mlx5_ib_post_recv only takes the RQ spinlock) ib_post_recv.  Reacquire,
+ * decrement, and wake the teardown (on the shared &sc_upcalls channel) if we
+ * were the last in-flight repost.
+ */
+static void
+svc_rdma_repost(struct svc_rdma_conn *conn, struct svc_rdma_recv *rr)
+{
+	const struct ib_recv_wr *bad_wr;
+	int rc;
+
 	mtx_lock(&conn->sc_lock);
 	if (conn->sc_state == SC_CLOSING) {
 		mtx_unlock(&conn->sc_lock);
@@ -1440,6 +1601,499 @@ repost:
 			    rc);
 		svc_rdma_conn_close(conn);
 	}
+}
+
+/*
+ * ===========================================================================
+ * RDMA Read engine -- inbound NFS WRITE / large-call data (TASK_003f-3).
+ *
+ * For a request bearing a read list, the CLIENT has registered memory it wants
+ * us to RDMA-READ FROM (the data of an NFS WRITE, or a large call argument).
+ * Each read-list segment is a peer-supplied { rs_handle(rkey), rs_offset(remote
+ * virtual address), rs_length }.  We pull every segment into one contiguous
+ * server destination buffer, splice it together with the inline head at the
+ * read list's rdma_position (RFC 8166 4.3), and hand the assembled call body to
+ * the consumer's sro_recv -- so nfsd sees the full NFS WRITE.
+ *
+ * UNTRUSTED PEER (RFC 8166 5) -- re-validated AT POST TIME, not trusted from the
+ * parse:
+ *   - every rs_length re-checked in (0, SVC_RDMA_MAX_SEG_LEN];
+ *   - the segment/WR count re-checked <= SVC_RDMA_MAX_READ_SEGS;
+ *   - the running SUM re-checked against SVC_RDMA_MAX_READ (1 MiB) with no
+ *     uint32 overflow -- the server buffer is sized by THIS bounded sum, never
+ *     by an unbounded peer total;
+ *   - rs_handle(rkey) and rs_offset are passed VERBATIM to the HCA: the hardware
+ *     enforces the rkey against the client's MR, so a bad rkey/addr fails the WR
+ *     with an error completion, which we handle by CLOSING -- never by trusting.
+ * A read that fails for any reason is a clean close, never a panic/overread.
+ *
+ * COMPLETION-vs-TEARDOWN lifetime (the #1 hazard), mirroring 3f-2 exactly:
+ *   - the read WR chain is accounted in sc_sends (armed only under SC_UP), so the
+ *     drained teardown's barrier waits it out before ib_drain_qp();
+ *   - the server destination buffer + its DMA mapping live in the recv's DURABLE
+ *     rr_rs and are freed/unmapped EXACTLY ONCE -- on the read completion, or by
+ *     the teardown for a read still in flight at close (rs_active/rs_mapped
+ *     idempotency, the sm_sg_mapped pattern);
+ *   - svc_rdma_conn_close() publishes SC_CLOSING before enqueuing the teardown,
+ *     so once teardown is pending no new read passes the SC_UP gate.
+ * ===========================================================================
+ */
+
+/*
+ * Kick off the RDMA Read for a request whose read list we just parsed.  Called
+ * from the recv completion (IB_POLL_WORKQUEUE) with the parsed msg still pointing
+ * into rr_buf; len is the clamped recv byte length.  On success a read chain is
+ * on the SQ, accounted in sc_sends, and rr_buf is OWNED by the read until the
+ * completion reposts it -- the caller must NOT repost.  Returns 0 on success or a
+ * positive errno (the caller closes the conn on error; this routine has already
+ * released everything it allocated before returning nonzero).
+ *
+ * Durability: BEFORE posting, copy the parsed msg (the bounded chunk arrays) and
+ * the inline head bytes into the recv's durable rr_rs, so nothing the read or its
+ * completion touches points into rr_buf (which 3b reposts as soon as a recv
+ * handler returns -- but here we do not repost, and the durable copy means even a
+ * future repost cannot corrupt the read state).
+ */
+static int
+svc_rdma_read_start(struct svc_rdma_conn *conn, struct svc_rdma_recv *rr,
+    const struct svc_rdma_msg *msg, uint32_t len)
+{
+	struct svc_rdma_read_state *rs = &rr->rr_rs;
+	struct ib_device *dev = conn->sc_id->device;
+	const struct ib_send_wr *bad_wr;
+	uint64_t total;
+	uint32_t i, n;
+	int rc;
+
+	n = msg->rd_nchunks;
+
+	/*
+	 * Re-validate the read-list SHAPE at post time (untrusted peer).  The
+	 * parser already enforced n <= SVC_RDMA_MAX_CHUNKS and each rs_length in
+	 * (0, SVC_RDMA_MAX_SEG_LEN]; re-assert here so this engine is correct
+	 * independent of the parser's caps and so a future parser change cannot
+	 * silently let an over-cap request reach the HCA.
+	 */
+	if (n == 0 || n > SVC_RDMA_MAX_READ_SEGS)
+		return (EINVAL);
+
+	/*
+	 * Re-compute and re-bound the TOTAL inbound length.  uint64 accumulation
+	 * cannot wrap (each rs_length <= 1<<30, n <= 8).  Reject 0 (a read list of
+	 * only zero-length segments is malformed -- though the parser already
+	 * rejects a 0-length segment) and anything over the whole-request cap.  The
+	 * server buffer is sized by THIS value, never by a raw peer field.
+	 */
+	total = 0;
+	for (i = 0; i < n; i++) {
+		uint32_t slen = msg->reads[i].rc_seg.rs_length;
+
+		if (slen == 0 || slen > SVC_RDMA_MAX_SEG_LEN)
+			return (EINVAL);
+		total += slen;
+	}
+	if (total == 0 || total > SVC_RDMA_MAX_READ)
+		return (EMSGSIZE);
+
+	/*
+	 * Copy the parsed call + inline head into the DURABLE rr_rs.  After this no
+	 * field the read or its completion uses points into rr_buf.  rs_head holds
+	 * the inline bytes (the head the read data splices into at rdma_position);
+	 * cap the copy at SVC_RDMA_INLINE (len is already clamped to it).
+	 */
+	rs->rs_msg = *msg;			/* durable copy of chunk arrays */
+	rs->rs_total = (uint32_t)total;
+	rs->rs_headlen = msg->rpc_len;
+	/*
+	 * Defense in depth: rpc_len is (len - chunk-list bytes) and so already
+	 * <= len <= SVC_RDMA_INLINE, but clamp explicitly to the received byte
+	 * count and the buffer size so a malformed rpc_len can never drive a copy
+	 * past the bytes that actually landed in rr_buf.
+	 */
+	if (rs->rs_headlen > len)
+		rs->rs_headlen = len;
+	if (rs->rs_headlen > SVC_RDMA_INLINE)
+		rs->rs_headlen = SVC_RDMA_INLINE;
+	rs->rs_head = malloc(SVC_RDMA_INLINE, M_NFSRDMA, M_NOWAIT);
+	if (rs->rs_head == NULL)
+		return (ENOMEM);
+	if (rs->rs_headlen != 0)
+		memcpy(rs->rs_head, msg->rpc, rs->rs_headlen);
+
+	/*
+	 * Allocate the server destination buffer sized by the BOUNDED total and
+	 * DMA-map it DMA_FROM_DEVICE (the HCA WRITES the read data into it).  This
+	 * is the only peer-influenced allocation, and it is bounded by
+	 * SVC_RDMA_MAX_READ.  M_NOWAIT: we are in the completion context.
+	 */
+	rs->rs_buf = malloc(rs->rs_total, M_NFSRDMA, M_NOWAIT);
+	if (rs->rs_buf == NULL) {
+		free(rs->rs_head, M_NFSRDMA);
+		rs->rs_head = NULL;
+		return (ENOMEM);
+	}
+	rs->rs_dma = ib_dma_map_single(dev, rs->rs_buf, rs->rs_total,
+	    DMA_FROM_DEVICE);
+	if (ib_dma_mapping_error(dev, rs->rs_dma)) {
+		free(rs->rs_buf, M_NFSRDMA);
+		rs->rs_buf = NULL;
+		free(rs->rs_head, M_NFSRDMA);
+		rs->rs_head = NULL;
+		return (EIO);
+	}
+	/*
+	 * BLOCKER 1 fix: mark the mapping live IMMEDIATELY after a successful map,
+	 * BEFORE the SC_UP check below.  svc_rdma_read_free unmaps iff rs_mapped, so
+	 * any reclaim after this point (the SC_UP-lost-race early-out, or the drained
+	 * teardown) unmaps exactly once.  Setting it only inside the SC_UP branch
+	 * left a window where a teardown racing between the map and the lock would
+	 * free() rs_buf with the DMA mapping still live (leaked mapping + device
+	 * translation onto freed memory) -- remotely triggerable by a mid-flight
+	 * disconnect.  It is plain memory the recv owns until the post, so setting it
+	 * before taking sc_lock is safe (no completion can reach rr_rs yet: nothing
+	 * is posted).
+	 */
+	rs->rs_mapped = true;
+
+	/*
+	 * Build the RDMA Read WR chain: one IB_WR_RDMA_READ per read segment, each
+	 * with a single local SGE pointing at the running offset within rs_buf
+	 * (lkey = the PD's local_dma_lkey -- the server dest is local memory, no
+	 * FRWR registration needed for the SINK of a read), and the peer's
+	 * { rkey, remote_addr } passed VERBATIM as wr.rdma.{rkey, remote_addr}.
+	 * Chain them next->next and SIGNAL ONLY THE LAST so a single completion
+	 * fires for the whole chain.  rs_cqe.done routes that completion to
+	 * svc_rdma_wc_rdma_read; every WR's wr_cqe aliases &rs_cqe so the (last)
+	 * completion recovers rs via container_of.
+	 */
+	{
+		uint32_t off = 0;
+
+		rs->rs_nwr = n;
+		rs->rs_cqe.done = svc_rdma_wc_rdma_read;
+		for (i = 0; i < n; i++) {
+			const struct svc_rdma_segment *seg =
+			    &msg->reads[i].rc_seg;
+			uint32_t slen = seg->rs_length;
+
+			rs->rs_sge[i].addr = rs->rs_dma + off;
+			rs->rs_sge[i].length = slen;
+			rs->rs_sge[i].lkey = conn->sc_pd->local_dma_lkey;
+
+			memset(&rs->rs_wr[i], 0, sizeof(rs->rs_wr[i]));
+			rs->rs_wr[i].wr.wr_cqe = &rs->rs_cqe;
+			rs->rs_wr[i].wr.sg_list = &rs->rs_sge[i];
+			rs->rs_wr[i].wr.num_sge = 1;
+			rs->rs_wr[i].wr.opcode = IB_WR_RDMA_READ;
+			rs->rs_wr[i].wr.send_flags = 0;
+			rs->rs_wr[i].remote_addr = seg->rs_offset;
+			rs->rs_wr[i].rkey = seg->rs_handle;
+			rs->rs_wr[i].wr.next = (i + 1 < n) ?
+			    &rs->rs_wr[i + 1].wr : NULL;
+			off += slen;	/* bounded by rs_total, no overflow */
+		}
+		/* Signal only the tail -- one completion for the whole chain. */
+		rs->rs_wr[n - 1].wr.send_flags = IB_SEND_SIGNALED;
+	}
+
+	/*
+	 * Arm the send-side teardown barrier and post, IDENTICALLY to
+	 * svc_rdma_conn_send()/the FRWR self-test: in one sc_lock section verify
+	 * SC_UP, mark this read in flight on the recv (rs_active -- with rs_mapped
+	 * already set after the map), and bump sc_sends; then ib_post_send with the
+	 * lock dropped; then reacquire, decrement sc_sends, and wake the teardown if
+	 * we were the last in-flight SQ WR.  Because conn_close() publishes SC_CLOSING
+	 * before enqueuing the teardown, once teardown is pending this post cannot
+	 * pass the SC_UP gate, and the barrier waits only for an already-counted post
+	 * to finish.  After sc_sends hits 0 the chain is on the SQ before
+	 * ib_drain_qp(), so the SQ drain sentinel catches it (its flush completion
+	 * reaches svc_rdma_wc_rdma_read with a live conn) and nothing posts afterward.
+	 *
+	 * rs_active is set BEFORE the post (the one-shot completion token): a chained
+	 * post that partially commits (see the failure handling below) generates flush
+	 * completions for the committed prefix, which must find rs_active set so the
+	 * one-shot guard in svc_rdma_wc_rdma_read claims reclaim ownership correctly.
+	 */
+	mtx_lock(&conn->sc_lock);
+	if (conn->sc_state != SC_UP) {
+		mtx_unlock(&conn->sc_lock);
+		/*
+		 * Tearing down before we posted anything: no WR reached the SQ, so
+		 * no completion will ever fire for this read.  Reclaim inline
+		 * (svc_rdma_read_free unmaps via the now-early rs_mapped) and let
+		 * the caller close.  This is the ONLY inline-reclaim path left --
+		 * it is safe precisely because nothing was posted.
+		 */
+		svc_rdma_read_free(conn, rr);
+		return (ENOTCONN);
+	}
+	rs->rs_active = true;
+	conn->sc_sends++;
+	mtx_unlock(&conn->sc_lock);
+
+	rc = ib_post_send(conn->sc_id->qp, &rs->rs_wr[0].wr, &bad_wr);
+
+	/*
+	 * BLOCKER 2 fix: a CHAINED ib_post_send can PARTIALLY commit.  mlx5's
+	 * mlx5_ib_post_send builds WQEs one WR at a time and, on a mid-chain
+	 * begin_wqe/mlx5_wq_overflow failure, `goto out` where `if (likely(nreq))`
+	 * RINGS THE DOORBELL for the already-built prefix while returning -ENOMEM
+	 * (mlx5_ib_qp.c:3952-3958 begin_wqe failure -> :4178-4200 out:).  So on rc
+	 * != 0 we must assume the worst: some prefix RDMA Reads are LIVE on the HCA
+	 * and will DMA-write rs_buf, and their completions (flush on QP->ERR, or an
+	 * error CQE) will run svc_rdma_wc_rdma_read via container_of on rr_rs.  We
+	 * therefore do NOT reclaim inline (no svc_rdma_read_free, no repost): freeing
+	 * rs_buf here would be a DMA-after-free, and the SINGLE post-drain reclaimer
+	 * (svc_rdma_conn_free_verbs -> svc_rdma_read_free, after ib_drain_qp) frees it
+	 * exactly once.  We DO still decrement sc_sends (the POSTING operation has
+	 * finished, success or fail) so the teardown's barrier can reach 0 and proceed
+	 * to drain the committed prefix -- leaving rs_active/rs_mapped/rs_buf intact
+	 * for that drained reclaim.  Then conn_close and return nonzero; the caller's
+	 * close is idempotent with ours.
+	 */
+	mtx_lock(&conn->sc_lock);
+	if (--conn->sc_sends == 0)
+		wakeup(&conn->sc_upcalls);
+	mtx_unlock(&conn->sc_lock);
+
+	if (rc != 0) {
+		if (ppsratecheck(&svc_rdma_log_last, &svc_rdma_log_pps, 5))
+			printf("nfsrdma: ib_post_send (RDMA Read) failed: %d "
+			    "(prefix may be committed; drain reclaims)\n", rc);
+		svc_rdma_conn_close(conn);
+		return (rc < 0 ? -rc : rc);
+	}
+	return (0);
+}
+
+/*
+ * Release the durable read state for a recv: unmap+free the server destination
+ * buffer and free the inline-head copy, EXACTLY ONCE.  RECLAIM IS DRIVEN BY THE
+ * idempotent rs_mapped (unmap) and rs_buf/rs_head != NULL (free) tokens -- the
+ * sm_sg_mapped pattern -- NOT by rs_active (which is the completion one-shot
+ * guard, a separate concern this routine merely clears defensively).  So the two
+ * legitimate reclaimers -- the first read completion (success or assemble-alloc
+ * drop), and the drained teardown (svc_rdma_conn_free_verbs) -- can each call this
+ * and the SECOND is a harmless no-op (all tokens already cleared/NULL).  Callable
+ * under sc_lock (it only ib_dma_unmap_single / free, neither sleeps); the read
+ * completion calls it WITHOUT the lock, the teardown without the lock after the
+ * drain.
+ *
+ * The DMA / read-vs-teardown rule: the server buffer's DMA mapping MUST stay live
+ * until the device is done writing into it (the read completion) or the QP is
+ * drained (teardown); ib_drain_qp() guarantees no read completion can fire after
+ * it, so the teardown calling this for a read that never completed is safe -- no
+ * concurrent completion can be touching rs_buf/rs_dma.
+ */
+static void
+svc_rdma_read_free(struct svc_rdma_conn *conn, struct svc_rdma_recv *rr)
+{
+	struct svc_rdma_read_state *rs = &rr->rr_rs;
+	struct ib_device *dev;
+
+	if (rs->rs_mapped) {
+		dev = (conn->sc_id != NULL) ? conn->sc_id->device : NULL;
+		if (dev != NULL)
+			ib_dma_unmap_single(dev, rs->rs_dma, rs->rs_total,
+			    DMA_FROM_DEVICE);
+		rs->rs_mapped = false;
+	}
+	if (rs->rs_buf != NULL) {
+		free(rs->rs_buf, M_NFSRDMA);
+		rs->rs_buf = NULL;
+	}
+	if (rs->rs_head != NULL) {
+		free(rs->rs_head, M_NFSRDMA);
+		rs->rs_head = NULL;
+	}
+	rs->rs_active = false;
+}
+
+/*
+ * RDMA Read completion (TASK_003f-3).  Dispatched by the CQ core in the same
+ * IB_POLL_WORKQUEUE context as the send/recv handlers; keep it short, take no
+ * sleepable lock, start no blocking teardown.  The signaled tail WR's wr_cqe
+ * aliases &rs->rs_cqe, so container_of recovers the read state, then the recv
+ * descriptor and the owning conn.
+ *
+ * ONE-SHOT (the multi-completion guard).  A chained post can deliver MORE THAN
+ * ONE completion for a single read: only the tail WR is signaled, but flush
+ * (QP->ERR) and error CQEs are reported for UNSIGNALED prefix WRs too, and a
+ * partially-committed failed post (see svc_rdma_read_start's BLOCKER 2 fix) can
+ * leave a committed prefix that flushes.  So this handler can be invoked >1x for
+ * one rr_rs.  rs_active is the one-shot token: at the top, under sc_lock,
+ * test-and-clear it; if it was already clear this is a DUPLICATE completion and
+ * we return immediately (the first invocation, or the drained teardown, owns
+ * reclaim).  Only the FIRST completion proceeds.  sc_sends is NOT touched here --
+ * it is decremented exactly once at the POSTING site (svc_rdma_read_start), so no
+ * completion path can double-decrement it.
+ *
+ * SUCCESS (first completion): rs_buf holds the inbound data the peer registered.
+ * Assemble the full call body = head[0, pos) ++ read_data ++ head[pos, headlen)
+ * where pos is the read list's rdma_position (RFC 8166 4.3); the parser already
+ * rejected a read list whose segments carry DIFFERING positions, so a single
+ * reads[0].rc_position describes the whole splice (clamped to headlen).  For the
+ * common NFS WRITE pos == headlen, so the read data appends after the inline
+ * head.  Dispatch via sro_recv under the same readiness gate + sc_upcalls barrier
+ * the inline path uses, then free the read state and repost rr_buf.
+ *
+ * ERROR/FLUSH (first completion): a bad rkey/addr/length fails the WR (the HCA
+ * enforced the rkey), or the chain flushed during teardown.  We clear rs_active
+ * (one-shot) but do NOT free rr_rs -- the DRAINED teardown is the single reclaimer
+ * for a closing conn, gated by the idempotent rs_mapped/rs_buf tokens (NOT
+ * rs_active), so leaving them set is correct and reclaim happens exactly once
+ * after ib_drain_qp().  IB_WC_WR_FLUSH_ERR is swallowed; any other status closes.
+ * rr_buf is NOT reposted (the teardown owns it).  This mirrors the recv/send flush
+ * handling exactly.
+ *
+ * Serialization (the true model, documented per the reviewer): per-conn
+ * completions are serialized by the single IB_POLL_WORKQUEUE thread; the recv that
+ * owns rr_rs is single-owner (never reposted while rs_active); and ib_drain_qp()
+ * is FIFO, so every completion this read can ever produce has run before the
+ * teardown frees conn/rr.  The rs_active one-shot then makes the >1-completion
+ * case safe: exactly one invocation does the work, the rest no-op.
+ */
+static void
+svc_rdma_wc_rdma_read(struct ib_cq *cq, struct ib_wc *wc)
+{
+	struct svc_rdma_read_state *rs;
+	struct svc_rdma_recv *rr;
+	struct svc_rdma_conn *conn;
+	struct svc_rdma_msg dispatch;
+	char *body;
+	uint32_t pos, bodylen;
+	int rc;
+	bool ready, first;
+
+	/* Same single-workqueue-thread invariant as the other wc handlers (N2). */
+	MPASS(cq->poll_ctx == IB_POLL_WORKQUEUE);
+
+	rs = container_of(wc->wr_cqe, struct svc_rdma_read_state, rs_cqe);
+	rr = container_of(rs, struct svc_rdma_recv, rr_rs);
+	conn = rr->rr_conn;
+
+	/*
+	 * One-shot test-and-clear: only the FIRST completion for this read proceeds;
+	 * any duplicate (a prefix flush after the tail already ran, a second flush)
+	 * finds rs_active already false and returns.  This makes dispatch+free+repost
+	 * (and the close) happen at most once per read.
+	 */
+	mtx_lock(&conn->sc_lock);
+	first = rs->rs_active;
+	rs->rs_active = false;
+	mtx_unlock(&conn->sc_lock);
+	if (!first)
+		return;
+
+	if (wc->status != IB_WC_SUCCESS) {
+		/*
+		 * Flushed during teardown: expected; the DRAINED teardown reclaims
+		 * rr_rs after ib_drain_qp() via the idempotent rs_mapped/rs_buf
+		 * tokens, so leave them set and touch nothing else.  Any other
+		 * status (including the error a bad peer rkey/addr/length produces)
+		 * is a real fault -> close; again do NOT free rr_rs here (the conn
+		 * is closing and the teardown is the single reclaimer), and do NOT
+		 * repost rr_buf (the teardown owns it).
+		 */
+		if (wc->status != IB_WC_WR_FLUSH_ERR) {
+			if (ppsratecheck(&svc_rdma_log_last,
+			    &svc_rdma_log_pps, 5))
+				printf("nfsrdma: RDMA Read completion error %u "
+				    "(bad rkey/addr/len or fault), closing\n",
+				    wc->status);
+			svc_rdma_conn_close(conn);
+		}
+		return;
+	}
+
+	/*
+	 * Splice point: the position in the XDR stream where the read data belongs.
+	 * Clamp to the inline head length so a peer-supplied position can never
+	 * index past the head we copied (defense in depth -- pos beyond headlen just
+	 * appends).  bodylen = head + read data; both bounded (headlen <=
+	 * SVC_RDMA_INLINE, rs_total <= SVC_RDMA_MAX_READ), so the sum cannot
+	 * overflow uint32.
+	 */
+	pos = rs->rs_msg.reads[0].rc_position;
+	if (pos > rs->rs_headlen)
+		pos = rs->rs_headlen;
+	bodylen = rs->rs_headlen + rs->rs_total;
+
+	/*
+	 * Assemble in place: rs_buf currently holds [read_data] of rs_total bytes.
+	 * We need [head[0,pos)][read_data][head[pos,headlen)].  Rather than grow
+	 * rs_buf, build the assembled body in a fresh allocation sized to the
+	 * bounded bodylen.  M_NOWAIT (completion context): on failure drop the call
+	 * (free state + repost; the RC client retransmits) rather than block.
+	 */
+	body = malloc(bodylen, M_NFSRDMA, M_NOWAIT);
+	if (body == NULL) {
+		if (ppsratecheck(&svc_rdma_log_last, &svc_rdma_log_pps, 5))
+			printf("nfsrdma: RDMA Read assemble alloc failed, "
+			    "dropping call\n");
+		svc_rdma_read_free(conn, rr);
+		svc_rdma_repost(conn, rr);
+		return;
+	}
+	if (pos != 0)
+		memcpy(body, rs->rs_head, pos);
+	memcpy(body + pos, rs->rs_buf, rs->rs_total);
+	if (rs->rs_headlen > pos)
+		memcpy(body + pos + rs->rs_total, rs->rs_head + pos,
+		    rs->rs_headlen - pos);
+
+	/*
+	 * Dispatch the assembled body to the consumer under the SAME readiness gate
+	 * + sc_upcalls barrier as the inline path.  The synthetic svc_rdma_msg
+	 * carries the durable xid/credit/proc and the assembled body as rpc/rpc_len
+	 * (the consumer copies it into an mbuf in sro_recv -- exactly as for an
+	 * inline call -- so nfsd sees the complete NFS WRITE).  ready guarantees
+	 * sro_newconn completed and the conn is SC_UP.  We drop the sc_upcalls
+	 * refcount before acting on the result (a close enqueues a teardown whose
+	 * barrier waits sc_upcalls == 0).
+	 */
+	dispatch = rs->rs_msg;
+	dispatch.rpc = body;
+	dispatch.rpc_len = bodylen;
+	/* The body is now self-contained; the consumer sees no chunk lists. */
+	dispatch.rd_nchunks = 0;
+	dispatch.wr_nchunks = 0;
+	dispatch.reply_present = false;
+	dispatch.rdma_proc = RDMA_MSG;
+
+	mtx_lock(&conn->sc_lock);
+	ready = (conn->sc_state == SC_UP && conn->sc_newconn_done);
+	if (ready)
+		conn->sc_upcalls++;
+	mtx_unlock(&conn->sc_lock);
+
+	rc = 0;
+	if (ready) {
+		if (conn->sc_ops != NULL && conn->sc_ops->sro_recv != NULL)
+			rc = conn->sc_ops->sro_recv(conn->sc_ctx, conn,
+			    &dispatch);
+		mtx_lock(&conn->sc_lock);
+		if (--conn->sc_upcalls == 0)
+			wakeup(&conn->sc_upcalls);
+		mtx_unlock(&conn->sc_lock);
+	}
+
+	free(body, M_NFSRDMA);
+
+	/*
+	 * Done with the read: free the durable state.  We are the first (and only)
+	 * completion (rs_active was test-and-cleared at the top), so this is the
+	 * sole normal-completion reclaimer; svc_rdma_read_free is idempotent on
+	 * rs_mapped/rs_buf so even a racing drained teardown reclaim is a no-op.
+	 * Then either close (consumer rejected) or repost rr_buf for the next call.
+	 */
+	svc_rdma_read_free(conn, rr);
+
+	if (rc != 0) {
+		svc_rdma_conn_close(conn);
+		return;
+	}
+	svc_rdma_repost(conn, rr);
 }
 
 /*
@@ -1615,18 +2269,41 @@ svc_rdma_mr_unmap(struct svc_rdma_conn *conn, struct svc_rdma_mr *sm)
  * The matching sc_sends decrement is done by the POSTING site (svc_rdma_mr_selftest)
  * right after ib_post_send returns, exactly as svc_rdma_conn_send() decrements its
  * own sc_sends after posting -- NOT here.  So this handler only reclaims the slot.
+ *
+ * ONE-SHOT (SHOULD-FIX, the same multi-completion guard as svc_rdma_wc_rdma_read).
+ * A partially-committed chained post (REG_MR + LOCAL_INV) can flush BOTH WRs, so
+ * this handler can be invoked >1x for one sm.  sm_inuse is the one-shot token: at
+ * the top, under sc_lock, test-and-clear it; if it was already clear this is a
+ * DUPLICATE completion and we return (the first invocation, or the drained
+ * teardown, owns reclaim).  Teardown reclaim is driven by sm_sg_mapped / sm_mr
+ * (NOT sm_inuse), so a flush/error path that returns the slot to the pool here
+ * without unmapping still lets the teardown unmap+dereg exactly once.
  */
 static void
 svc_rdma_wc_reg(struct ib_cq *cq, struct ib_wc *wc)
 {
 	struct svc_rdma_mr *sm;
 	struct svc_rdma_conn *conn;
+	bool first;
 
 	/* Same single-workqueue-thread invariant as the recv/send handlers (N2). */
 	MPASS(cq->poll_ctx == IB_POLL_WORKQUEUE);
 
 	sm = container_of(wc->wr_cqe, struct svc_rdma_mr, sm_cqe);
 	conn = sm->sm_conn;
+
+	/*
+	 * One-shot test-and-clear: only the FIRST completion for this MR proceeds;
+	 * a duplicate (the chain's other WR flushing) finds sm_inuse already false
+	 * and returns.  Clearing sm_inuse here also returns the slot to the pool for
+	 * the success path (which previously cleared it at the end).
+	 */
+	mtx_lock(&conn->sc_lock);
+	first = sm->sm_inuse;
+	sm->sm_inuse = false;
+	mtx_unlock(&conn->sc_lock);
+	if (!first)
+		return;
 
 	if (wc->status != IB_WC_SUCCESS) {
 		if (wc->status != IB_WC_WR_FLUSH_ERR) {
@@ -1637,8 +2314,10 @@ svc_rdma_wc_reg(struct ib_cq *cq, struct ib_wc *wc)
 			/*
 			 * Leave sm_sg_mapped as-is: the teardown unmaps it (the
 			 * device may still hold the registration on an error that
-			 * did not invalidate).  Do not touch the pool here -- the
-			 * teardown owns the whole pool once it runs.
+			 * did not invalidate).  The slot is already returned to the
+			 * pool by the one-shot above, but the teardown owns the
+			 * whole pool's unmap+dereg once it runs (gated by
+			 * sm_sg_mapped/sm_mr, not sm_inuse), so this cannot leak.
 			 */
 			svc_rdma_conn_close(conn);
 		}
@@ -1651,15 +2330,11 @@ svc_rdma_wc_reg(struct ib_cq *cq, struct ib_wc *wc)
 
 	/*
 	 * Registered and invalidated cleanly: the device is done with the MR's
-	 * page vector, so drop the DMA mapping and free the slot back to the
-	 * bounded pool.  Unmap BEFORE clearing sm_inuse so a teardown that races
-	 * (it cannot reclaim a still-inuse slot until the sc_sends barrier has
-	 * drained this WR anyway) never sees a freed-but-mapped slot.
+	 * page vector, so drop the DMA mapping (the slot was already returned to the
+	 * pool by the one-shot above).  svc_rdma_mr_unmap is idempotent on
+	 * sm_sg_mapped, so a racing drained-teardown unmap is a no-op.
 	 */
 	svc_rdma_mr_unmap(conn, sm);
-	mtx_lock(&conn->sc_lock);
-	sm->sm_inuse = false;
-	mtx_unlock(&conn->sc_lock);
 }
 
 /*
@@ -1778,25 +2453,30 @@ svc_rdma_mr_selftest(struct svc_rdma_conn *conn)
 
 	rc = ib_post_send(conn->sc_id->qp, &sm->sm_regwr.wr, &bad_wr);
 
+	/*
+	 * SHOULD-FIX (same partial-post flaw as the RDMA Read chain): this is a
+	 * 2-WR chain (REG_MR unsignaled + LOCAL_INV signaled).  mlx5 commits the
+	 * already-built prefix to the HCA on a mid-chain failure (mlx5_ib_qp.c out:
+	 * `if (likely(nreq))`), so on rc != 0 a committed REG_MR may be live and its
+	 * flush/error completion will run svc_rdma_wc_reg via container_of on sm.  We
+	 * must therefore NOT reclaim inline (no svc_rdma_mr_unmap, no sm_inuse=false):
+	 * that would race the committed WR's completion and free a DMA mapping the
+	 * device may still touch.  Leave sm_sg_mapped/sm_inuse set; the DRAINED
+	 * teardown (svc_rdma_conn_free_verbs, after ib_drain_qp) is the single
+	 * reclaimer (idempotent svc_rdma_mr_unmap + ib_dereg_mr).  We DO still
+	 * decrement sc_sends (the posting op finished) so the teardown barrier can
+	 * reach 0 and drain the committed prefix, then conn_close.  svc_rdma_wc_reg is
+	 * one-shot-guarded against the resulting multiple completions (see there).
+	 */
 	mtx_lock(&conn->sc_lock);
-	if (rc != 0) {
-		/*
-		 * Neither WR reached the SQ, so no completion will fire: undo the
-		 * DMA mapping and release the slot here, then drop the barrier.
-		 * (svc_rdma_mr_unmap is safe under sc_lock -- it only calls
-		 * ib_dma_unmap_sg, which does not sleep.)
-		 */
-		svc_rdma_mr_unmap(conn, sm);
-		sm->sm_inuse = false;
-	}
 	if (--conn->sc_sends == 0)
 		wakeup(&conn->sc_upcalls);
 	mtx_unlock(&conn->sc_lock);
 
 	if (rc != 0) {
 		if (ppsratecheck(&svc_rdma_log_last, &svc_rdma_log_pps, 5))
-			printf("nfsrdma: FRWR self-test ib_post_send failed: %d\n",
-			    rc);
+			printf("nfsrdma: FRWR self-test ib_post_send failed: %d "
+			    "(prefix may be committed; drain reclaims)\n", rc);
 		svc_rdma_conn_close(conn);
 	}
 }
@@ -2242,6 +2922,19 @@ svc_rdma_conn_free_verbs(struct svc_rdma_conn *conn)
 		for (i = 0; i < conn->sc_nrecv; i++) {
 			struct svc_rdma_recv *rr = &conn->sc_recv[i];
 
+			/*
+			 * Reclaim any RDMA Read (TASK_003f-3) still in flight for
+			 * this recv at close: free+unmap the server destination
+			 * buffer and the inline-head copy.  svc_rdma_read_free is
+			 * idempotent (rs_mapped/rs_active), so a read that already
+			 * completed normally is a no-op here, and one that never
+			 * completed (closed mid-read, or a flushed read WR) is
+			 * freed exactly once.  ib_drain_qp() already ran in
+			 * svc_rdma_conn_destroy(), so no RDMA Read completion can
+			 * be touching rs_buf/rs_dma when we release them.
+			 */
+			svc_rdma_read_free(conn, rr);
+
 			if (rr->rr_mapped && dev != NULL)
 				ib_dma_unmap_single(dev, rr->rr_dma,
 				    SVC_RDMA_INLINE, DMA_FROM_DEVICE);
@@ -2552,20 +3245,27 @@ svc_rdma_accept(struct rdma_cm_id *id)
 	 * recv (a single inline segment), so one recv SGE is sufficient.
 	 *
 	 * max_wr is the RECV cap (and the reply-send pool depth).  max_send_wr is
-	 * the SEND-queue cap: the reply depth PLUS FRWR head-room (3f-2).  The
-	 * FRWR self-test (and, later, 3f-3/3f-4) posts REG_MR + LOCAL_INV WRs on
-	 * the SQ in addition to reply SENDs, so the SQ must hold both without
-	 * overflow.  We reserve 2 WRs per MR slot (one REG_MR + one LOCAL_INV) for
-	 * the whole pool -- a fixed local bound (SVC_RDMA_MR_DEPTH), never a peer
-	 * count -- so the entire MR pool could be registered+invalidated
-	 * concurrently with a full reply pool.  Both caps are clamped to the
-	 * device's max_qp_wr.
+	 * the SEND-queue cap: the reply depth PLUS FRWR head-room (3f-2) PLUS RDMA
+	 * Read head-room (3f-3).  The SQ carries reply SENDs, REG_MR + LOCAL_INV WRs,
+	 * AND RDMA Read WR chains, so it must hold them all without overflow.  We
+	 * reserve:
+	 *   - 2 WRs per MR slot (one REG_MR + one LOCAL_INV), 2 * SVC_RDMA_MR_DEPTH;
+	 *   - one RDMA Read WR per chunk per concurrently-readable recv: at most
+	 *     SVC_RDMA_MAX_READ_SEGS WRs per recv buffer (one read in flight per
+	 *     recv, never reposted while its read is outstanding) across max_wr
+	 *     recvs -> max_wr * SVC_RDMA_MAX_READ_SEGS.
+	 * All are FIXED LOCAL bounds, never peer counts (the parser caps the read
+	 * list at SVC_RDMA_MAX_CHUNKS == SVC_RDMA_MAX_READ_SEGS).  Both caps are
+	 * clamped to the device's max_qp_wr; on a small-cap device the clamp wins and
+	 * a read chain that would overflow simply fails ib_post_send -> clean close,
+	 * never a panic.
 	 */
 	max_wr = SVC_RDMA_RECV_DEPTH;
 	if (dev->attrs.max_qp_wr > 0 &&
 	    (u32)dev->attrs.max_qp_wr < max_wr)
 		max_wr = dev->attrs.max_qp_wr;
-	max_send_wr = max_wr + 2 * SVC_RDMA_MR_DEPTH;
+	max_send_wr = max_wr + 2 * SVC_RDMA_MR_DEPTH +
+	    max_wr * SVC_RDMA_MAX_READ_SEGS;
 	if (dev->attrs.max_qp_wr > 0 &&
 	    (u32)dev->attrs.max_qp_wr < max_send_wr)
 		max_send_wr = dev->attrs.max_qp_wr;

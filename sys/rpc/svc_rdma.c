@@ -77,13 +77,17 @@
  *                   teardown is separate, driven by the verbs layer after
  *                   sro_disconnect returns.)
  *
- * Untrusted peer (RFC 8166 5).  The inline RPC bytes are peer data.  The recv
- * path copies a length the VERBS layer already bounded to the recv buffer
- * (msg->rpc_len <= SVC_RDMA_INLINE) -- never a peer-supplied length into an
- * allocation -- and the call header is decoded with the standard xdr_callmsg(),
- * which is bounds-safe on a short/malformed body (it returns FALSE, we drop).
- * The reply send buffer is a fixed-size local buffer; an over-inline reply is
- * dropped, never overflowed.
+ * Untrusted peer (RFC 8166 5).  The RPC bytes are peer data.  The recv path
+ * copies a length the VERBS layer already BOUNDED: for a pure-inline call that is
+ * the recv buffer size (<= SVC_RDMA_INLINE); for an RDMA-Read-assembled body
+ * (TASK_003f-3 -- NFS WRITE) it is the inline head plus the read data, which the
+ * verbs layer caps at SVC_RDMA_INLINE + 1 MiB (its SVC_RDMA_MAX_READ
+ * whole-request cap), still a fixed verbs-imposed bound, NEVER a raw peer length
+ * into an allocation.  m_getm2() sizes the mbuf chain dynamically to that bounded
+ * length, so the larger assembled body is handled the same way as an inline one.
+ * The call header is decoded with the standard xdr_callmsg(), which is bounds-safe
+ * on a short/malformed body (it returns FALSE, we drop).  The reply send buffer is
+ * a fixed-size local buffer; an over-inline reply is dropped, never overflowed.
  */
 
 #include <sys/param.h>
@@ -680,8 +684,10 @@ svc_rdma_sro_newconn(void *ctx, struct svc_rdma_conn *conn)
  * or allocate).  On alloc failure we DROP (return 0 so the verbs layer reposts);
  * the RC client retransmits.  We never block a completion thread.
  *
- * msg->rpc_len was bounded by the verbs layer to the recv buffer
- * (<= SVC_RDMA_INLINE); it is not a peer-supplied length into an allocation.
+ * msg->rpc_len was bounded by the verbs layer: <= SVC_RDMA_INLINE for a pure-
+ * inline call, or <= SVC_RDMA_INLINE + 1 MiB for an RDMA-Read-assembled NFS WRITE
+ * body (TASK_003f-3); either way a fixed verbs-imposed bound, not a peer-supplied
+ * length into an allocation.  m_getm2 sizes the chain to it dynamically.
  */
 static int
 svc_rdma_sro_recv(void *ctx, struct svc_rdma_conn *conn,
