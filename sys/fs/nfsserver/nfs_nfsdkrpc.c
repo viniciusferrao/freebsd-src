@@ -123,7 +123,7 @@ VNET_DEFINE_STATIC(bool, nfsrvd_inited) = false;
 
 #ifdef OFED
 /*
- * NFS-over-RDMA listen hook (TASK_003e-2c).  svc_rdma_nfsd_listen() is a built-
+ * NFS-over-RDMA listen hook.  svc_rdma_nfsd_listen() is a built-
  * in kernel symbol exported by the krpc RDMA transport (sys/rpc/svc_rdma.c,
  * "optional ofed").  It starts/stops the RDMA-CM listener bound to THIS nfsd's
  * SVCPOOL (VNET(nfsrvd_pool)), so accepted RDMA connections register as SVCXPRTs

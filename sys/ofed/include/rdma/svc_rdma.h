@@ -30,10 +30,10 @@
  * svc_rdma.h -- consumer upcall interface for the NFS-over-RDMA server verbs
  * layer (svc_verbs.c, in the ibcore module).
  *
- * TASK_003e-1 scope: decouple the verbs layer from the RPC policy.  svc_verbs.c
+ * The verbs layer is decoupled from the RPC policy.  svc_verbs.c
  * owns the RDMA-CM listener, the per-connection QP/CQ/PD, the recv/send buffer
  * pools, and the drained-teardown lifecycle.  It does NOT know anything about
- * krpc/SVCXPRT/nfsd.  A consumer (TASK_003e-2's krpc SVCXPRT in
+ * krpc/SVCXPRT/nfsd.  A consumer (the krpc SVCXPRT in
  * sys/rpc/svc_rdma.c) registers a struct svc_rdma_ops upcall table plus an
  * opaque ctx with svc_rdma_listen_start_ops(); the verbs layer then calls back
  * into the consumer at the three lifecycle points (newconn / recv / disconnect)
@@ -49,15 +49,43 @@
  * verbs-internal detail (recv/send descriptors, the registry, the barriers)
  * private to svc_verbs.c.
  *
- * NOTE: the additive sysctl self-test in svc_verbs.c uses an internal DEFAULT
- * ops table (accept -> parse -> stub reply -> teardown) and does not go through
- * this header.  These declarations exist for the external consumer.
+ * These declarations are the surface the krpc consumer (sys/rpc/svc_rdma.c) uses.
  */
 
 #ifndef _RDMA_SVC_RDMA_H
 #define _RDMA_SVC_RDMA_H
 
 #include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/malloc.h>
+
+/*
+ * The verbs layer's malloc type (defined in svc_verbs.c).  Declared here so the
+ * krpc consumer can allocate the RDMA-Write SOURCE buffer for svo_conn_write_list
+ * with the SAME type the engine frees it with: the consumer fills that buffer
+ * from the reply mbuf BEFORE taking its xprt lock (keeping the per-READ copy off
+ * the lock), then hands ownership to the engine, which frees it at completion.
+ */
+MALLOC_DECLARE(M_NFSRDMA);
+
+struct mbuf;
+
+/*
+ * Zero-copy outbound-READ source descriptor.  When the nfsd builds
+ * a READ reply in M_EXTPG page-list mbufs (Rick Macklem's enable_mextpg path), the
+ * krpc consumer hands the verbs engine the data pages directly instead of a
+ * contigmalloc'd copy.  Each descriptor is one page's worth of read data: pg_pa is
+ * the PHYSICAL address (from m_epg_pa[i]) -- the engine maps PHYS_TO_DMAP(pg_pa) +
+ * pg_off, never a vm_page_t (some EXTPG pages are unmanaged) -- pg_off is the
+ * intra-page byte offset (0 for read data) and pg_len the bytes in this page; the
+ * sum of pg_len over the array equals datalen.  The engine takes ownership of the
+ * source mbuf chain and m_freem()s it at write completion.
+ */
+struct svc_rdma_page {
+	vm_paddr_t	pg_pa;
+	uint32_t	pg_off;
+	uint32_t	pg_len;
+};
 
 /*
  * Opaque per-accepted-connection handle.  The concrete struct svc_rdma_conn is
@@ -70,11 +98,19 @@
 struct svc_rdma_conn;
 
 /*
+ * Opaque mbuf handle.  Used only by the zero-copy sro_recv_mbuf op below, which
+ * hands the consumer an already-assembled ONC RPC call as an mbuf chain whose
+ * large middle segment is EXT_DISPOSABLE external storage over a DMA'd RDMA-Read
+ * sink (verbs-layer-owned ext_free); the consumer treats the chain as opaque.
+ */
+struct mbuf;
+
+/*
  * RFC 8166 chunk metadata, decoded and BOUNDS-VALIDATED by svc_verbs.c
- * (TASK_003f-1) into the fixed-capacity structures below.  These describe the
- * peer-registered memory regions a later increment (3f-3 RDMA Read / 3f-4 RDMA
- * Write) will operate on; 3f-1 only DECODES and VALIDATES them -- no verbs are
- * posted from the parser.
+ * into the fixed-capacity structures below.  These describe the peer-registered
+ * memory regions the RDMA Read (write/read-list) and RDMA Write (write-list /
+ * reply-chunk) engines operate on; the parser only DECODES and VALIDATES them --
+ * no verbs are posted from the parser.
  *
  * EVERY field here is peer-supplied and therefore UNTRUSTED, but by the time a
  * consumer sees them the parser has already enforced: a per-message segment cap
@@ -90,6 +126,21 @@ struct svc_rdma_conn;
 #define	SVC_RDMA_MAX_SEGS	16	/* max rdma_segments in one chunk */
 #define	SVC_RDMA_MAX_CHUNKS	8	/* max chunks in read/write list */
 #define	SVC_RDMA_MAX_SEG_LEN	(1U << 30)	/* sane per-segment length cap */
+/*
+ * SVC_RDMA_MAX_READ_SEGS caps the read list SPECIFICALLY (decoupled from
+ * SVC_RDMA_MAX_CHUNKS).  An NFS WRITE's read list is many segments
+ * of ONE logical chunk (one rdma_position), and a real Linux NFS/RDMA client
+ * splits a 1 MiB WRITE into ~16 segments of ~64 KiB (the HCA's FRWR granularity)
+ * -- far more than the 8-chunk write-list cap.  Sizing the read list at 8 made
+ * the server reject every >~0.5 MiB WRITE ("exceeds chunk/segment caps") and
+ * was the wall that pinned the negotiated wsize at 128 KiB.  64 covers a 1 MiB
+ * request down to 16 KiB segments (4x the observed fragmentation) while the
+ * reads[] array still leaves struct svc_rdma_msg under the 4 KiB budget.  It is
+ * a FIXED LOCAL constant: a peer declaring more read segments is a clean reject,
+ * never a larger allocation.  Each read segment is one RDMA Read WR / SQ slot,
+ * so this also bounds the SQ head-room reserved at accept (see max_send_wr).
+ */
+#define	SVC_RDMA_MAX_READ_SEGS	64	/* max segments in the read list */
 
 /*
  * One RFC 8166 rdma_segment: { handle (rkey), length, offset (virtual addr) }.
@@ -105,7 +156,7 @@ struct svc_rdma_segment {
 /*
  * One read-list entry: an rdma_position plus a single rdma_segment.  The read
  * list is a flat array of these (the parser flattens the RFC 8166 1/0-terminated
- * chain into rd_nchunks entries, capped at SVC_RDMA_MAX_CHUNKS).
+ * chain into rd_nchunks entries, capped at SVC_RDMA_MAX_READ_SEGS).
  */
 struct svc_rdma_read_chunk {
 	uint32_t	 rc_position;	/* position in the XDR stream */
@@ -128,8 +179,7 @@ struct svc_rdma_write_chunk {
  * sro_recv upcall.  This mirrors the verbs-internal definition in svc_verbs.c
  * (which stays authoritative); it exposes exactly what a consumer needs to
  * dispatch the call:
- *   xid     - word0, the echoed opaque transaction id (the only field a stub
- *             reply needs).
+ *   xid     - word0, the echoed opaque transaction id.
  *   credit  - word2, the peer's offered flow-control credit.
  *   rpc     - pointer to the inline ONC RPC payload (recv buffer + 28-byte
  *             RFC 8166 header).  NO COPY: this points directly into the verbs
@@ -137,7 +187,7 @@ struct svc_rdma_write_chunk {
  *             sro_recv call (see the lifetime rule below).
  *   rpc_len - length in bytes of the inline RPC payload (may be 0).
  *
- * Chunk metadata (TASK_003f-1).  rdma_proc is word3, distinguishing RDMA_MSG
+ * Chunk metadata.  rdma_proc is word3, distinguishing RDMA_MSG
  * (inline body follows the chunk lists) from RDMA_NOMSG (no inline body; the
  * whole call/reply travels by chunk).  The three chunk descriptions are decoded
  * from the read list / write list / reply chunk that follow word3, each into a
@@ -146,10 +196,10 @@ struct svc_rdma_write_chunk {
  *   writes       - wr_nchunks write-list chunks (each a counted segment array).
  *   reply        - the optional reply chunk; reply_present says whether it was
  *                  encoded by the peer.
- * For a pure inline call (all three lists empty -- the only shape pre-3f) all
- * counts are 0, reply_present is false, and rpc/rpc_len locate the inline body
- * exactly as before.  Consumers that do not yet handle chunks (3f-1 itself)
- * MUST treat any nonzero count / present reply as "not yet served".
+ * For a pure inline call (all three lists empty) rd_nchunks and wr_nchunks are
+ * 0, reply_present is false, and rpc/rpc_len locate the inline body.  A chunked
+ * call carries a nonzero rd_nchunks/wr_nchunks and/or reply_present true, with
+ * the offered segments populated in reads[]/writes[]/reply.
  */
 struct svc_rdma_msg {
 	uint32_t	 xid;		/* word0, echoed opaque */
@@ -161,7 +211,7 @@ struct svc_rdma_msg {
 	uint32_t	 rd_nchunks;	/* valid entries in reads[] (<= cap) */
 	uint32_t	 wr_nchunks;	/* valid entries in writes[] (<= cap) */
 	bool		 reply_present;	/* a reply chunk was encoded */
-	struct svc_rdma_read_chunk  reads[SVC_RDMA_MAX_CHUNKS];
+	struct svc_rdma_read_chunk  reads[SVC_RDMA_MAX_READ_SEGS];
 	struct svc_rdma_write_chunk writes[SVC_RDMA_MAX_CHUNKS];
 	struct svc_rdma_write_chunk reply;
 };
@@ -203,8 +253,8 @@ struct svc_rdma_msg {
  *       recv buffer is reposted to the QP as soon as sro_recv returns, so a
  *       consumer that needs the bytes past the call MUST copy them (e.g. into an
  *       mbuf chain) before returning.  The consumer MAY call svc_rdma_conn_send()
- *       synchronously from within sro_recv (the stub does); that is supported in
- *       this context.  Returning nonzero asks the verbs layer to close the
+ *       synchronously from within sro_recv; that is supported in this context.
+ *       Returning nonzero asks the verbs layer to close the
  *       connection (the consumer rejected the call); returning 0 lets the verbs
  *       layer repost and await the next call.
  *
@@ -230,6 +280,22 @@ struct svc_rdma_ops {
 	int	(*sro_recv)(void *ctx, struct svc_rdma_conn *conn,
 		    const struct svc_rdma_msg *msg);
 	void	(*sro_disconnect)(void *ctx, struct svc_rdma_conn *conn);
+	/*
+	 * sro_recv_mbuf(ctx, conn, m, xid, has_reply, reply) -> 0 cont /
+	 * nonzero drop+close.  Same IB_POLL_WORKQUEUE context and *** MUST NOT
+	 * SLEEP *** rule as sro_recv, same sro_newconn-happened-before
+	 * guarantee.  m is a COMPLETE ONC RPC call body already assembled
+	 * (head ++ read-data ++ head-tail) as an mbuf chain whose large middle
+	 * segment is EXT_DISPOSABLE external storage over a DMA'd read sink with
+	 * its OWN ext_free callback (verbs-layer-owned; the krpc treats m as
+	 * opaque).  OWNERSHIP OF m TRANSFERS to the callee on return 0 (it
+	 * m_freem()s it via the recv queue / drain).  On nonzero the CALLER
+	 * still owns m and m_freem()s it.  reply is a pure value type, captured
+	 * iff has_reply.
+	 */
+	int	(*sro_recv_mbuf)(void *ctx, struct svc_rdma_conn *conn,
+		    struct mbuf *m, uint32_t xid, bool has_reply,
+		    const struct svc_rdma_write_chunk *reply);
 };
 
 /*
@@ -293,6 +359,122 @@ int	svc_rdma_conn_send(struct svc_rdma_conn *conn, const void *buf,
 	    uint32_t len);
 
 /*
+ * Post an RPC-over-RDMA RDMA_ERROR reply on conn, keyed by the request's KNOWN
+ * opaque xid (RFC 8166 4.4/5).  errcode is the rdma_err value: 1 ==
+ * ERR_VERS (the verbs layer appends its supported version range -- the recv path
+ * emits this case itself and then closes), 2 == ERR_CHUNK (the server could not
+ * place the reply with the offered chunk lists: an over-inline reply with no
+ * usable reply chunk, or a write-list read whose DDP boundary is out of range).
+ * The verbs layer builds the fixed RDMA_ERROR header; the consumer passes only
+ * the xid and the error code.
+ *
+ * The caller MUST pass a real xid taken from a request whose header parsed; the
+ * verbs layer never fabricates an RDMA_ERROR from an unparseable header.  Like
+ * svc_rdma_conn_send() this does NOT sleep, rides the same bounded send pool and
+ * SC_UP gate (a drop on a closing conn / exhausted pool is silent), and the send
+ * buffer is freed on completion -- there is no ownership transfer.  An ERR_CHUNK
+ * leaves the connection UP (a per-request error; the client retries); it does
+ * NOT close.  Subject to the same caller-reference rule as svc_rdma_conn_send
+ * (hold a reference keeping conn alive across the call).
+ *
+ * OPTIONAL verbs op (svo_conn_error): the consumer NULL-checks it at the call
+ * site, so an older ibcore that predates it simply falls back to dropping the
+ * unplaceable reply.
+ */
+int	svc_rdma_conn_error(struct svc_rdma_conn *conn, uint32_t xid,
+	    uint32_t errcode);
+
+/*
+ * RDMA-Write a too-large-for-inline reply into the client's reply chunk, then
+ * SEND a small RDMA_NOMSG transport header reporting the bytes written.
+ * This is the OUTBOUND data path for the RFC 8166 §4.3 reply
+ * chunk: the whole marshalled ONC RPC reply does not fit the inline send buffer,
+ * so the client pre-registered reply-chunk memory and the server RDMA-Writes the
+ * reply into it and reports the length in the RDMA_NOMSG header's reply chunk.
+ *
+ * buf/len are the marshalled ONC RPC reply BODY ONLY (NO RFC 8166 header -- the
+ * verbs layer builds the RDMA_NOMSG header itself).  buf is caller-owned and only
+ * read here: the verbs layer copies len bytes into its own DMA-mapped source
+ * buffer (no ownership transfer), so the caller may free/reuse buf the instant
+ * this returns.
+ *
+ * reply is the parsed-and-validated reply chunk the client offered, captured by
+ * the consumer during sro_recv (it is a pure value type -- a fixed-size segment
+ * array, no pointers -- so the consumer copies it and hands it back here).  EVERY
+ * field is UNTRUSTED and is RE-VALIDATED at post time: the segment count <= cap,
+ * each segment length in (0, cap], the running total >= len (the client must have
+ * offered at least as much reply-chunk space as the reply needs -- if not, the
+ * reply does not fit the client's chunk and EMSGSIZE is returned, NOT an
+ * over-write of the client's memory).  The client {rkey, addr} are passed
+ * VERBATIM to the HCA, which enforces them; a bad one fails the WR -> clean close.
+ *
+ * xid is the echoed opaque transaction id for the RDMA_NOMSG header (word0).
+ *
+ * Context: callable from a krpc pool thread (xp_reply) under the consumer's
+ * per-conn lock (the same caller-reference rule as svc_rdma_conn_send: the lock
+ * keeps conn alive across the call).  It does NOT sleep.  It is gated by the
+ * connection still being up and by the bounded send pool (the RDMA_NOMSG header
+ * SEND draws one buffer); a tearing-down conn or exhausted pool drops the reply.
+ *
+ * Returns 0 if the RDMA Write chain + header SEND were posted, EINVAL for a
+ * len/segment violation, EMSGSIZE if the reply exceeds the client's reply-chunk
+ * capacity, ENOMEM on allocation failure, EBUSY if the send pool was exhausted,
+ * ENOTCONN if the connection is no longer up, or the posted errno otherwise.  On
+ * a nonzero return the verbs layer has released everything it allocated for a
+ * never-posted attempt (a posted-but-failed chain is reclaimed by the drained
+ * teardown -- the partial-post discipline, see svc_verbs.c).
+ */
+int	svc_rdma_conn_reply_chunk(struct svc_rdma_conn *conn, uint32_t xid,
+	    const struct svc_rdma_write_chunk *reply, const void *buf,
+	    uint32_t len);
+
+/*
+ * RDMA-Write a DDP-eligible NFS READ's data into the client's write-list chunk,
+ * then SEND a REDUCED RDMA_MSG (RFC 8166 3.5.3 / 4.2 "reduction"): the ONC RPC
+ * reply with the read data removed, carrying a write list that echoes the chunk
+ * with the per-segment lengths ACTUALLY written.  OUTBOUND data path for the
+ * write list (vs. svc_rdma_conn_reply_chunk's reply chunk): the read data does
+ * not fit inline, so the client pre-registered write-list memory and the server
+ * RDMA-Writes the data into it and reports the lengths in the header.
+ *
+ * `write' is the parsed-and-validated single write chunk the client offered for
+ * this READ (a pure value type the consumer captured during sro_recv).  EVERY
+ * field is UNTRUSTED and RE-VALIDATED at post time exactly as the reply-chunk
+ * engine does: segment count <= cap, each length in (0, cap], the running total
+ * (offered capacity) computed with no uint32 overflow >= datalen, else EMSGSIZE
+ * and NOTHING is written.  data/datalen are the read data bytes (server-known,
+ * bounded by SVC_RDMA_MAX_WRITE); the chunk receives exactly datalen UNPADDED
+ * bytes (RFC 8166 3.4.5).  reduced/reducedlen are the reduced inline ONC RPC
+ * body the verbs layer SENDs after the RDMA_MSG header (header + body must fit
+ * one inline send buffer; else EMSGSIZE).  {rkey,addr} go VERBATIM to the HCA,
+ * which enforces them.  data and reduced are caller-owned and only read here
+ * (both copied into DMA-mapped verbs-owned buffers), so the caller may free them
+ * the instant this returns.  xid is the echoed transaction id (RDMA_MSG word0).
+ *
+ * Same context, lifetime, completion and partial-post rules as
+ * svc_rdma_conn_reply_chunk.  Returns 0, EINVAL for a len/segment violation,
+ * EMSGSIZE if the data exceeds the client's write chunk or the reduced reply
+ * exceeds the inline send buffer, ENOMEM, EBUSY, ENOTCONN, or the posted errno.
+ */
+int	svc_rdma_conn_write_list(struct svc_rdma_conn *conn, uint32_t xid,
+	    const struct svc_rdma_write_chunk *write, void *src,
+	    uint32_t datalen, const void *reduced, uint32_t reducedlen);
+
+/*
+ * Zero-copy twin of svc_rdma_conn_write_list: RDMA-Write the READ
+ * data DIRECTLY from the reply's M_EXTPG pages (pages[]/npages, summing to
+ * datalen) instead of a contigmalloc'd copy.  Same lifetime/completion/
+ * partial-post rules.  Takes OWNERSHIP of mrep on EVERY return (0 or a positive
+ * errno) -- like svc_rdma_conn_write_list's "engine owns src on every return" --
+ * and m_freem()s it at completion, at drain on a committed partial post, or
+ * immediately on an early error.  The caller must NOT touch mrep after this call.
+ */
+int	svc_rdma_conn_write_list_pages(struct svc_rdma_conn *conn, uint32_t xid,
+	    const struct svc_rdma_write_chunk *write, struct mbuf *mrep,
+	    const struct svc_rdma_page *pages, uint32_t npages,
+	    uint32_t datalen, const void *reduced, uint32_t reducedlen);
+
+/*
  * Report the flow-control credit the verbs layer GRANTED this connection: the
  * number of receive buffers (and thus recv WRs) it actually posted, which is the
  * value a reply's RPC-over-RDMA header should advertise in rdma_credit (RFC 8166
@@ -305,8 +487,16 @@ int	svc_rdma_conn_send(struct svc_rdma_conn *conn, const void *buf,
 uint32_t svc_rdma_conn_credits(struct svc_rdma_conn *conn);
 
 /*
+ * Pre-allocate the calling krpc pool thread's linuxkpi `current` shadow off-lock
+ * (#59), so a later ib_post_send under the xr_lock leaf mutex does not trigger
+ * the M_WAITOK alloc inside mlx5_ib_post_send.  Idempotent and cheap after the
+ * first call on a thread.
+ */
+void	svc_rdma_thread_setup(void);
+
+/*
  * ===========================================================================
- * Cross-module verbs-ops registration (TASK_003e-2a).
+ * Cross-module verbs-ops registration.
  *
  * Module layering (docs/16-svcxprt-rdma-integration.md "Module layering"): the
  * verbs entry points above (svc_rdma_listen_start_ops / svc_rdma_conn_send /
@@ -326,9 +516,12 @@ uint32_t svc_rdma_conn_credits(struct svc_rdma_conn *conn);
  *   svo_listen_start  -> svc_rdma_listen_start_ops
  *   svo_listen_stop   -> svc_rdma_listen_stop
  *   svo_conn_send     -> svc_rdma_conn_send
+ *   svo_conn_reply_chunk -> svc_rdma_conn_reply_chunk
  *   svo_conn_set_ctx  -> svc_rdma_conn_set_ctx
  *   svo_conn_get_ctx  -> svc_rdma_conn_get_ctx
  *   svo_conn_credits  -> svc_rdma_conn_credits
+ *   svo_conn_peeraddr -> svc_rdma_conn_peeraddr
+ *   svo_conn_error    -> svc_rdma_conn_error (RFC 8166 RDMA_ERROR; optional)
  * (svc_rdma_listen_stop() is declared privately in svc_verbs.c, not in this
  * consumer header, because a consumer never calls it directly -- it reaches it
  * only through svo_listen_stop.  The signature here matches it.)
@@ -337,7 +530,10 @@ uint32_t svc_rdma_conn_credits(struct svc_rdma_conn *conn);
  * it: ibcore passes a static const table and must svc_rdma_unregister_verbs()
  * before that table (its module text) can go away.  Registration is single-
  * provider: a second svc_rdma_register_verbs() while one is registered is
- * rejected.  All entries are required (krpc rejects a partial table with EINVAL).
+ * rejected.  The CORE entries are required (krpc rejects a table missing one
+ * with EINVAL); svo_conn_write_list, svo_conn_peeraddr and svo_conn_error are
+ * OPTIONAL (NULL-checked at each call site) so an older ibcore predating them
+ * still registers.
  */
 struct svc_rdma_verbs_ops {
 	int	(*svo_listen_start)(uint16_t port,
@@ -345,9 +541,64 @@ struct svc_rdma_verbs_ops {
 	void	(*svo_listen_stop)(void);
 	int	(*svo_conn_send)(struct svc_rdma_conn *conn, const void *buf,
 		    uint32_t len);
+	int	(*svo_conn_reply_chunk)(struct svc_rdma_conn *conn, uint32_t xid,
+		    const struct svc_rdma_write_chunk *reply, const void *buf,
+		    uint32_t len);
+	/*
+	 * svo_conn_write_list -> svc_rdma_conn_write_list (write-list READ
+	 * engine).  OPTIONAL: krpc NULL-checks it at the call site (like
+	 * svo_conn_peeraddr) and svc_rdma_register_verbs does NOT require it, so
+	 * an older ibcore predating the engine still registers and over-inline
+	 * READs simply fall back to the existing drop.
+	 */
+	int	(*svo_conn_write_list)(struct svc_rdma_conn *conn, uint32_t xid,
+		    const struct svc_rdma_write_chunk *write, void *src,
+		    uint32_t datalen, const void *reduced, uint32_t reducedlen);
+	/*
+	 * svo_conn_write_list_pages -> svc_rdma_conn_write_list_pages: the
+	 * zero-copy twin of svo_conn_write_list.  The source is the
+	 * READ reply's M_EXTPG data pages (mrep + pages[]/npages) instead of a
+	 * contigmalloc'd copy.  The engine OWNS mrep on EVERY return (0 or errno) and
+	 * m_freem()s it at completion, at drain on a committed partial post, or
+	 * immediately on an early error; the caller must NOT touch mrep afterward.
+	 * OPTIONAL (NULL-checked at the call site): an older ibcore without it leaves
+	 * the krpc consumer on the contigmalloc fallback.
+	 */
+	int	(*svo_conn_write_list_pages)(struct svc_rdma_conn *conn, uint32_t xid,
+		    const struct svc_rdma_write_chunk *write, struct mbuf *mrep,
+		    const struct svc_rdma_page *pages, uint32_t npages,
+		    uint32_t datalen, const void *reduced, uint32_t reducedlen);
 	void	(*svo_conn_set_ctx)(struct svc_rdma_conn *conn, void *cctx);
 	void	*(*svo_conn_get_ctx)(struct svc_rdma_conn *conn);
 	uint32_t (*svo_conn_credits)(struct svc_rdma_conn *conn);
+	void	(*svo_conn_peeraddr)(struct svc_rdma_conn *conn,
+		    struct sockaddr_storage *ss);
+	/*
+	 * svo_conn_error -> svc_rdma_conn_error (RFC 8166 RDMA_ERROR/ERR_CHUNK).
+	 * The consumer reaches it to reply RDMA_ERROR/ERR_CHUNK keyed
+	 * by xid when it cannot place a reply into the client's chunks (an
+	 * over-inline reply with no usable reply chunk) -- the connection STAYS UP
+	 * (a per-request error; rdma_err is one of the RFC 8166 4.4 codes,
+	 * ERR_CHUNK == 2).  OPTIONAL: krpc NULL-checks it at the call site (like
+	 * svo_conn_write_list / svo_conn_peeraddr) and svc_rdma_register_verbs does
+	 * NOT require it, so an older ibcore predating it still registers and
+	 * over-inline replies with no reply chunk simply fall back to the existing
+	 * silent drop.
+	 */
+	int	(*svo_conn_error)(struct svc_rdma_conn *conn, uint32_t xid,
+		    uint32_t errcode);
+	/*
+	 * svo_thread_setup -> svc_rdma_thread_setup (#59).  The krpc reply paths
+	 * post (ib_post_send) while holding the xr_lock leaf mutex, on the
+	 * assumption that the post does not sleep.  mlx5_ib_post_send breaks that
+	 * the FIRST time a given krpc pool thread enters it: linuxkpi allocates the
+	 * thread's `current` shadow with M_WAITOK, a sleepable uma_zalloc under the
+	 * mutex (WITNESS warns).  The consumer calls this OFF-LOCK at the top of a
+	 * reply, where M_WAITOK is legal, to pre-allocate that shadow so the
+	 * under-lock post never allocates.  OPTIONAL (NULL-checked); a no-op on an
+	 * older ibcore (the warning, which is non-fatal, simply persists there).
+	 */
+	void	(*svo_thread_setup)(void);
 };
 
 /*

@@ -76,6 +76,26 @@
 #define SVCSET_VERSQUIET	2
 #define SVCGET_CONNMAXREC	3
 #define SVCSET_CONNMAXREC	4
+/*
+ * SVCSET_READDDP (NFS-over-RDMA write-list READ engine).  The nfsd READ path
+ * calls SVC_CONTROL(xprt, SVCSET_READDDP, &svcxprt_readddp) at the point it
+ * appends the read data to the reply, to tell the transport WHERE the
+ * DDP-eligible read data sits inside the NFS reply body (so an RDMA transport
+ * can RDMA-Write it into the client's write-list chunk and SEND a reduced
+ * RDMA_MSG -- RFC 8166 reduction).  rd_off is the byte offset of the read data
+ * within the NFS reply BODY (the bytes built before the data mbuf is appended);
+ * rd_len is the actual (unpadded) data length.  Transport-agnostic: only the
+ * RDMA xp_control consumes it; TCP/UDP xp_control default-returns FALSE, so the
+ * call is a safe no-op there.  `in' points at a struct svcxprt_readddp; the
+ * values are a pure copy (no pointers, no aliasing of nfsd state past the call).
+ */
+#define SVCSET_READDDP		5
+
+struct svcxprt_readddp {
+	uint32_t	rd_xid;		/* ONC RPC xid (matches rm_xid) */
+	uint32_t	rd_off;		/* read-data offset within the NFS reply body */
+	uint32_t	rd_len;		/* read-data length (unpadded, == cnt) */
+};
 
 /*
  * Operations for rpc_control().
