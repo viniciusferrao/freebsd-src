@@ -419,6 +419,7 @@ __END_DECLS
 
 __BEGIN_DECLS
 extern void	svc_unreg(SVCPOOL *, const rpcprog_t, const rpcvers_t);
+extern int	svc_rdma_nfsd_listen(SVCPOOL *, int);
 __END_DECLS
 
 /*
