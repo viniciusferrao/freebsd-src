@@ -203,9 +203,30 @@ void	*svc_rdma_conn_get_ctx(struct svc_rdma_conn *conn);
  * capacity, EBUSY if the pool was exhausted, ENOTCONN if the connection is no
  * longer up, or the posted error otherwise.  MUST NOT be called after
  * sro_disconnect for this conn has returned.
+ *
+ * Caller-reference rule (the consumer's responsibility): conn is owned by the
+ * verbs layer and is valid only for the sro_newconn..sro_disconnect window.  A
+ * caller that invokes svc_rdma_conn_send() OUTSIDE an active upcall (e.g. a krpc
+ * pool thread marshalling a reply asynchronously) MUST hold a reference that
+ * keeps conn alive across the call -- in the krpc consumer this is the per-conn
+ * lock under which sro_disconnect clears its conn handle, so a post either sees
+ * a live conn or is dropped, never racing the verbs layer's free of conn.  The
+ * verbs layer's own SC_UP/in-flight-send gate then makes the post itself safe.
  */
 int	svc_rdma_conn_send(struct svc_rdma_conn *conn, const void *buf,
 	    uint32_t len);
+
+/*
+ * Report the flow-control credit the verbs layer GRANTED this connection: the
+ * number of receive buffers (and thus recv WRs) it actually posted, which is the
+ * value a reply's RPC-over-RDMA header should advertise in rdma_credit (RFC 8166
+ * 3.3.1).  The verbs layer clamps the posted depth to the device's QP recv cap,
+ * so this is the true depth, not a nominal constant -- granting it avoids both
+ * over-advertising (RNR/stall on a small HCA) and under-advertising (needless
+ * round trips).  Set once at accept time and never mutated, so it is safe to read
+ * from any upcall or from a pool thread holding a reference to conn.
+ */
+uint32_t svc_rdma_conn_credits(struct svc_rdma_conn *conn);
 
 /*
  * ===========================================================================
@@ -231,6 +252,7 @@ int	svc_rdma_conn_send(struct svc_rdma_conn *conn, const void *buf,
  *   svo_conn_send     -> svc_rdma_conn_send
  *   svo_conn_set_ctx  -> svc_rdma_conn_set_ctx
  *   svo_conn_get_ctx  -> svc_rdma_conn_get_ctx
+ *   svo_conn_credits  -> svc_rdma_conn_credits
  * (svc_rdma_listen_stop() is declared privately in svc_verbs.c, not in this
  * consumer header, because a consumer never calls it directly -- it reaches it
  * only through svo_listen_stop.  The signature here matches it.)
@@ -239,7 +261,7 @@ int	svc_rdma_conn_send(struct svc_rdma_conn *conn, const void *buf,
  * it: ibcore passes a static const table and must svc_rdma_unregister_verbs()
  * before that table (its module text) can go away.  Registration is single-
  * provider: a second svc_rdma_register_verbs() while one is registered is
- * rejected.
+ * rejected.  All entries are required (krpc rejects a partial table with EINVAL).
  */
 struct svc_rdma_verbs_ops {
 	int	(*svo_listen_start)(uint16_t port,
@@ -249,6 +271,7 @@ struct svc_rdma_verbs_ops {
 		    uint32_t len);
 	void	(*svo_conn_set_ctx)(struct svc_rdma_conn *conn, void *cctx);
 	void	*(*svo_conn_get_ctx)(struct svc_rdma_conn *conn);
+	uint32_t (*svo_conn_credits)(struct svc_rdma_conn *conn);
 };
 
 /*

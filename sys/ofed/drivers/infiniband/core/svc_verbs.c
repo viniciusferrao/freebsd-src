@@ -809,6 +809,18 @@ svc_rdma_wc_recv(struct ib_cq *cq, struct ib_wc *wc)
 	int rc;
 	bool ready;
 
+	/*
+	 * Invariant guard (review N2): this handler -- and the lockless-decrement
+	 * quiescence dance on sc_reposts/sc_sends/sc_upcalls it drives -- is
+	 * correct ONLY because the CQ is polled from a single workqueue thread
+	 * (IB_POLL_WORKQUEUE), so completions for one conn are serialized and the
+	 * teardown can wait them out.  If a future change allocated the CQ with
+	 * IB_POLL_DIRECT/SOFTIRQ this serialization would vanish and reopen a
+	 * completion-vs-teardown UAF; assert the context so that mistake trips
+	 * INVARIANTS here instead of failing silently.
+	 */
+	MPASS(cq->poll_ctx == IB_POLL_WORKQUEUE);
+
 	rr = container_of(wc->wr_cqe, struct svc_rdma_recv, rr_cqe);
 	conn = rr->rr_conn;
 
@@ -1190,6 +1202,22 @@ svc_rdma_conn_get_ctx(struct svc_rdma_conn *conn)
 }
 
 /*
+ * Report the granted flow-control credit -- the number of recv buffers we
+ * actually posted for this connection (sc_nrecv), clamped at accept time to the
+ * device's QP recv cap.  This is the value a consumer's reply should advertise
+ * in the RPC-over-RDMA rdma_credit field (the same value svc_rdma_reply() uses
+ * for the in-tree stub).  sc_nrecv is written once during accept and never
+ * mutated thereafter (see the accept-path comment), so this read needs no
+ * sc_lock.  Declared in <rdma/svc_rdma.h>.
+ */
+uint32_t
+svc_rdma_conn_credits(struct svc_rdma_conn *conn)
+{
+
+	return ((uint32_t)conn->sc_nrecv);
+}
+
+/*
  * Marshal and post the in-tree STUB inline RPC-over-RDMA version 1 reply (3d),
  * echoing the call's opaque xid.  This is now the DEFAULT-OPS reply policy: it
  * builds the fixed bytes and hands them to svc_rdma_conn_send() (the reusable
@@ -1332,6 +1360,10 @@ svc_rdma_wc_send(struct ib_cq *cq, struct ib_wc *wc)
 {
 	struct svc_rdma_send *ss;
 	struct svc_rdma_conn *conn;
+
+	/* Same single-workqueue-thread invariant as svc_rdma_wc_recv (N2): the
+	 * sc_sends lockless-decrement quiescence relies on it. */
+	MPASS(cq->poll_ctx == IB_POLL_WORKQUEUE);
 
 	ss = container_of(wc->wr_cqe, struct svc_rdma_send, ss_cqe);
 	conn = ss->ss_conn;
@@ -1731,7 +1763,12 @@ svc_rdma_accept(struct rdma_cm_id *id)
 	 * comp_vector 0 is the deliberate minimal choice (matching
 	 * rpcrdma_ep_create; spreading vectors is a later perf task).  conn is
 	 * the CQ context.  IB_POLL_WORKQUEUE dispatches completions from a
-	 * workqueue thread (see svc_rdma_wc_recv()'s context note).
+	 * workqueue thread (see svc_rdma_wc_recv()'s context note).  This poll
+	 * context is load-bearing: the completion handlers' lockless decrements of
+	 * sc_reposts/sc_sends/sc_upcalls and the teardown quiescence barrier are
+	 * correct only because a single workqueue thread serializes per-conn
+	 * completions.  svc_rdma_wc_recv()/svc_rdma_wc_send() MPASS exactly this
+	 * (N2), so changing either CQ away from IB_POLL_WORKQUEUE trips INVARIANTS.
 	 */
 	conn->sc_scq = ib_alloc_cq(dev, conn, max_wr + 1, 0, IB_POLL_WORKQUEUE);
 	if (IS_ERR(conn->sc_scq)) {
@@ -2227,6 +2264,7 @@ static const struct svc_rdma_verbs_ops ibcore_verbs_ops = {
 	.svo_conn_send		= svc_rdma_conn_send,
 	.svo_conn_set_ctx	= svc_rdma_conn_set_ctx,
 	.svo_conn_get_ctx	= svc_rdma_conn_get_ctx,
+	.svo_conn_credits	= svc_rdma_conn_credits,
 };
 
 /*
