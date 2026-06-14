@@ -2412,7 +2412,12 @@ svc_rdma_conn_reply_chunk(struct svc_rdma_conn *conn, uint32_t xid,
 	 * len (bounded by SVC_RDMA_MAX_WRITE), never a raw peer field.
 	 */
 	ws->ws_srclen = len;
-	ws->ws_src = malloc(len, M_NFSRDMA, M_NOWAIT);
+	/* contigmalloc: ws_src is the RDMA-Write SOURCE for the reply chunk; like the
+	 * read sink it must be physically contiguous for ib_dma_map_single (a
+	 * multi-page reply -- e.g. a large READDIR -- otherwise sources wrong
+	 * physical pages and the write fails REM_INV_REQ).  Same fix as rs_buf. */
+	ws->ws_src = contigmalloc(len, M_NFSRDMA, M_NOWAIT, 0, ~(vm_paddr_t)0,
+	    PAGE_SIZE, 0);
 	if (ws->ws_src == NULL) {
 		free(ws, M_NFSRDMA);
 		return (ENOMEM);
