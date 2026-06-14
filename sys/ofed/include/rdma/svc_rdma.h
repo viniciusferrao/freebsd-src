@@ -71,6 +71,7 @@
 #define _RDMA_SVC_RDMA_H
 
 #include <sys/types.h>
+#include <sys/socket.h>
 
 /*
  * Opaque per-accepted-connection handle.  The concrete struct svc_rdma_conn is
@@ -387,6 +388,7 @@ uint32_t svc_rdma_conn_credits(struct svc_rdma_conn *conn);
  *   svo_conn_set_ctx  -> svc_rdma_conn_set_ctx
  *   svo_conn_get_ctx  -> svc_rdma_conn_get_ctx
  *   svo_conn_credits  -> svc_rdma_conn_credits
+ *   svo_conn_peeraddr -> svc_rdma_conn_peeraddr (TASK_003f-6)
  * (svc_rdma_listen_stop() is declared privately in svc_verbs.c, not in this
  * consumer header, because a consumer never calls it directly -- it reaches it
  * only through svo_listen_stop.  The signature here matches it.)
@@ -409,6 +411,8 @@ struct svc_rdma_verbs_ops {
 	void	(*svo_conn_set_ctx)(struct svc_rdma_conn *conn, void *cctx);
 	void	*(*svo_conn_get_ctx)(struct svc_rdma_conn *conn);
 	uint32_t (*svo_conn_credits)(struct svc_rdma_conn *conn);
+	void	(*svo_conn_peeraddr)(struct svc_rdma_conn *conn,
+		    struct sockaddr_storage *ss);
 };
 
 /*

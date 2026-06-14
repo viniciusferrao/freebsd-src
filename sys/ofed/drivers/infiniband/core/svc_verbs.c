@@ -172,7 +172,7 @@ MALLOC_DEFINE(M_NFSRDMA, "nfsrdma", "NFS over RDMA server");
  * which is sized max_wr + 1 for the ib_drain_qp SQ sentinel).
  */
 #define	SVC_RDMA_INLINE		4096
-#define	SVC_RDMA_RECV_DEPTH	8
+#define	SVC_RDMA_RECV_DEPTH	64
 #define	SVC_RDMA_SEND_DEPTH	SVC_RDMA_RECV_DEPTH
 
 /*
@@ -711,6 +711,8 @@ static int svc_rdma_parse_header(const void *buf, uint32_t len,
 static void svc_rdma_wc_recv(struct ib_cq *cq, struct ib_wc *wc);
 static void svc_rdma_reply(struct svc_rdma_conn *conn, uint32_t xid);
 static void svc_rdma_wc_send(struct ib_cq *cq, struct ib_wc *wc);
+static void svc_rdma_conn_peeraddr(struct svc_rdma_conn *conn,
+    struct sockaddr_storage *ss);
 static int svc_rdma_mr_reg(struct svc_rdma_conn *conn, struct svc_rdma_mr *sm,
     void *buf, uint32_t len, int access, uint32_t *rkeyp);
 static void svc_rdma_mr_unmap(struct svc_rdma_conn *conn, struct svc_rdma_mr *sm);
@@ -1540,16 +1542,22 @@ svc_rdma_wc_recv(struct ib_cq *cq, struct ib_wc *wc)
 	 * copies the whole parsed msg -- reply chunk included -- into rs_msg, so
 	 * the post-read dispatch carries the reply chunk too (TASK_003f-5).
 	 */
-	if (msg.wr_nchunks != 0 ||
-	    (msg.rdma_proc == RDMA_NOMSG && msg.rd_nchunks == 0)) {
+	/*
+	 * Only a bodyless RDMA_NOMSG with no read list is unserveable (there is no
+	 * inline call body and no read chunk to assemble one) -- close it.  A
+	 * request that carries a WRITE list (the client's destination for an NFS
+	 * READ result) is now DISPATCHED: its call body is inline, so we serve it
+	 * like any inline call and reply inline when the result fits.  The write
+	 * list itself is not yet used to RDMA-Write a large result into the client
+	 * (that is the write-list data path, a separate increment); a result too
+	 * large for the inline reply is dropped by xp_reply with no reply chunk,
+	 * exactly as before -- but small reads (and the mount's own ops) succeed.
+	 */
+	if (msg.rdma_proc == RDMA_NOMSG && msg.rd_nchunks == 0) {
 		if (ppsratecheck(&svc_rdma_log_last, &svc_rdma_log_pps, 5))
-			printf("nfsrdma: RPC-over-RDMA v1 %s xid=0x%08x "
-			    "credit=%u read_list=%u write_list=%u reply_chunk=%u "
-			    "(write-list/bodyless-NOMSG not yet served), closing\n",
-			    msg.rdma_proc == RDMA_NOMSG ? "RDMA_NOMSG" :
-			    "RDMA_MSG", msg.xid, msg.credit, msg.rd_nchunks,
-			    msg.wr_nchunks,
-			    msg.reply_present ? msg.reply.wc_nsegs : 0);
+			printf("nfsrdma: RPC-over-RDMA v1 RDMA_NOMSG xid=0x%08x "
+			    "credit=%u no read list (bodyless), closing\n",
+			    msg.xid, msg.credit);
 		svc_rdma_conn_close(conn);
 		return;
 	}
@@ -3264,6 +3272,40 @@ svc_rdma_conn_credits(struct svc_rdma_conn *conn)
 
 	return ((uint32_t)conn->sc_nrecv);
 }
+/*
+ * Surface the connection's PEER address (TASK_003f-6).  RDMA-CM resolved the
+ * client's address into the cm_id during connection setup; for NFS-over-RDMA the
+ * client did rdma_resolve_addr() on an IP (its IPoIB address), so
+ * route.addr.dst_addr is the client's sockaddr_in/in6.  The krpc consumer copies
+ * this into the SVCXPRT's xp_rtaddr so NFS export-address checks
+ * (svc_getrpccaller -> xp_rtaddr) match the client against -network/-host
+ * exports, exactly as a TCP transport's peer address does.  We normalize sa_len
+ * from the family (the OFED address path may leave it 0) and copy only known
+ * families; an unknown/absent address yields AF_UNSPEC (the prior behavior).
+ * Declared in <rdma/svc_rdma.h>.
+ */
+static void
+svc_rdma_conn_peeraddr(struct svc_rdma_conn *conn, struct sockaddr_storage *ss)
+{
+	struct sockaddr *sa;
+
+	memset(ss, 0, sizeof(*ss));
+	if (conn->sc_id == NULL)
+		return;
+	sa = (struct sockaddr *)&conn->sc_id->route.addr.dst_addr;
+	switch (sa->sa_family) {
+	case AF_INET:
+		memcpy(ss, sa, sizeof(struct sockaddr_in));
+		ss->ss_len = sizeof(struct sockaddr_in);
+		break;
+	case AF_INET6:
+		memcpy(ss, sa, sizeof(struct sockaddr_in6));
+		ss->ss_len = sizeof(struct sockaddr_in6);
+		break;
+	default:
+		break;
+	}
+}
 
 /*
  * Marshal and post the in-tree STUB inline RPC-over-RDMA version 1 reply (3d),
@@ -4165,6 +4207,19 @@ svc_rdma_accept(struct rdma_cm_id *id)
 		goto fail;
 	}
 
+	{
+		struct sockaddr_storage pss;
+		uint32_t a = 0;
+
+		svc_rdma_conn_peeraddr(conn, &pss);
+		if (pss.ss_family == AF_INET)
+			a = ((struct sockaddr_in *)&pss)->sin_addr.s_addr;
+		if (ppsratecheck(&svc_rdma_log_last, &svc_rdma_log_pps, 5))
+			printf("nfsrdma: accept: recv_depth=%d send_depth=%d "
+			    "peer_af=%d peer_be=0x%08x\n", conn->sc_nrecv,
+			    conn->sc_nsend, pss.ss_family, a);
+	}
+
 	return (0);
 
 fail:
@@ -4499,6 +4554,7 @@ static const struct svc_rdma_verbs_ops ibcore_verbs_ops = {
 	.svo_conn_set_ctx	= svc_rdma_conn_set_ctx,
 	.svo_conn_get_ctx	= svc_rdma_conn_get_ctx,
 	.svo_conn_credits	= svc_rdma_conn_credits,
+	.svo_conn_peeraddr	= svc_rdma_conn_peeraddr,
 };
 
 /*
