@@ -243,6 +243,17 @@ MALLOC_DEFINE(M_NFSRDMA, "nfsrdma", "NFS over RDMA server");
 #define	SVC_RDMA_MAX_WRITE_SEGS	SVC_RDMA_MAX_SEGS
 
 /*
+ * Per-connection pool of pre-allocated, pre-DMA-mapped CONTIGUOUS RDMA-Read
+ * sink buffers (TASK_003f-8).  Each is SVC_RDMA_MAX_READ bytes (the per-request
+ * read cap) and mapped DMA_FROM_DEVICE ONCE at accept, so the NFS-WRITE hot path
+ * grabs a ready buffer instead of contigmalloc+map per write (which serializes
+ * on the global physical-page allocator and caps WRITE throughput).  Capped at
+ * the recv depth; a read that finds the pool empty falls back to the per-read
+ * contigmalloc path.  16 * 1 MiB = 16 MiB/conn (benchmark-tuned).
+ */
+#define	SVC_RDMA_READBUF_POOL	16
+
+/*
  * Size of the inline RPC-over-RDMA v1 reply we marshal in 3d.  It is a fixed
  * local constant -- the 7-word (28-byte) RFC 8166 transport header followed by
  * a minimal 6-word (24-byte) ONC RPC MSG_ACCEPTED/SUCCESS reply body (RFC 5531)
@@ -324,6 +335,26 @@ enum {
 CTASSERT(sizeof(struct svc_rdma_msg) <= 4096);
 
 /*
+ * One pre-allocated, pre-DMA-mapped contiguous RDMA-Read sink buffer from the
+ * per-connection read-buffer pool (TASK_003f-8).
+ *
+ * rb_buf is contigmalloc'd SVC_RDMA_MAX_READ bytes (physically contiguous) and
+ * rb_dma is its permanent DMA_FROM_DEVICE mapping, established ONCE at accept
+ * and torn down ONCE in the drained teardown.  rb_inuse (sc_lock) is the
+ * bounded-free-list token: a read that borrows the buffer sets it true and
+ * rs_rb records the borrow; svc_rdma_read_free returns the buffer (rb_inuse
+ * <- false, rs_rb <- NULL) instead of unmapping/freeing.  rb_mapped mirrors
+ * the rr_mapped / ss_mapped pattern: set only after a successful map so a
+ * partial-build teardown skips the unmap for an unmapped slot.
+ */
+struct svc_rdma_readbuf {
+	void	*rb_buf;	/* contigmalloc'd SVC_RDMA_MAX_READ bytes (contiguous) */
+	u64	 rb_dma;	/* ib_dma_map_single DMA_FROM_DEVICE, mapped once */
+	bool	 rb_mapped;	/* rb_dma is a live mapping */
+	bool	 rb_inuse;	/* lent to an in-flight read (sc_lock) */
+};
+
+/*
  * Durable inbound-read state (TASK_003f-3), embedded in each recv descriptor.
  *
  * THE LIFETIME FIX.  The 3f-1 parser fills a struct svc_rdma_msg whose rpc/
@@ -374,6 +405,7 @@ struct svc_rdma_read_state {
 	uint32_t		 rs_total;	/* summed read length (bounded) */
 	u64			 rs_dma;	/* rs_buf DMA map (DMA_FROM_DEVICE) */
 	bool			 rs_mapped;	/* rs_dma is a live mapping (sc_lock) */
+	struct svc_rdma_readbuf	*rs_rb;		/* borrowed pool buffer; NULL => fallback alloc */
 	bool			 rs_active;	/* completion one-shot guard (sc_lock) */
 	int			 rs_nwr;
 	struct ib_rdma_wr	 rs_wr[SVC_RDMA_MAX_READ_SEGS];
@@ -575,6 +607,8 @@ struct svc_rdma_conn {
 	int			 sc_nsend;
 	struct svc_rdma_mr	*sc_mr;		/* sc_nmr FRWR pool (3f-2) */
 	int			 sc_nmr;
+	struct svc_rdma_readbuf	*sc_rbpool;	/* sc_nrbpool-element read-buffer pool */
+	int			 sc_nrbpool;
 	void			*sc_selftest_buf; /* private FRWR self-test buffer */
 	u32			 sc_mr_pages;	/* per-MR page cap (device-bounded) */
 	struct mtx		 sc_lock;
@@ -1852,44 +1886,69 @@ svc_rdma_read_start(struct svc_rdma_conn *conn, struct svc_rdma_recv *rr,
 		memcpy(rs->rs_head, msg->rpc, rs->rs_headlen);
 
 	/*
-	 * Allocate the server destination buffer sized by the BOUNDED total and
-	 * DMA-map it DMA_FROM_DEVICE (the HCA WRITES the read data into it).  This
-	 * is the only peer-influenced allocation, and it is bounded by
-	 * SVC_RDMA_MAX_READ.  M_NOWAIT: we are in the completion context.
-	 */
-	/* contigmalloc: rs_buf must be PHYSICALLY contiguous -- ib_dma_map_single maps
+	 * Grab a pre-mapped pool buffer if one is free (TASK_003f-8 fast path):
+	 * no per-write contigmalloc/map.  rs_rb records the borrow; rs_mapped stays
+	 * FALSE (the pool owns the permanent mapping -- it must NOT be unmapped per
+	 * read).  Fall back to a per-read contigmalloc+map if the pool is empty.
+	 *
+	 * contigmalloc: rs_buf must be PHYSICALLY contiguous -- ib_dma_map_single maps
 	 * one contiguous region (vtophys of the first page); a scattered multi-page
 	 * malloc buffer would land the RDMA-Read data in the wrong physical pages
-	 * (TASK_003f-3 data-corruption fix).  Freed with free() (contigfree deprecated). */
-	rs->rs_buf = contigmalloc(rs->rs_total, M_NFSRDMA, M_NOWAIT, 0,
-	    ~(vm_paddr_t)0, PAGE_SIZE, 0);
-	if (rs->rs_buf == NULL) {
-		free(rs->rs_head, M_NFSRDMA);
-		rs->rs_head = NULL;
-		return (ENOMEM);
-	}
-	rs->rs_dma = ib_dma_map_single(dev, rs->rs_buf, rs->rs_total,
-	    DMA_FROM_DEVICE);
-	if (ib_dma_mapping_error(dev, rs->rs_dma)) {
-		free(rs->rs_buf, M_NFSRDMA);
-		rs->rs_buf = NULL;
-		free(rs->rs_head, M_NFSRDMA);
-		rs->rs_head = NULL;
-		return (EIO);
-	}
-	/*
-	 * BLOCKER 1 fix: mark the mapping live IMMEDIATELY after a successful map,
-	 * BEFORE the SC_UP check below.  svc_rdma_read_free unmaps iff rs_mapped, so
-	 * any reclaim after this point (the SC_UP-lost-race early-out, or the drained
-	 * teardown) unmaps exactly once.  Setting it only inside the SC_UP branch
-	 * left a window where a teardown racing between the map and the lock would
-	 * free() rs_buf with the DMA mapping still live (leaked mapping + device
-	 * translation onto freed memory) -- remotely triggerable by a mid-flight
-	 * disconnect.  It is plain memory the recv owns until the post, so setting it
-	 * before taking sc_lock is safe (no completion can reach rr_rs yet: nothing
-	 * is posted).
+	 * (TASK_003f-3 data-corruption fix).  Freed with free() (contigfree deprecated).
 	 */
-	rs->rs_mapped = true;
+	rs->rs_rb = NULL;
+	mtx_lock(&conn->sc_lock);
+	{
+		int rbk;
+		for (rbk = 0; rbk < conn->sc_nrbpool; rbk++) {
+			if (!conn->sc_rbpool[rbk].rb_inuse) {
+				conn->sc_rbpool[rbk].rb_inuse = true;
+				rs->rs_rb = &conn->sc_rbpool[rbk];
+				break;
+			}
+		}
+	}
+	mtx_unlock(&conn->sc_lock);
+	if (rs->rs_rb != NULL) {
+		rs->rs_buf = rs->rs_rb->rb_buf;
+		rs->rs_dma = rs->rs_rb->rb_dma;
+		rs->rs_mapped = false;	/* pool owns the mapping; not per-read */
+		/* Hand the buffer to the device for this read (DMA_FROM_DEVICE). */
+		ib_dma_sync_single_for_device(dev, rs->rs_dma, rs->rs_total,
+		    DMA_FROM_DEVICE);
+	} else {
+		/* Fallback: per-read contigmalloc + map (the original path). */
+		rs->rs_buf = contigmalloc(rs->rs_total, M_NFSRDMA, M_NOWAIT, 0,
+		    ~(vm_paddr_t)0, PAGE_SIZE, 0);
+		if (rs->rs_buf == NULL) {
+			free(rs->rs_head, M_NFSRDMA);
+			rs->rs_head = NULL;
+			return (ENOMEM);
+		}
+		rs->rs_dma = ib_dma_map_single(dev, rs->rs_buf, rs->rs_total,
+		    DMA_FROM_DEVICE);
+		if (ib_dma_mapping_error(dev, rs->rs_dma)) {
+			free(rs->rs_buf, M_NFSRDMA);
+			rs->rs_buf = NULL;
+			free(rs->rs_head, M_NFSRDMA);
+			rs->rs_head = NULL;
+			return (EIO);
+		}
+		/*
+		 * BLOCKER 1 fix: mark the mapping live IMMEDIATELY after a successful
+		 * map, BEFORE the SC_UP check below.  svc_rdma_read_free unmaps iff
+		 * rs_mapped, so any reclaim after this point (the SC_UP-lost-race
+		 * early-out, or the drained teardown) unmaps exactly once.  Setting
+		 * it only inside the SC_UP branch left a window where a teardown
+		 * racing between the map and the lock would free() rs_buf with the DMA
+		 * mapping still live (leaked mapping + device translation onto freed
+		 * memory) -- remotely triggerable by a mid-flight disconnect.  It is
+		 * plain memory the recv owns until the post, so setting it before
+		 * taking sc_lock is safe (no completion can reach rr_rs yet: nothing
+		 * is posted).
+		 */
+		rs->rs_mapped = true;	/* fallback mapping; read_free unmaps it */
+	}
 
 	/*
 	 * Build the RDMA Read WR chain: one IB_WR_RDMA_READ per read segment, each
@@ -2027,6 +2086,25 @@ svc_rdma_read_free(struct svc_rdma_conn *conn, struct svc_rdma_recv *rr)
 	struct svc_rdma_read_state *rs = &rr->rr_rs;
 	struct ib_device *dev;
 
+	/*
+	 * Pooled buffer (TASK_003f-8): return it to the free-list; do NOT unmap or
+	 * free it (the pool owns the permanent mapping and the memory).  Idempotent
+	 * via rs_rb: the read completion and the drained teardown may both call this,
+	 * but only the one that finds rs_rb != NULL returns the buffer.  Done under
+	 * sc_lock so rb_inuse + rs_rb flip atomically.  sc_lock is dropped BEFORE the
+	 * ib_dma_unmap_single below (which takes DMA_PRIV_LOCK) -- no lock nesting.
+	 */
+	mtx_lock(&conn->sc_lock);
+	if (rs->rs_rb != NULL) {
+		rs->rs_rb->rb_inuse = false;
+		rs->rs_rb = NULL;
+		rs->rs_buf = NULL;	/* belongs to the pool; do not free below */
+		rs->rs_dma = 0;
+		rs->rs_mapped = false;
+	}
+	mtx_unlock(&conn->sc_lock);
+
+	/* Fallback buffer: unmap + free exactly once (idempotent via rs_mapped/rs_buf). */
 	if (rs->rs_mapped) {
 		dev = (conn->sc_id != NULL) ? conn->sc_id->device : NULL;
 		if (dev != NULL)
@@ -3699,6 +3777,28 @@ svc_rdma_conn_free_verbs(struct svc_rdma_conn *conn)
 		conn->sc_selftest_buf = NULL;
 	}
 
+	/*
+	 * Read-buffer pool (TASK_003f-8).  Runs AFTER ib_drain_qp() (via caller
+	 * svc_rdma_conn_destroy), so no in-flight read can still hold a pool buffer:
+	 * every committed RDMA Read WR has flushed, and svc_rdma_read_free has been
+	 * called for each recv above.  Unmap + free each slot, then free the array.
+	 */
+	if (conn->sc_rbpool != NULL) {
+		dev = conn->sc_id->device;
+		for (i = 0; i < conn->sc_nrbpool; i++) {
+			struct svc_rdma_readbuf *rb = &conn->sc_rbpool[i];
+
+			if (rb->rb_mapped && dev != NULL)
+				ib_dma_unmap_single(dev, rb->rb_dma,
+				    SVC_RDMA_MAX_READ, DMA_FROM_DEVICE);
+			if (rb->rb_buf != NULL)
+				free(rb->rb_buf, M_NFSRDMA);
+		}
+		free(conn->sc_rbpool, M_NFSRDMA);
+		conn->sc_rbpool = NULL;
+		conn->sc_nrbpool = 0;
+	}
+
 	if (conn->sc_pd != NULL) {
 		ib_dealloc_pd(conn->sc_pd);
 		conn->sc_pd = NULL;
@@ -4193,6 +4293,39 @@ svc_rdma_accept(struct rdma_cm_id *id)
 				printf("nfsrdma: ib_alloc_mr failed: %d\n", rc);
 				goto fail;
 			}
+		}
+	}
+
+	/*
+	 * Read-buffer pool (TASK_003f-8): pre-allocate + DMA-map contiguous read
+	 * sinks so the NFS-WRITE RDMA-Read hot path does not contigmalloc per write.
+	 * Best-effort: cap at the recv depth, and stop at the first allocation/map
+	 * failure (a shorter pool just means more fallback, never an accept failure).
+	 */
+	conn->sc_nrbpool = (SVC_RDMA_READBUF_POOL < conn->sc_nrecv) ?
+	    SVC_RDMA_READBUF_POOL : conn->sc_nrecv;
+	conn->sc_rbpool = malloc(conn->sc_nrbpool * sizeof(*conn->sc_rbpool),
+	    M_NFSRDMA, M_WAITOK | M_ZERO);
+	{
+		int rbk;
+		for (rbk = 0; rbk < conn->sc_nrbpool; rbk++) {
+			struct svc_rdma_readbuf *rb = &conn->sc_rbpool[rbk];
+
+			rb->rb_buf = contigmalloc(SVC_RDMA_MAX_READ, M_NFSRDMA,
+			    M_WAITOK, 0, ~(vm_paddr_t)0, PAGE_SIZE, 0);
+			if (rb->rb_buf == NULL) {
+				conn->sc_nrbpool = rbk;	/* short pool */
+				break;
+			}
+			rb->rb_dma = ib_dma_map_single(dev, rb->rb_buf,
+			    SVC_RDMA_MAX_READ, DMA_FROM_DEVICE);
+			if (ib_dma_mapping_error(dev, rb->rb_dma)) {
+				free(rb->rb_buf, M_NFSRDMA);
+				rb->rb_buf = NULL;
+				conn->sc_nrbpool = rbk;
+				break;
+			}
+			rb->rb_mapped = true;
 		}
 	}
 
