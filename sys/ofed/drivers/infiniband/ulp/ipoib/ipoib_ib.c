@@ -841,7 +841,7 @@ timeout:
 
 	/* Wait for all AHs to be reaped */
 	set_bit(IPOIB_STOP_REAPER, &priv->flags);
-	cancel_delayed_work(&priv->ah_reap_task);
+	cancel_delayed_work_sync(&priv->ah_reap_task);
 	if (flush)
 		flush_workqueue(ipoib_workqueue);
 
