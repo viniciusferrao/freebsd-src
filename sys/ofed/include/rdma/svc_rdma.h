@@ -84,6 +84,14 @@
 struct svc_rdma_conn;
 
 /*
+ * Opaque mbuf handle.  Used only by the zero-copy sro_recv_mbuf op below, which
+ * hands the consumer an already-assembled ONC RPC call as an mbuf chain whose
+ * large middle segment is EXT_DISPOSABLE external storage over a DMA'd RDMA-Read
+ * sink (verbs-layer-owned ext_free); the consumer treats the chain as opaque.
+ */
+struct mbuf;
+
+/*
  * RFC 8166 chunk metadata, decoded and BOUNDS-VALIDATED by svc_verbs.c
  * (TASK_003f-1) into the fixed-capacity structures below.  These describe the
  * peer-registered memory regions a later increment (3f-3 RDMA Read / 3f-4 RDMA
@@ -259,6 +267,22 @@ struct svc_rdma_ops {
 	int	(*sro_recv)(void *ctx, struct svc_rdma_conn *conn,
 		    const struct svc_rdma_msg *msg);
 	void	(*sro_disconnect)(void *ctx, struct svc_rdma_conn *conn);
+	/*
+	 * sro_recv_mbuf(ctx, conn, m, xid, has_reply, reply) -> 0 cont /
+	 * nonzero drop+close.  Same IB_POLL_WORKQUEUE context and *** MUST NOT
+	 * SLEEP *** rule as sro_recv, same sro_newconn-happened-before
+	 * guarantee.  m is a COMPLETE ONC RPC call body already assembled
+	 * (head ++ read-data ++ head-tail) as an mbuf chain whose large middle
+	 * segment is EXT_DISPOSABLE external storage over a DMA'd read sink with
+	 * its OWN ext_free callback (verbs-layer-owned; the krpc treats m as
+	 * opaque).  OWNERSHIP OF m TRANSFERS to the callee on return 0 (it
+	 * m_freem()s it via the recv queue / drain).  On nonzero the CALLER
+	 * still owns m and m_freem()s it.  reply is a pure value type, captured
+	 * iff has_reply.
+	 */
+	int	(*sro_recv_mbuf)(void *ctx, struct svc_rdma_conn *conn,
+		    struct mbuf *m, uint32_t xid, bool has_reply,
+		    const struct svc_rdma_write_chunk *reply);
 };
 
 /*
