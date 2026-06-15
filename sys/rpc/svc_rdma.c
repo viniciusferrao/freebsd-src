@@ -135,6 +135,19 @@
 #define	RPCRDMA_VERSION		1
 #define	RPCRDMA_HDR_MIN		28	/* 7 words: xid,vers,credit,proc + 3 empty lists */
 #define	RDMA_MSG		0	/* rdma_proc: inline RPC message follows */
+/*
+ * RFC 8166 4.4 RDMA_ERROR rdma_err code we ask the verbs layer to emit (through
+ * the optional svo_conn_error op) when a reply cannot be placed into the client's
+ * chunks (TASK_028).  We only ever request ERR_CHUNK here: the server has a known
+ * xid but cannot place the reply (an over-inline reply with no usable reply
+ * chunk; the write-list READ out-of-range fall-through).  ERR_VERS is diagnosed
+ * and replied entirely inside the verbs layer (it owns the version check).  The
+ * verbs layer builds the full RDMA_ERROR header; this file only names the error
+ * kind.  ERR_CHUNK is a PER-REQUEST error -- the connection stays up and the
+ * client may retry -- so the reply path returns FALSE (drop) after requesting it
+ * and does NOT close.
+ */
+#define	RDMA_ERR_CHUNK		2	/* rdma_err: chunk lists unusable for reply */
 
 /*
  * Fallback flow-control credit for a reply's w2 rdma_credit (SF1).  The primary
@@ -780,7 +793,12 @@ svc_rdma_xprt_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 					*seq = seqval;
 				return (TRUE);
 			}
-			/* boundary out of range: fall through to reply-chunk/drop. */
+			/*
+			 * boundary out of range: fall through to the reply-chunk /
+			 * ERR_CHUNK path below.  A READ never offers a reply chunk, so
+			 * an out-of-range write-list boundary lands on the ERR_CHUNK
+			 * drop (RFC 8166 4.4/5), not on a reply-chunk send.
+			 */
 		}
 		if (have_pend && pend.rp_has_reply) {
 			/*
@@ -821,9 +839,30 @@ svc_rdma_xprt_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 			return (TRUE);
 		}
 		m_freem(mrep);
+		/*
+		 * (B) ERR_CHUNK (RFC 8166 4.4/5, TASK_028).  We could not place this
+		 * reply: it is over-inline and either no reply chunk was offered, or a
+		 * write-list read's DDP boundary was out of range and fell through to
+		 * here.  Rather than drop silently, report RDMA_ERROR/ERR_CHUNK keyed
+		 * by the request's KNOWN xid (msg->rm_xid, decoded by xdr_callmsg) so
+		 * the client learns this specific request failed and can retry -- the
+		 * connection STAYS UP (a per-request error).  Post under xr_lock so we
+		 * observe a stable live xr_conn (the same SF1/SF2 window as the inline
+		 * and reply-chunk paths above), and only when the verbs layer supplies
+		 * the OPTIONAL svo_conn_error (an older ibcore without it falls back to
+		 * the plain drop).  mrep was freed above and is not touched here.  We
+		 * still return FALSE: no inline reply was sent.
+		 */
+		mtx_lock(&xr->xr_lock);
+		conn = xr->xr_conn;
+		if (conn != NULL && svc_rdma_verbs != NULL &&
+		    svc_rdma_verbs->svo_conn_error != NULL)
+			(void)svc_rdma_verbs->svo_conn_error(conn, msg->rm_xid,
+			    RDMA_ERR_CHUNK);
+		mtx_unlock(&xr->xr_lock);
 		if (ppsratecheck(&svc_rdma_log_last, &svc_rdma_log_pps, 5))
 			printf("svc_rdma: over-inline reply (%u > %u) with no reply "
-			    "chunk, dropping (xid=0x%08x)\n", total,
+			    "chunk, replying ERR_CHUNK (xid=0x%08x)\n", total,
 			    SVC_RDMA_REPLY_INLINE, msg->rm_xid);
 		return (FALSE);
 	}
