@@ -275,6 +275,7 @@ struct svc_rdma_qent {
 	 */
 	bool		sq_has_writes;
 	struct svc_rdma_write_chunk sq_writes;
+	uint32_t	sq_nwrites;	/* offered write-list chunk count */
 };
 STAILQ_HEAD(svc_rdma_qhead, svc_rdma_qent);
 
@@ -309,6 +310,7 @@ struct svc_rdma_reply_pend {
 	bool		rp_has_reply;
 	bool		rp_has_writes;
 	struct svc_rdma_write_chunk rp_writes;
+	uint32_t	rp_nwrites;	/* offered write-list chunk count */
 	bool		rp_has_ddp;
 	uint32_t	rp_ddp_off;
 	uint32_t	rp_ddp_len;
@@ -374,7 +376,8 @@ svc_rdma_drain_queue(struct svc_rdma_xprt *xr)
 static void
 svc_rdma_reply_pend_insert(struct svc_rdma_xprt *xr, uint32_t xid,
     bool has_reply, const struct svc_rdma_write_chunk *reply,
-    bool has_writes, const struct svc_rdma_write_chunk *writes)
+    bool has_writes, const struct svc_rdma_write_chunk *writes,
+    uint32_t nwrites)
 {
 	int i, free_slot = -1;
 
@@ -398,6 +401,7 @@ svc_rdma_reply_pend_insert(struct svc_rdma_xprt *xr, uint32_t xid,
 		p->rp_has_writes = has_writes;
 		if (has_writes)
 			p->rp_writes = *writes;
+		p->rp_nwrites = has_writes ? nwrites : 0;
 		/*
 		 * The DDP boundary is filled LATER by svc_rdma_readddp_set() (from
 		 * xp_control on the request thread); start it cleared so a request
@@ -523,7 +527,7 @@ svc_rdma_xprt_recv(SVCXPRT *xprt, struct rpc_msg *msg,
 		if (q->sq_has_reply || q->sq_has_writes)
 			svc_rdma_reply_pend_insert(xr, q->sq_xid,
 			    q->sq_has_reply, &q->sq_reply,
-			    q->sq_has_writes, &q->sq_writes);
+			    q->sq_has_writes, &q->sq_writes, q->sq_nwrites);
 		free(q, M_SVCRDMA);
 
 		/*
@@ -720,23 +724,53 @@ svc_rdma_xprt_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 	 */
 	if (total > SVC_RDMA_REPLY_INLINE) {
 		/*
+		 * Multi-chunk write list (RFC 8166 3.4.2): a COMPOUND that offered more
+		 * than one write chunk (i.e. >1 DDP-eligible READ).  The reduction
+		 * engine maps a SINGLE DDP result to one write chunk (RFC 8267) and
+		 * echoes a one-chunk reply write list, so it cannot place a multi-chunk
+		 * reply.  Rather than send a non-conformant single-chunk reply or drop
+		 * silently, answer with a per-request RDMA_ERROR/ERR_CHUNK keyed by the
+		 * KNOWN xid (RFC 8166 4.4/5): the client learns this request could not
+		 * be placed and may retry (e.g. without DDP), and the connection STAYS
+		 * UP.  Only matters over-inline; an inline reply simply leaves every
+		 * offered write chunk empty, which is always conformant.
+		 */
+		if (have_pend && pend.rp_has_writes && pend.rp_nwrites > 1) {
+			m_freem(mrep);
+			mtx_lock(&xr->xr_lock);
+			conn = xr->xr_conn;
+			if (conn != NULL && svc_rdma_verbs != NULL &&
+			    svc_rdma_verbs->svo_conn_error != NULL)
+				(void)svc_rdma_verbs->svo_conn_error(conn,
+				    msg->rm_xid, RDMA_ERR_CHUNK);
+			mtx_unlock(&xr->xr_lock);
+			if (ppsratecheck(&svc_rdma_log_last,
+			    &svc_rdma_log_pps, 5))
+				printf("svc_rdma: multi-chunk write list (%u "
+				    "chunks) not reducible, replying ERR_CHUNK "
+				    "(xid=0x%08x)\n", pend.rp_nwrites,
+				    msg->rm_xid);
+			return (FALSE);
+		}
+		/*
 		 * Write-list READ engine (RFC 8166 reduction).  An over-inline READ
 		 * whose data is DDP-eligible into the client's write list: the request
-		 * offered a write list (captured at recv) AND the nfsd READ path
-		 * stamped the DDP boundary {off,len} via SVCSET_READDDP.  RDMA-Write
-		 * the read data into the write list and SEND a reduced RDMA_MSG
-		 * instead of dropping.  The data sits at rpchdr + ddp_off within mrep,
-		 * where rpchdr = rlen - nfsreply_len.  The read data mbuf was XDR
-		 * round-up padded by nfsvno_read (NFSM_RNDUP(cnt)), so the inline
-		 * reduced body must excise the PADDED span [doff, doff+padded) while
-		 * the write list receives exactly ddp_len (unpadded) bytes (RFC 8166
-		 * 3.4.5).  Bounds-check the padded window against the marshalled reply
-		 * before trusting it; a failed bound falls through to the existing
-		 * reply-chunk / drop path.  Strictly prefer this over the reply-chunk
-		 * path: a READ never offers a reply chunk.
+		 * offered a SINGLE write chunk (captured at recv; multi-chunk handled
+		 * above) AND the nfsd READ path stamped the DDP boundary {off,len} via
+		 * SVCSET_READDDP.  RDMA-Write the read data into the write list and
+		 * SEND a reduced RDMA_MSG instead of dropping.  The data sits at
+		 * rpchdr + ddp_off within mrep, where rpchdr = rlen - nfsreply_len.
+		 * The read data mbuf was XDR round-up padded by nfsvno_read
+		 * (NFSM_RNDUP(cnt)), so the inline reduced body must excise the PADDED
+		 * span [doff, doff+padded) while the write list receives exactly
+		 * ddp_len (unpadded) bytes (RFC 8166 3.4.5).  Bounds-check the padded
+		 * window against the marshalled reply before trusting it; a failed
+		 * bound falls through to the existing reply-chunk / drop path.
+		 * Strictly prefer this over the reply-chunk path: a READ never offers a
+		 * reply chunk.
 		 */
-		if (have_pend && pend.rp_has_writes && pend.rp_has_ddp &&
-		    pend.rp_ddp_len > 0 && svc_rdma_verbs != NULL &&
+		if (have_pend && pend.rp_has_writes && pend.rp_nwrites == 1 &&
+		    pend.rp_has_ddp && pend.rp_ddp_len > 0 && svc_rdma_verbs != NULL &&
 		    svc_rdma_verbs->svo_conn_write_list != NULL) {
 			u_int hdrbytes = rlen - nfsreply_len;
 			u_int doff = hdrbytes + pend.rp_ddp_off;
@@ -1267,9 +1301,14 @@ svc_rdma_sro_recv(void *ctx, struct svc_rdma_conn *conn,
 	 * offers a write list (not a reply chunk) to receive its data by DDP.
 	 * msg->writes is a pure value type, safe to copy here.  RFC 8267 maps the
 	 * single DDP-eligible READ result to one write chunk, so we carry
-	 * writes[0] only.  sq_xid is set whenever EITHER list is present.
+	 * writes[0] only -- but ALSO carry the offered chunk count so xp_reply can
+	 * tell a single-chunk READ (reduced) from a multi-chunk write list (a
+	 * COMPOUND with >1 DDP-eligible READ), which the engine does not reduce and
+	 * must answer with a conformant ERR_CHUNK rather than a single-chunk reply.
+	 * sq_xid is set whenever EITHER list is present.
 	 */
 	q->sq_has_writes = (msg->wr_nchunks > 0);
+	q->sq_nwrites = msg->wr_nchunks;
 	if (msg->reply_present || q->sq_has_writes)
 		q->sq_xid = msg->xid;
 	if (msg->reply_present)
@@ -1340,6 +1379,7 @@ svc_rdma_sro_recv_mbuf(void *ctx, struct svc_rdma_conn *conn, struct mbuf *m,
 	 * sq_has_writes MUST be explicitly cleared here.
 	 */
 	q->sq_has_writes = false;
+	q->sq_nwrites = 0;
 	if (has_reply) {
 		q->sq_xid = xid;
 		q->sq_reply = *reply;
