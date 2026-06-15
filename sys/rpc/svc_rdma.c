@@ -143,7 +143,7 @@
  * svo_conn_credits() (== conn->sc_nrecv, clamped to the device QP recv cap); see
  * svc_rdma_xprt_reply().  This constant is used only as a defensive non-zero
  * floor if the accessor ever returns 0 (it should not).  It matches the verbs
- * layer's nominal SVC_RDMA_RECV_DEPTH (8).
+ * layer's nominal SVC_RDMA_RECV_DEPTH (64).
  */
 #define	SVC_RDMA_CREDIT_GRANT	8
 
@@ -263,7 +263,7 @@ STAILQ_HEAD(svc_rdma_qhead, svc_rdma_qent);
  * means "no reply chunk for this reply" -> the inline path (or drop) handles it,
  * never an over-write.  Guarded by xr_lock.
  */
-#define	SVC_RDMA_REPLY_PEND	16
+#define	SVC_RDMA_REPLY_PEND	64
 struct svc_rdma_reply_pend {
 	bool		rp_valid;
 	uint32_t	rp_xid;
