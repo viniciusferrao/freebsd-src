@@ -346,6 +346,32 @@ int	svc_rdma_conn_send(struct svc_rdma_conn *conn, const void *buf,
 	    uint32_t len);
 
 /*
+ * Post an RPC-over-RDMA RDMA_ERROR reply on conn, keyed by the request's KNOWN
+ * opaque xid (RFC 8166 4.4/5, TASK_028).  errcode is the rdma_err value: 1 ==
+ * ERR_VERS (the verbs layer appends its supported version range -- the recv path
+ * emits this case itself and then closes), 2 == ERR_CHUNK (the server could not
+ * place the reply with the offered chunk lists: an over-inline reply with no
+ * usable reply chunk, or a write-list read whose DDP boundary is out of range).
+ * The verbs layer builds the fixed RDMA_ERROR header; the consumer passes only
+ * the xid and the error code.
+ *
+ * The caller MUST pass a real xid taken from a request whose header parsed; the
+ * verbs layer never fabricates an RDMA_ERROR from an unparseable header.  Like
+ * svc_rdma_conn_send() this does NOT sleep, rides the same bounded send pool and
+ * SC_UP gate (a drop on a closing conn / exhausted pool is silent), and the send
+ * buffer is freed on completion -- there is no ownership transfer.  An ERR_CHUNK
+ * leaves the connection UP (a per-request error; the client retries); it does
+ * NOT close.  Subject to the same caller-reference rule as svc_rdma_conn_send
+ * (hold a reference keeping conn alive across the call).
+ *
+ * OPTIONAL verbs op (svo_conn_error): the consumer NULL-checks it at the call
+ * site, so an older ibcore that predates it simply falls back to dropping the
+ * unplaceable reply.
+ */
+int	svc_rdma_conn_error(struct svc_rdma_conn *conn, uint32_t xid,
+	    uint32_t errcode);
+
+/*
  * RDMA-Write a too-large-for-inline reply into the client's reply chunk, then
  * SEND a small RDMA_NOMSG transport header reporting the bytes written
  * (TASK_003f-4).  This is the OUTBOUND data path for the RFC 8166 §4.3 reply
@@ -460,6 +486,7 @@ uint32_t svc_rdma_conn_credits(struct svc_rdma_conn *conn);
  *   svo_conn_get_ctx  -> svc_rdma_conn_get_ctx
  *   svo_conn_credits  -> svc_rdma_conn_credits
  *   svo_conn_peeraddr -> svc_rdma_conn_peeraddr (TASK_003f-6)
+ *   svo_conn_error    -> svc_rdma_conn_error (RFC 8166 RDMA_ERROR; optional)
  * (svc_rdma_listen_stop() is declared privately in svc_verbs.c, not in this
  * consumer header, because a consumer never calls it directly -- it reaches it
  * only through svo_listen_stop.  The signature here matches it.)
@@ -468,7 +495,10 @@ uint32_t svc_rdma_conn_credits(struct svc_rdma_conn *conn);
  * it: ibcore passes a static const table and must svc_rdma_unregister_verbs()
  * before that table (its module text) can go away.  Registration is single-
  * provider: a second svc_rdma_register_verbs() while one is registered is
- * rejected.  All entries are required (krpc rejects a partial table with EINVAL).
+ * rejected.  The CORE entries are required (krpc rejects a table missing one
+ * with EINVAL); svo_conn_write_list, svo_conn_peeraddr and svo_conn_error are
+ * OPTIONAL (NULL-checked at each call site) so an older ibcore predating them
+ * still registers.
  */
 struct svc_rdma_verbs_ops {
 	int	(*svo_listen_start)(uint16_t port,
@@ -494,6 +524,20 @@ struct svc_rdma_verbs_ops {
 	uint32_t (*svo_conn_credits)(struct svc_rdma_conn *conn);
 	void	(*svo_conn_peeraddr)(struct svc_rdma_conn *conn,
 		    struct sockaddr_storage *ss);
+	/*
+	 * svo_conn_error -> svc_rdma_conn_error (RFC 8166 RDMA_ERROR/ERR_CHUNK,
+	 * TASK_028).  The consumer reaches it to reply RDMA_ERROR/ERR_CHUNK keyed
+	 * by xid when it cannot place a reply into the client's chunks (an
+	 * over-inline reply with no usable reply chunk) -- the connection STAYS UP
+	 * (a per-request error; rdma_err is one of the RFC 8166 4.4 codes,
+	 * ERR_CHUNK == 2).  OPTIONAL: krpc NULL-checks it at the call site (like
+	 * svo_conn_write_list / svo_conn_peeraddr) and svc_rdma_register_verbs does
+	 * NOT require it, so an older ibcore predating it still registers and
+	 * over-inline replies with no reply chunk simply fall back to the existing
+	 * silent drop.
+	 */
+	int	(*svo_conn_error)(struct svc_rdma_conn *conn, uint32_t xid,
+		    uint32_t errcode);
 };
 
 /*
