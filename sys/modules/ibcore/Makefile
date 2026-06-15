@@ -42,8 +42,15 @@ SRCS= \
 	ib_uverbs_std_types_mr.c \
 	ib_uverbs_uapi.c \
 	ib_verbs.c \
-	xprt_verbs.c \
-	svc_verbs.c
+	xprt_verbs.c
+# svc_verbs.c (the NFS-over-RDMA server) is intentionally NOT built into this
+# loadable module: it calls svc_rdma_register_verbs()/svc_rdma_unregister_verbs(),
+# defined in sys/rpc/svc_rdma.c (native krpc, "optional ofed"), which is not
+# packaged in any .ko, so kldload'ing ibcore here would fail with unresolved
+# symbols.  The NFS-over-RDMA server is provided only by a kernel built with
+# "options OFED" (e.g. GENERIC-OFED), where svc_verbs.c and svc_rdma.c are both
+# compiled in.  A standalone loadable nfsrdma.ko (depending on ibcore + krpc) is
+# left as follow-up packaging work.
 
 SRCS+=	${LINUXKPI_GENSRCS}
 SRCS+=	opt_inet.h opt_inet6.h
