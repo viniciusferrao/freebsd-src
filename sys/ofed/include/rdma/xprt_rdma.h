@@ -37,6 +37,13 @@
  * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+*/
+
+/*
+ * Provenance: derived from the Linux kernel RPC-over-RDMA client header
+ * net/sunrpc/xprtrdma/xprt_rdma.h (Tom Tucker, Chuck Lever), ported to FreeBSD.
+ * Dual GPL-2.0/BSD-3-Clause copyrights above retained per the BSD-3-Clause
+ * terms, under which FreeBSD uses this file.
  */
 
 /*

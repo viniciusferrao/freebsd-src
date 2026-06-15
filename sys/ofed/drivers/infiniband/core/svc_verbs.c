@@ -37,6 +37,15 @@
  * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+*/
+
+/*
+ * Provenance: this server-side RPC-over-RDMA verbs layer was derived from the
+ * Linux kernel svcrdma transport -- net/sunrpc/xprtrdma/svc_rdma_transport.c,
+ * svc_rdma_recvfrom.c, svc_rdma_sendto.c, svc_rdma_rw.c (Tom Tucker, Chuck
+ * Lever) -- and ported to the FreeBSD OFED/LinuxKPI verbs stack.  The dual
+ * GPL-2.0/BSD-3-Clause copyrights above are retained per the BSD-3-Clause
+ * terms, under which FreeBSD uses this file.
  */
 
 /*
