@@ -3000,6 +3000,272 @@ svc_rdma_wc_rdma_write(struct ib_cq *cq, struct ib_wc *wc)
 }
 
 /*
+ * RDMA-Write a DDP-eligible NFS READ's data into the client's write-list chunk
+ * and SEND a REDUCED RDMA_MSG reporting the bytes written (write-list READ
+ * engine).  PUBLIC entry point (declared in <rdma/svc_rdma.h>); the krpc
+ * consumer's xp_reply calls it when an over-inline READ reply carries a write
+ * list.  It is the OUTBOUND-write twin of svc_rdma_conn_reply_chunk and reuses
+ * its svc_rdma_write_state, svc_rdma_write_free, and svc_rdma_wc_rdma_write
+ * completion VERBATIM.  The ONLY structural differences from reply_chunk:
+ *   - the RDMA Write SOURCE is the READ DATA (data/datalen), not a reply body;
+ *   - the tail SEND carries a REDUCED RDMA_MSG = [transport header with the
+ *     echoed write list] ++ [reduced inline ONC RPC body], not a bodyless
+ *     RDMA_NOMSG header.  ws_hdr therefore holds header + reduced body and the
+ *     SEND covers both.
+ *
+ * UNTRUSTED PEER -- re-validated at post time, never trusted from the parse, and
+ * the source is SERVER-KNOWN so we never write more than the client offered:
+ *   - datalen re-checked in (0, SVC_RDMA_MAX_WRITE];
+ *   - the write chunk's segment count re-checked <= SVC_RDMA_MAX_WRITE_SEGS;
+ *   - each rs_length re-checked in (0, SVC_RDMA_MAX_SEG_LEN] and SUMMED with no
+ *     uint32 overflow; datalen must be <= that capacity (else EMSGSIZE, write
+ *     NOTHING);
+ *   - at most rs_length bytes into each segment (min(remaining, rs_length));
+ *   - rs_handle(rkey)/rs_offset passed VERBATIM to the HCA, which enforces them.
+ * reducedlen is server-known; header + reduced body must fit one inline send
+ * buffer (SVC_RDMA_INLINE) or EMSGSIZE.
+ *
+ * COMPLETION-vs-TEARDOWN lifetime, PARTIAL-POST, and ws one-shot are IDENTICAL
+ * to svc_rdma_conn_reply_chunk (same sc_writes registry, same ws_active guard,
+ * same svc_rdma_wc_rdma_write).  Context: a krpc pool thread under the
+ * consumer's per-conn lock; does NOT sleep.
+ */
+int
+svc_rdma_conn_write_list(struct svc_rdma_conn *conn, uint32_t xid,
+    const struct svc_rdma_write_chunk *write, const void *data,
+    uint32_t datalen, const void *reduced, uint32_t reducedlen)
+{
+	struct svc_rdma_write_state *ws;
+	struct ib_device *dev = conn->sc_id->device;
+	const struct ib_send_wr *bad_wr;
+	uint64_t capacity;
+	uint32_t i, n, off, remaining, hdrlen, sendlen;
+	char *h;
+	int rc;
+
+	/*
+	 * Validate the DATA length (server-known, bounded).  A 0-length read does
+	 * not reach here (the consumer skips DDP for cnt == 0); a read over the
+	 * whole-transfer cap is refused rather than written.
+	 */
+	if (datalen == 0 || datalen > SVC_RDMA_MAX_WRITE)
+		return (EINVAL);
+
+	/*
+	 * Re-validate the write chunk SHAPE at post time (untrusted peer), exactly
+	 * as reply_chunk re-validates the reply chunk.
+	 */
+	n = write->wc_nsegs;
+	if (n == 0 || n > SVC_RDMA_MAX_WRITE_SEGS)
+		return (EINVAL);
+
+	/*
+	 * Offered CAPACITY (sum of segment lengths) with no uint32 overflow,
+	 * re-checking each length.  The data must FIT: datalen <= capacity, else
+	 * EMSGSIZE and we write nothing (never-over-write invariant).
+	 */
+	capacity = 0;
+	for (i = 0; i < n; i++) {
+		uint32_t slen = write->wc_segs[i].rs_length;
+
+		if (slen == 0 || slen > SVC_RDMA_MAX_SEG_LEN)
+			return (EINVAL);
+		capacity += slen;
+	}
+	if ((uint64_t)datalen > capacity)
+		return (EMSGSIZE);
+
+	/*
+	 * The reduced RDMA_MSG SEND = transport header (with the echoed write
+	 * list) + the reduced inline body.  Header layout (big-endian XDR words,
+	 * RFC 8166 4.3, write-list form):
+	 *   w0 rdma_xid, w1 rdma_vers(1), w2 rdma_credit, w3 rdma_proc(RDMA_MSG),
+	 *   w4 read_list = 0,
+	 *   w5 = 1 (write list: one chunk present), w6 nsegs,
+	 *     then nsegs * { handle, length(written), offset(64) } (4 words each),
+	 *   w  = 0 (write list terminator),
+	 *   w  = 0 (reply chunk: absent),
+	 *   then the reduced inline ONC RPC body.
+	 * The header is a fixed local size (bounded by n <= SVC_RDMA_MAX_WRITE_SEGS
+	 * and cannot be driven past the cap by a peer); with the reduced body it
+	 * must fit one inline send buffer (SVC_RDMA_INLINE -- the receive-buffer
+	 * size, the bound svc_rdma_conn_send also uses), else EMSGSIZE -> the
+	 * caller drops, exactly as the pre-engine over-inline path did.
+	 */
+	hdrlen = RPCRDMA_HDR_FIXED +			/* prefix */
+	    RPCRDMA_WORD +				/* read list = 0 */
+	    2 * RPCRDMA_WORD +				/* write list: present + nsegs */
+	    n * (RPCRDMA_SEG_WORDS * RPCRDMA_WORD) +	/* the segments */
+	    RPCRDMA_WORD +				/* write list terminator */
+	    RPCRDMA_WORD;				/* reply chunk absent */
+	if ((uint64_t)hdrlen + reducedlen > SVC_RDMA_INLINE)
+		return (EMSGSIZE);
+	sendlen = hdrlen + reducedlen;
+
+	/*
+	 * Allocate the durable write state (outlives this call -- the writes and
+	 * the SEND complete async).  M_NOWAIT (xp_reply runs under a leaf mutex);
+	 * zeroed so every token starts false/NULL.
+	 */
+	ws = malloc(sizeof(*ws), M_NFSRDMA, M_NOWAIT | M_ZERO);
+	if (ws == NULL)
+		return (ENOMEM);
+	ws->ws_conn = conn;
+
+	/*
+	 * Copy the read data into the DMA source buffer and map it DMA_TO_DEVICE
+	 * (the HCA READS it to push into the client).  contigmalloc for the same
+	 * reason as reply_chunk's ws_src: a multi-page transfer must be physically
+	 * contiguous for ib_dma_map_single.
+	 */
+	ws->ws_srclen = datalen;
+	ws->ws_src = contigmalloc(datalen, M_NFSRDMA, M_NOWAIT, 0,
+	    ~(vm_paddr_t)0, PAGE_SIZE, 0);
+	if (ws->ws_src == NULL) {
+		free(ws, M_NFSRDMA);
+		return (ENOMEM);
+	}
+	memcpy(ws->ws_src, data, datalen);
+	ws->ws_src_dma = ib_dma_map_single(dev, ws->ws_src, datalen,
+	    DMA_TO_DEVICE);
+	if (ib_dma_mapping_error(dev, ws->ws_src_dma)) {
+		free(ws->ws_src, M_NFSRDMA);
+		free(ws, M_NFSRDMA);
+		return (EIO);
+	}
+	ws->ws_src_mapped = true;	/* mark live IMMEDIATELY (BLOCKER 1 rule) */
+
+	/*
+	 * Build the reduced RDMA_MSG SEND buffer: the transport header (echoing
+	 * the write chunk with the bytes actually written) followed by the reduced
+	 * inline body, mapped DMA_TO_DEVICE.
+	 */
+	ws->ws_hdrlen = sendlen;
+	ws->ws_hdr = malloc(sendlen, M_NFSRDMA, M_NOWAIT);
+	if (ws->ws_hdr == NULL) {
+		svc_rdma_write_free(ws);	/* unmaps ws_src, frees ws */
+		return (ENOMEM);
+	}
+	h = ws->ws_hdr;
+	be32enc(h +  0, xid);				/* w0  rdma_xid */
+	be32enc(h +  4, RPCRDMA_VERSION);		/* w1  rdma_vers */
+	be32enc(h +  8, (uint32_t)conn->sc_nrecv);	/* w2  rdma_credit (granted) */
+	be32enc(h + 12, RDMA_MSG);			/* w3  rdma_proc */
+	be32enc(h + 16, 0);				/* w4  read list (empty) */
+	be32enc(h + 20, 1);				/* w5  write list: 1 chunk */
+	be32enc(h + 24, n);				/* w6  nsegs */
+	off = 28;
+	remaining = datalen;
+	for (i = 0; i < n; i++) {
+		uint32_t slen = write->wc_segs[i].rs_length;
+		uint32_t wlen = (remaining < slen) ? remaining : slen;
+
+		be32enc(h + off + 0, write->wc_segs[i].rs_handle);
+		be32enc(h + off + 4, wlen);		/* bytes written into this seg */
+		be64enc(h + off + 8, write->wc_segs[i].rs_offset);
+		off += RPCRDMA_SEG_WORDS * RPCRDMA_WORD;
+		remaining -= wlen;
+	}
+	be32enc(h + off, 0);				/* write list terminator */
+	off += RPCRDMA_WORD;
+	be32enc(h + off, 0);				/* reply chunk absent */
+	off += RPCRDMA_WORD;
+	if (reducedlen > 0)
+		memcpy(h + off, reduced, reducedlen);	/* reduced inline body */
+	ws->ws_hdr_dma = ib_dma_map_single(dev, ws->ws_hdr, sendlen,
+	    DMA_TO_DEVICE);
+	if (ib_dma_mapping_error(dev, ws->ws_hdr_dma)) {
+		svc_rdma_write_free(ws);	/* unmaps ws_src, frees both + ws */
+		return (EIO);
+	}
+	ws->ws_hdr_mapped = true;
+
+	/*
+	 * Build the RDMA Write WR chain into the write chunk's segments, exactly as
+	 * reply_chunk does (one IB_WR_RDMA_WRITE per byte-carrying segment, single
+	 * local SGE into ws_src, peer { rkey, remote_addr } verbatim, all
+	 * unsignaled), then chain the reduced-RDMA_MSG SEND last and signal ONLY it.
+	 */
+	ws->ws_cqe.done = svc_rdma_wc_rdma_write;
+	off = 0;			/* source offset within ws_src */
+	remaining = datalen;
+	ws->ws_nwr = 0;
+	for (i = 0; i < n && remaining > 0; i++) {
+		uint32_t slen = write->wc_segs[i].rs_length;
+		uint32_t wlen = (remaining < slen) ? remaining : slen;
+		int k = ws->ws_nwr;
+
+		ws->ws_sge[k].addr = ws->ws_src_dma + off;
+		ws->ws_sge[k].length = wlen;
+		ws->ws_sge[k].lkey = conn->sc_pd->local_dma_lkey;
+
+		memset(&ws->ws_wr[k], 0, sizeof(ws->ws_wr[k]));
+		ws->ws_wr[k].wr.wr_cqe = &ws->ws_cqe;
+		ws->ws_wr[k].wr.sg_list = &ws->ws_sge[k];
+		ws->ws_wr[k].wr.num_sge = 1;
+		ws->ws_wr[k].wr.opcode = IB_WR_RDMA_WRITE;
+		ws->ws_wr[k].wr.send_flags = 0;		/* unsignaled */
+		ws->ws_wr[k].remote_addr = write->wc_segs[i].rs_offset;
+		ws->ws_wr[k].rkey = write->wc_segs[i].rs_handle;
+		ws->ws_nwr++;
+		off += wlen;		/* bounded by datalen, no overflow */
+		remaining -= wlen;
+	}
+
+	/* The tail reduced-RDMA_MSG SEND, signaled -- one completion per chain. */
+	ws->ws_sndsge.addr = ws->ws_hdr_dma;
+	ws->ws_sndsge.length = sendlen;
+	ws->ws_sndsge.lkey = conn->sc_pd->local_dma_lkey;
+	memset(&ws->ws_sndwr, 0, sizeof(ws->ws_sndwr));
+	ws->ws_sndwr.wr_cqe = &ws->ws_cqe;
+	ws->ws_sndwr.sg_list = &ws->ws_sndsge;
+	ws->ws_sndwr.num_sge = 1;
+	ws->ws_sndwr.opcode = IB_WR_SEND;
+	ws->ws_sndwr.send_flags = IB_SEND_SIGNALED;
+	ws->ws_sndwr.next = NULL;
+
+	/* Link writes -> ... -> reduced-RDMA_MSG SEND. */
+	for (i = 0; i + 1 < (uint32_t)ws->ws_nwr; i++)
+		ws->ws_wr[i].wr.next = &ws->ws_wr[i + 1].wr;
+	if (ws->ws_nwr > 0)
+		ws->ws_wr[ws->ws_nwr - 1].wr.next = &ws->ws_sndwr;
+
+	/*
+	 * Arm the send-side teardown barrier and post, IDENTICALLY to
+	 * svc_rdma_conn_reply_chunk: register on sc_writes, mark in flight, bump
+	 * sc_sends under SC_UP; post with the lock dropped; decrement; partial-post
+	 * discipline on failure.
+	 */
+	mtx_lock(&conn->sc_lock);
+	if (conn->sc_state != SC_UP) {
+		mtx_unlock(&conn->sc_lock);
+		svc_rdma_write_free(ws);
+		return (ENOTCONN);
+	}
+	TAILQ_INSERT_TAIL(&conn->sc_writes, ws, ws_link);
+	ws->ws_active = true;
+	conn->sc_sends++;
+	mtx_unlock(&conn->sc_lock);
+
+	rc = ib_post_send(conn->sc_id->qp,
+	    ws->ws_nwr > 0 ? &ws->ws_wr[0].wr : &ws->ws_sndwr, &bad_wr);
+
+	mtx_lock(&conn->sc_lock);
+	if (--conn->sc_sends == 0)
+		wakeup(&conn->sc_upcalls);
+	mtx_unlock(&conn->sc_lock);
+
+	if (rc != 0) {
+		if (ppsratecheck(&svc_rdma_log_last, &svc_rdma_log_pps, 5))
+			printf("nfsrdma: ib_post_send (write-list READ) failed: %d "
+			    "(prefix may be committed; drain reclaims)\n", rc);
+		svc_rdma_conn_close(conn);
+		return (rc < 0 ? -rc : rc);
+	}
+	return (0);
+}
+
+/*
  * ===========================================================================
  * FRWR memory-registration substrate (TASK_003f-2).
  *
@@ -4935,6 +5201,7 @@ static const struct svc_rdma_verbs_ops ibcore_verbs_ops = {
 	.svo_listen_stop	= svc_rdma_listen_stop,
 	.svo_conn_send		= svc_rdma_conn_send,
 	.svo_conn_reply_chunk	= svc_rdma_conn_reply_chunk,
+	.svo_conn_write_list	= svc_rdma_conn_write_list,
 	.svo_conn_set_ctx	= svc_rdma_conn_set_ctx,
 	.svo_conn_get_ctx	= svc_rdma_conn_get_ctx,
 	.svo_conn_credits	= svc_rdma_conn_credits,

@@ -377,6 +377,38 @@ int	svc_rdma_conn_reply_chunk(struct svc_rdma_conn *conn, uint32_t xid,
 	    uint32_t len);
 
 /*
+ * RDMA-Write a DDP-eligible NFS READ's data into the client's write-list chunk,
+ * then SEND a REDUCED RDMA_MSG (RFC 8166 3.5.3 / 4.2 "reduction"): the ONC RPC
+ * reply with the read data removed, carrying a write list that echoes the chunk
+ * with the per-segment lengths ACTUALLY written.  OUTBOUND data path for the
+ * write list (vs. svc_rdma_conn_reply_chunk's reply chunk): the read data does
+ * not fit inline, so the client pre-registered write-list memory and the server
+ * RDMA-Writes the data into it and reports the lengths in the header.
+ *
+ * `write' is the parsed-and-validated single write chunk the client offered for
+ * this READ (a pure value type the consumer captured during sro_recv).  EVERY
+ * field is UNTRUSTED and RE-VALIDATED at post time exactly as the reply-chunk
+ * engine does: segment count <= cap, each length in (0, cap], the running total
+ * (offered capacity) computed with no uint32 overflow >= datalen, else EMSGSIZE
+ * and NOTHING is written.  data/datalen are the read data bytes (server-known,
+ * bounded by SVC_RDMA_MAX_WRITE); the chunk receives exactly datalen UNPADDED
+ * bytes (RFC 8166 3.4.5).  reduced/reducedlen are the reduced inline ONC RPC
+ * body the verbs layer SENDs after the RDMA_MSG header (header + body must fit
+ * one inline send buffer; else EMSGSIZE).  {rkey,addr} go VERBATIM to the HCA,
+ * which enforces them.  data and reduced are caller-owned and only read here
+ * (both copied into DMA-mapped verbs-owned buffers), so the caller may free them
+ * the instant this returns.  xid is the echoed transaction id (RDMA_MSG word0).
+ *
+ * Same context, lifetime, completion and partial-post rules as
+ * svc_rdma_conn_reply_chunk.  Returns 0, EINVAL for a len/segment violation,
+ * EMSGSIZE if the data exceeds the client's write chunk or the reduced reply
+ * exceeds the inline send buffer, ENOMEM, EBUSY, ENOTCONN, or the posted errno.
+ */
+int	svc_rdma_conn_write_list(struct svc_rdma_conn *conn, uint32_t xid,
+	    const struct svc_rdma_write_chunk *write, const void *data,
+	    uint32_t datalen, const void *reduced, uint32_t reducedlen);
+
+/*
  * Report the flow-control credit the verbs layer GRANTED this connection: the
  * number of receive buffers (and thus recv WRs) it actually posted, which is the
  * value a reply's RPC-over-RDMA header should advertise in rdma_credit (RFC 8166
@@ -434,6 +466,16 @@ struct svc_rdma_verbs_ops {
 	int	(*svo_conn_reply_chunk)(struct svc_rdma_conn *conn, uint32_t xid,
 		    const struct svc_rdma_write_chunk *reply, const void *buf,
 		    uint32_t len);
+	/*
+	 * svo_conn_write_list -> svc_rdma_conn_write_list (write-list READ
+	 * engine).  OPTIONAL: krpc NULL-checks it at the call site (like
+	 * svo_conn_peeraddr) and svc_rdma_register_verbs does NOT require it, so
+	 * an older ibcore predating the engine still registers and over-inline
+	 * READs simply fall back to the existing drop.
+	 */
+	int	(*svo_conn_write_list)(struct svc_rdma_conn *conn, uint32_t xid,
+		    const struct svc_rdma_write_chunk *write, const void *data,
+		    uint32_t datalen, const void *reduced, uint32_t reducedlen);
 	void	(*svo_conn_set_ctx)(struct svc_rdma_conn *conn, void *cctx);
 	void	*(*svo_conn_get_ctx)(struct svc_rdma_conn *conn);
 	uint32_t (*svo_conn_credits)(struct svc_rdma_conn *conn);
