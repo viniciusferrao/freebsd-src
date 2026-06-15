@@ -105,6 +105,17 @@ static const struct clnt_ops clnt_bck_ops = {
 };
 
 /*
+ * Link-safe RDMA backchannel send hook (see rpc/krpc.h).  Defined here in an
+ * ALWAYS-compiled krpc file so the symbol exists on every NFS kernel; set to
+ * the real RDMA primitive (svc_rdma_bck_send) by the OFED-only rpc/svc_rdma.c
+ * at verbs registration and cleared at unregistration.  NULL means no OFED /
+ * no RDMA backchannel: clnt_bck_call then treats a socket-less send as a send
+ * failure (RPC_CANTSEND).  This indirection keeps clnt_bck.c free of any
+ * svc_rdma/ofed symbol so it links on a non-OFED kernel.
+ */
+int (*clnt_bck_rdma_send)(SVCXPRT *, struct mbuf *) = NULL;
+
+/*
  * Create a client handle for a connection.
  * Default options are set, which the user can change using clnt_control()'s.
  * This code handles the special case of an NFSv4.1 session backchannel
@@ -270,11 +281,18 @@ call_again:
 	mreq->m_pkthdr.len = m_length(mreq, NULL);
 
 	/*
-	 * Prepend a record marker containing the packet length.
+	 * Prepend a record marker containing the packet length.  This is the TCP
+	 * byte-stream framing only; an RDMA backchannel xprt (xp_socket == NULL)
+	 * carries each callback as one message-oriented SEND with the RFC 8166
+	 * RDMA_MSG transport header prepended by clnt_bck_rdma_send instead, so it
+	 * MUST NOT carry a TCP record mark -- leave mreq as the bare ONC RPC
+	 * message whose first 4 bytes are the network-order xid the helper reads.
 	 */
-	M_PREPEND(mreq, sizeof(uint32_t), M_WAITOK);
-	*mtod(mreq, uint32_t *) =
-	    htonl(0x80000000 | (mreq->m_pkthdr.len - sizeof(uint32_t)));
+	if (xprt->xp_socket != NULL) {
+		M_PREPEND(mreq, sizeof(uint32_t), M_WAITOK);
+		*mtod(mreq, uint32_t *) =
+		    htonl(0x80000000 | (mreq->m_pkthdr.len - sizeof(uint32_t)));
+	}
 
 	cr->cr_xid = xid;
 	mtx_lock(&ct->ct_lock);
@@ -297,36 +315,57 @@ call_again:
 	TAILQ_INSERT_TAIL(&ct->ct_pending, cr, cr_link);
 	mtx_unlock(&ct->ct_lock);
 
-	/* For RPC-over-TLS, copy mrep to a chain of ext_pgs. */
-	if ((xprt->xp_tls & RPCTLS_FLAGS_HANDSHAKE) != 0) {
-		/*
-		 * Copy the mbuf chain to a chain of
-		 * ext_pgs mbuf(s) as required by KERN_TLS.
-		 */
-		maxextsiz = TLS_MAX_MSG_SIZE_V10_2;
+	if (xprt->xp_socket != NULL) {
+		/* For RPC-over-TLS, copy mrep to a chain of ext_pgs. */
+		if ((xprt->xp_tls & RPCTLS_FLAGS_HANDSHAKE) != 0) {
+			/*
+			 * Copy the mbuf chain to a chain of
+			 * ext_pgs mbuf(s) as required by KERN_TLS.
+			 */
+			maxextsiz = TLS_MAX_MSG_SIZE_V10_2;
 #ifdef KERN_TLS
-		if (rpctls_getinfo(&maxlen, false, false))
-			maxextsiz = min(maxextsiz, maxlen);
+			if (rpctls_getinfo(&maxlen, false, false))
+				maxextsiz = min(maxextsiz, maxlen);
 #endif
-		mreq = _rpc_copym_into_ext_pgs(mreq, maxextsiz);
-	}
-	/*
-	 * sosend consumes mreq.
-	 */
-	sx_xlock(&xprt->xp_lock);
-	error = sosend(xprt->xp_socket, NULL, NULL, mreq, NULL, 0, curthread);
-	mreq = NULL;
-	if (error == EMSGSIZE) {
-		SOCK_SENDBUF_LOCK(xprt->xp_socket);
-		sbwait(xprt->xp_socket, SO_SND);
-		SOCK_SENDBUF_UNLOCK(xprt->xp_socket);
+			mreq = _rpc_copym_into_ext_pgs(mreq, maxextsiz);
+		}
+		/*
+		 * sosend consumes mreq.
+		 */
+		sx_xlock(&xprt->xp_lock);
+		error = sosend(xprt->xp_socket, NULL, NULL, mreq, NULL, 0,
+		    curthread);
+		mreq = NULL;
+		if (error == EMSGSIZE) {
+			SOCK_SENDBUF_LOCK(xprt->xp_socket);
+			sbwait(xprt->xp_socket, SO_SND);
+			SOCK_SENDBUF_UNLOCK(xprt->xp_socket);
+			sx_xunlock(&xprt->xp_lock);
+			AUTH_VALIDATE(auth, xid, NULL, NULL);
+			mtx_lock(&ct->ct_lock);
+			TAILQ_REMOVE(&ct->ct_pending, cr, cr_link);
+			goto call_again;
+		}
 		sx_xunlock(&xprt->xp_lock);
-		AUTH_VALIDATE(auth, xid, NULL, NULL);
-		mtx_lock(&ct->ct_lock);
-		TAILQ_REMOVE(&ct->ct_pending, cr, cr_link);
-		goto call_again;
+	} else {
+		/*
+		 * NFS-over-RDMA backchannel: no socket, no TCP record mark, no
+		 * KERN_TLS (RPC-over-TLS is socket-only), and no sosend/sbwait
+		 * EMSGSIZE retry (there is no socket send buffer to wait on).
+		 * Hand the bare ONC RPC CALL to the link-safe RDMA send hook,
+		 * which prepends the RFC 8166 RDMA_MSG header and posts it on the
+		 * connection's QP; the hook (svc_rdma_bck_send) consumes mreq.  A
+		 * NULL hook means no OFED/RDMA backchannel is available; map that
+		 * and any post error (ENOTCONN/EBUSY/EINVAL) to a send failure,
+		 * which the `if (error)' path below turns into RPC_CANTSEND.
+		 */
+		if (clnt_bck_rdma_send != NULL) {
+			error = clnt_bck_rdma_send(xprt, mreq);
+			mreq = NULL;	/* the hook consumed (freed) mreq */
+		} else
+			error = ENOTCONN;
+			/* leave mreq non-NULL: freed by the out: cleanup */
 	}
-	sx_xunlock(&xprt->xp_lock);
 
 	reply_msg.acpted_rply.ar_verf.oa_flavor = AUTH_NULL;
 	reply_msg.acpted_rply.ar_verf.oa_base = cr->cr_verf;
