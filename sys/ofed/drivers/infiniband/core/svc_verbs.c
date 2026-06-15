@@ -291,6 +291,29 @@ enum {
 };
 
 /*
+ * RFC 8166 4.4 rdma_err discriminator carried in word4 of an RDMA_ERROR reply.
+ * These are the only two recoverable faults this server diagnoses with a KNOWN
+ * xid and reports rather than silently resetting the connection:
+ *   ERR_VERS  - the call's rdma_vers is not one we support; the reply appends
+ *               the inclusive [vers_low, vers_high] range we DO support (here
+ *               exactly [1,1]).  The recv path sends this then closes the
+ *               mismatched connection (a version cannot change on a live RC
+ *               connection, so closing is correct -- the reply is a courtesy so
+ *               the client learns the reason rather than seeing only a reset).
+ *   ERR_CHUNK - the chunk lists could not be used to place the reply (an
+ *               over-inline reply with no usable reply chunk, or a write-list
+ *               read whose DDP boundary is out of range and fell through).  No
+ *               extra words follow; the connection STAYS UP -- a per-request
+ *               error, and the client may retry.
+ * Both are built by svc_rdma_send_error() / svc_rdma_conn_error() from a KNOWN
+ * xid only -- we NEVER fabricate an RDMA_ERROR from an unparseable header.
+ */
+enum {
+	ERR_VERS	= 1,	/* unsupported rdma_vers; vers range follows */
+	ERR_CHUNK	= 2	/* chunk lists unusable for this reply */
+};
+
+/*
  * ONC RPC (RFC 5531) reply-message constants for the minimal MSG_ACCEPTED/
  * SUCCESS body 3d marshals after the RPC-over-RDMA header.  This is exactly a
  * valid NFS NULL reply; the semantically-correct nfsd reply body is 3e.  These
@@ -770,6 +793,8 @@ static int svc_rdma_parse_header(const void *buf, uint32_t len,
     struct svc_rdma_msg *out);
 static void svc_rdma_wc_recv(struct ib_cq *cq, struct ib_wc *wc);
 static void svc_rdma_reply(struct svc_rdma_conn *conn, uint32_t xid);
+static int svc_rdma_send_error(struct svc_rdma_conn *conn, uint32_t xid,
+    uint32_t errcode);
 static void svc_rdma_wc_send(struct ib_cq *cq, struct ib_wc *wc);
 static void svc_rdma_conn_peeraddr(struct svc_rdma_conn *conn,
     struct sockaddr_storage *ss);
@@ -1388,10 +1413,23 @@ svc_rdma_parse_header(const void *buf, uint32_t len, struct svc_rdma_msg *out)
 	if (len < RPCRDMA_HDR_FIXED)
 		return (EBADMSG);
 
-	/* word1: version MUST be 1 (RFC 8166 4.2). */
+	/*
+	 * word1: version MUST be 1 (RFC 8166 4.2).  A mismatch is DISTINGUISHED
+	 * from generic malformation: the fixed-prefix gate above proved len >=
+	 * RPCRDMA_HDR_FIXED, so word0 (rdma_xid) is in range and READABLE even
+	 * though we decode nothing else.  Stamp out->xid from word0 (the init
+	 * block below, which normally sets it, is reached only on the success
+	 * path) and return a DISTINCT code -- EPROTONOSUPPORT, not EBADMSG -- so
+	 * the recv path can reply RDMA_ERROR/ERR_VERS keyed by that real xid
+	 * before closing the mismatched connection (RFC 8166 4.4/5).  On this
+	 * return only out->xid is defined; every other out field is undefined and
+	 * the caller touches only out->xid.
+	 */
 	vers = be32dec((const char *)buf + 4);
-	if (vers != RPCRDMA_VERSION)
-		return (EBADMSG);
+	if (vers != RPCRDMA_VERSION) {
+		out->xid = be32dec((const char *)buf + 0);	/* word0 */
+		return (EPROTONOSUPPORT);
+	}
 
 	/*
 	 * word3: rdma_proc.  We decode chunk lists for RDMA_MSG and RDMA_NOMSG
@@ -1555,7 +1593,11 @@ svc_rdma_wc_recv(struct ib_cq *cq, struct ib_wc *wc)
 		 * repost once conn_close() publishes SC_CLOSING anyway.
 		 */
 		if (ppsratecheck(&svc_rdma_log_last, &svc_rdma_log_pps, 5)) {
-			if (rc == EOPNOTSUPP)
+			if (rc == EPROTONOSUPPORT)
+				printf("nfsrdma: RPC-over-RDMA version unsupported "
+				    "xid=0x%08x, replying ERR_VERS and closing\n",
+				    msg.xid);
+			else if (rc == EOPNOTSUPP)
 				printf("nfsrdma: RPC-over-RDMA request exceeds "
 				    "chunk/segment caps, closing (%u bytes)\n",
 				    len);
@@ -1563,6 +1605,22 @@ svc_rdma_wc_recv(struct ib_cq *cq, struct ib_wc *wc)
 				printf("nfsrdma: malformed RPC-over-RDMA header "
 				    "(%u bytes), closing\n", len);
 		}
+		/*
+		 * (A) ERR_VERS (RFC 8166 4.4/5).  ONLY the version-mismatch return
+		 * (EPROTONOSUPPORT) leaves a trustworthy xid: parse_header proved the
+		 * fixed prefix was present and stamped msg.xid before bailing.  Reply
+		 * RDMA_ERROR/ERR_VERS carrying our supported version range on the
+		 * still-SC_UP conn, THEN close.  The SEND is posted through the same
+		 * SC_UP-gated, sc_sends-counted bounded pool as every reply, so
+		 * posting it BEFORE svc_rdma_conn_close() publishes SC_CLOSING is
+		 * safe: the in-flight WR is drained by the close's sc_sends barrier
+		 * ahead of ib_drain_qp(), and a racing close makes the post a benign
+		 * ENOTCONN drop.  Every other rc (EBADMSG/EOPNOTSUPP) has NO
+		 * guaranteed-readable xid (the header may be too short), so we MUST
+		 * NOT fabricate an RDMA_ERROR -- we just close, exactly as before.
+		 */
+		if (rc == EPROTONOSUPPORT)
+			svc_rdma_send_error(conn, msg.xid, ERR_VERS);
 		svc_rdma_conn_close(conn);
 		return;
 	}
@@ -3957,6 +4015,102 @@ svc_rdma_reply(struct svc_rdma_conn *conn, uint32_t xid)
 }
 
 /*
+ * Marshal and post an RPC-over-RDMA version 1 RDMA_ERROR reply (RFC 8166 4.4/5,
+ * TASK_028), echoing the call's KNOWN opaque xid.  This is the conformant
+ * replacement for silently conn_close()ing a recoverable protocol error: it
+ * tells the client WHY with a transport-level error reply.
+ *
+ *   ERR_VERS  - the inbound rdma_vers was not 1; we report our supported version
+ *               range [vers_low, vers_high] = [1, 1] (words 5,6).  The recv path
+ *               sends this then closes the mismatched connection.
+ *   ERR_CHUNK - the chunk lists could not place the reply (over-inline reply with
+ *               no usable reply chunk; write-list read DDP boundary out of range).
+ *               Per-request: the connection stays up and the client may retry.
+ *
+ * Header layout (all big-endian XDR words, RFC 8166 4.4):
+ *   w0 rdma_xid    = echoed call xid (the ONLY peer-derived value)
+ *   w1 rdma_vers   = RPCRDMA_VERSION (1)
+ *   w2 rdma_credit = conn->sc_nrecv -- the credit we GRANT (posted recv depth),
+ *                    identical to svc_rdma_reply(); never the peer's offered
+ *                    credit.  Set once at accept time, never mutated, so reading
+ *                    it here without sc_lock is safe.
+ *   w3 rdma_proc   = RDMA_ERROR (4)
+ *   w4 rdma_err    = errcode (ERR_VERS | ERR_CHUNK)
+ *   ERR_VERS only:
+ *     w5 vers_low  = RPCRDMA_VERSION (1)
+ *     w6 vers_high = RPCRDMA_VERSION (1)
+ * Total: 5 words (20 bytes) for ERR_CHUNK, 7 words (28 bytes) for ERR_VERS --
+ * both well under SVC_RDMA_REPLY_LEN, so the fixed local buffer cannot overflow.
+ *
+ * UNTRUSTED PEER / LIFETIME.  The ONLY peer-derived datum is the 32-bit xid,
+ * echoed verbatim; every other word is our own fixed constant, and no peer
+ * length sizes the buffer.  The caller MUST pass a real xid that came from a
+ * header whose fixed prefix parsed (svc_rdma_parse_header stamped it); we NEVER
+ * build an RDMA_ERROR from an unparseable header.  The reply is built into a
+ * local stack buffer we own and handed to svc_rdma_conn_send(), which copies it
+ * into the bounded DMA send pool under the SAME SC_UP gate, free-list, and
+ * sc_sends quiescence barrier as every other reply -- the send buffer is
+ * reclaimed by svc_rdma_wc_send() (or the drained teardown) on completion, never
+ * here, so there is no UAF and no double-free.  Context: callable from the recv
+ * completion (IB_POLL_WORKQUEUE) and from a krpc pool thread holding a conn
+ * reference; it does not sleep.  A drop (pool exhausted / closing) is logged and
+ * ignored -- for ERR_VERS the close follows regardless; for ERR_CHUNK the
+ * client's RC retransmit recovers.
+ */
+static int
+svc_rdma_send_error(struct svc_rdma_conn *conn, uint32_t xid, uint32_t errcode)
+{
+	char err[RPCRDMA_HDR_FIXED + 3 * RPCRDMA_WORD];
+	char *p = err;
+	uint32_t len;
+	int rc;
+
+	be32enc(p +  0, xid);			/* w0  rdma_xid */
+	be32enc(p +  4, RPCRDMA_VERSION);	/* w1  rdma_vers */
+	be32enc(p +  8, (uint32_t)conn->sc_nrecv); /* w2 rdma_credit: posted depth */
+	be32enc(p + 12, RDMA_ERROR);		/* w3  rdma_proc */
+	be32enc(p + 16, errcode);		/* w4  rdma_err */
+	len = RPCRDMA_HDR_FIXED + RPCRDMA_WORD;	/* w0..w4 = 5 words = 20 bytes */
+	if (errcode == ERR_VERS) {
+		be32enc(p + 20, RPCRDMA_VERSION); /* w5  vers_low  = 1 */
+		be32enc(p + 24, RPCRDMA_VERSION); /* w6  vers_high = 1 */
+		len += 2 * RPCRDMA_WORD;		/* now 7 words = 28 bytes */
+	}
+
+	rc = svc_rdma_conn_send(conn, err, len);
+	if (rc != 0 && ppsratecheck(&svc_rdma_log_last, &svc_rdma_log_pps, 5)) {
+		if (rc == EBUSY)
+			printf("nfsrdma: send buffers exhausted, dropping "
+			    "RDMA_ERROR err=%u (xid=0x%08x)\n", errcode, xid);
+		else if (rc == ENOTCONN)
+			; /* connection tearing down; silent (expected) */
+		else
+			printf("nfsrdma: RDMA_ERROR err=%u post failed: %d "
+			    "(xid=0x%08x)\n", errcode, rc, xid);
+	}
+	return (rc);
+}
+
+/*
+ * Consumer-facing RDMA_ERROR entry point (the svo_conn_error op, TASK_028).  The
+ * krpc consumer (sys/rpc/svc_rdma.c) reaches this through the registered
+ * verbs-ops table when it cannot place a reply with the offered chunk lists and
+ * wants to report ERR_CHUNK keyed by the request's xid instead of dropping
+ * silently.  Thin wrapper over svc_rdma_send_error() so the consumer needs no
+ * knowledge of the wire header; it does NOT close the connection (ERR_CHUNK is a
+ * per-request error and the connection stays UP).  Declared extern in
+ * <rdma/svc_rdma.h>; OPTIONAL (krpc NULL-checks it at the call site and
+ * svc_rdma_register_verbs does not require it, so an older ibcore still loads and
+ * over-inline drops keep their prior behavior).
+ */
+int
+svc_rdma_conn_error(struct svc_rdma_conn *conn, uint32_t xid, uint32_t errcode)
+{
+
+	return (svc_rdma_send_error(conn, xid, errcode));
+}
+
+/*
  * Default consumer ops (TASK_003e-1) -- the in-tree self-test policy bound by
  * the plain vfs.nfsrdma.listen sysctl.  These preserve the exact 3d behavior so
  * the sysctl self-test path is unchanged when no external consumer is
@@ -5206,6 +5360,7 @@ static const struct svc_rdma_verbs_ops ibcore_verbs_ops = {
 	.svo_conn_get_ctx	= svc_rdma_conn_get_ctx,
 	.svo_conn_credits	= svc_rdma_conn_credits,
 	.svo_conn_peeraddr	= svc_rdma_conn_peeraddr,
+	.svo_conn_error		= svc_rdma_conn_error,
 };
 
 /*
