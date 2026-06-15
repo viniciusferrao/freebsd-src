@@ -4419,7 +4419,7 @@ nfsrv_docallback(struct nfsclient *clp, int procnum, nfsv4stateid_t *stateidp,
 		if ((nd->nd_flag & ND_NFSV41) != 0) {
 			KASSERT(sep != NULL, ("sep NULL"));
 			if (sep->sess_cbsess.nfsess_xprt != NULL &&
-			    sep->sess_cbsess.nfsess_xprt->xp_socket != NULL)
+			    sep->sess_cbsess.nfsess_xprt->xp_p2 != NULL)
 				error = newnfs_request(nd, NULL, clp,
 				    &clp->lc_req, NULL, NULL, cred,
 				    clp->lc_program, clp->lc_req.nr_vers, NULL,
@@ -4432,8 +4432,8 @@ nfsrv_docallback(struct nfsclient *clp, int procnum, nfsv4stateid_t *stateidp,
 				 * callback just after the nfsd threads were
 				 * terminated and restarted), OR the back channel
 				 * is a transport with no socket -- e.g. an
-				 * NFS-over-RDMA connection, whose server->client
-				 * callback path is not implemented.  Mark the
+				 * NFS-over-RDMA connection that is not bound
+				 * as a backchannel (xp_p2 == NULL).  Mark the
 				 * callback path down (ECONNREFUSED) rather than
 				 * dereferencing a NULL socket in newnfs_request;
 				 * the caller sets LCL_CBDOWN, which disables
@@ -4441,8 +4441,8 @@ nfsrv_docallback(struct nfsclient *clp, int procnum, nfsv4stateid_t *stateidp,
 				 * triggering OPEN/etc. proceed without callbacks.
 				 */
 				printf("nfsrv_docallback: no usable backchannel "
-				    "xprt (rdma backchannel callbacks "
-				    "unimplemented)\n");
+				    "xprt (no bound backchannel "
+				    "client)\n");
 				error = ECONNREFUSED;
 			}
 			NFSD_DEBUG(4, "aft newnfs_request=%d\n", error);

@@ -108,6 +108,7 @@
 
 #include <rpc/rpc.h>
 #include <rpc/rpc_com.h>
+#include <rpc/krpc.h>		/* clnt_bck_svccall + clnt_bck_rdma_send hook */
 
 #include <rdma/svc_rdma.h>	/* the shared cross-module contract */
 
@@ -929,6 +930,84 @@ svc_rdma_xprt_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 	return (TRUE);
 }
 
+/*
+ * svc_rdma_bck_send: send one NFSv4.1 backchannel CB RPC CALL (server->client
+ * callback, e.g. CB_NULL) over the SAME established RDMA QP, in the reverse
+ * direction of the forward NFS stream.  Reached only through the link-safe
+ * clnt_bck_rdma_send hook from clnt_bck_call (xp_socket == NULL).  mreq is the
+ * marshalled ONC RPC CALL whose first XDR word is the already-network-order
+ * xid (clnt_bck_call wrote htonl(xid) there and, on the RDMA path, prepended no
+ * TCP record mark); it is consumed (m_freem) here.
+ *
+ * This is the inline reply-send path of svc_rdma_xprt_reply above with a CALL
+ * body instead of a REPLY body: build the 7-word RFC 8166 RDMA_MSG transport
+ * header (w0 = the echoed ONC xid so the client's RPC-over-RDMA layer mirrors
+ * it and the clnt_bck_call reply matcher keys on the same value; w1 =
+ * RPCRDMA_VERSION; w2 = the real granted credit read from the live conn under
+ * xr_lock; w3 = RDMA_MSG; w4/w5/w6 = empty chunk lists -- a CB_NULL CALL is
+ * pure-inline), prepend it, then post under xr_lock against a stable xr_conn --
+ * the identical SF1 discipline as the forward reply (sro_disconnect NULLs
+ * xr_conn under the same lock after draining recv; svo_conn_send does not sleep
+ * and is safe under a leaf mutex).  Lock order xr_lock -> sc_lock is the
+ * existing forward-reply order; ct_lock is never held here (clnt_bck_call drops
+ * it before the send block), so no new lock order is introduced.  Returns 0, or
+ * ENOTCONN/EBUSY/EINVAL which clnt_bck_call maps to RPC_CANTSEND.
+ */
+static int
+svc_rdma_bck_send(SVCXPRT *xprt, struct mbuf *mreq)
+{
+	struct svc_rdma_xprt *xr = (struct svc_rdma_xprt *)xprt->xp_p1;
+	struct svc_rdma_conn *conn;
+	uint32_t hdr[7];
+	uint32_t netxid;
+	char *buf;
+	u_int rlen, total;
+	int rc;
+
+	rlen = m_length(mreq, NULL);
+	total = RPCRDMA_HDR_MIN + rlen;
+	if (total > SVC_RDMA_INLINE) {
+		m_freem(mreq);
+		return (EINVAL);		/* CB_NULL is tiny; never trips */
+	}
+
+	/* The ONC xid is word0 of mreq, already in network byte order. */
+	m_copydata(mreq, 0, sizeof(netxid), (caddr_t)&netxid);
+	hdr[0] = netxid;			/* w0 rdma_xid (echo, net order) */
+	hdr[1] = htonl(RPCRDMA_VERSION);	/* w1 rdma_vers */
+	hdr[2] = htonl(SVC_RDMA_CREDIT_GRANT);	/* w2 rdma_credit (fallback) */
+	hdr[3] = htonl(RDMA_MSG);		/* w3 rdma_proc */
+	hdr[4] = 0;				/* w4 read_list (empty) */
+	hdr[5] = 0;				/* w5 write_list (empty) */
+	hdr[6] = 0;				/* w6 reply_chunk (empty) */
+
+	buf = malloc(total, M_SVCRDMA, M_WAITOK);
+	memcpy(buf, hdr, RPCRDMA_HDR_MIN);
+	m_copydata(mreq, 0, rlen, buf + RPCRDMA_HDR_MIN);
+	m_freem(mreq);
+
+	mtx_lock(&xr->xr_lock);
+	conn = xr->xr_conn;
+	if (conn != NULL && svc_rdma_verbs != NULL) {
+		uint32_t credit = svc_rdma_verbs->svo_conn_credits(conn);
+
+		if (credit == 0)		/* defensive: never advertise 0 */
+			credit = SVC_RDMA_CREDIT_GRANT;
+		be32enc(buf + 8, credit);	/* w2 rdma_credit: real depth */
+		rc = svc_rdma_verbs->svo_conn_send(conn, buf, total);
+	} else
+		rc = ENOTCONN;
+	mtx_unlock(&xr->xr_lock);
+
+	free(buf, M_SVCRDMA);
+
+	if (rc != 0 && rc != ENOTCONN && ppsratecheck(&svc_rdma_log_last,
+	    &svc_rdma_log_pps, 5))
+		printf("svc_rdma: backchannel CALL post failed: %d "
+		    "(xid=0x%08x)\n", rc, ntohl(netxid));
+	return (rc);
+}
+
 static bool_t
 svc_rdma_xprt_control(SVCXPRT *xprt, const u_int rq, void *in)
 {
@@ -974,6 +1053,20 @@ svc_rdma_xprt_destroy(SVCXPRT *xprt)
 		mtx_destroy(&xr->xr_lock);
 		free(xr, M_SVCRDMA);
 		xprt->xp_p1 = NULL;
+	}
+	/*
+	 * Release the NFSv4.1 backchannel CLIENT bound at CREATE_SESSION
+	 * (nfs_nfsdstate.c:840 CLNT_ACQUIRE'd nr_client into xp_p2).  Runs on the
+	 * last SVC_RELEASE, after every recv completion has drained and after
+	 * sro_disconnect already CLNT_CLOSE'd it, so no clnt_bck_svccall can
+	 * still reference it.  Mirrors svc_vc_destroy (svc_vc.c:539,550).  The
+	 * session's own xprt reference is released separately by
+	 * nfsrv_freesession via SVC_RELEASE, so this is a distinct refcount and
+	 * not a double free.
+	 */
+	if (xprt->xp_p2 != NULL) {
+		CLNT_RELEASE((CLIENT *)xprt->xp_p2);
+		xprt->xp_p2 = NULL;
 	}
 	sx_destroy(&xprt->xp_lock);
 	svc_xprt_free(xprt);
@@ -1107,6 +1200,45 @@ svc_rdma_sro_recv(void *ctx, struct svc_rdma_conn *conn,
 
 	if (msg->rpc_len == 0)
 		return (0);	/* nothing to dispatch; repost */
+
+	/*
+	 * NFSv4.1 backchannel REPLY demux.  Forward NFS CALLs and the client's
+	 * server-originated callback (CB) REPLYs both arrive as inline RDMA_MSG
+	 * SENDs on this one recv ring; the RPC-over-RDMA transport header carries
+	 * no direction, so the direction lives in the INNER ONC RPC header at
+	 * word1 (offset +4 of the inline body; the xid is at +0): CALL == 0,
+	 * REPLY == 1 (rpc_msg.h).  When a backchannel CLIENT is bound
+	 * (xp_p2 != NULL) and this is a REPLY, route it to the krpc reply matcher
+	 * (clnt_bck_svccall) instead of dispatching it as a forward call -- the
+	 * RDMA analogue of svc_vc_recv's TCP demux, but here on the recv-
+	 * completion workqueue (an independent context from the nfsd pool thread
+	 * blocked in clnt_bck_call awaiting this reply), which guarantees the
+	 * reply's wakeup always has a runnable context and cannot deadlock on
+	 * pool-thread occupancy.
+	 *
+	 * MUST copy the bytes NOW: msg->rpc points into the verbs recv buffer,
+	 * which is reposted the instant this function returns, so an mbuf is
+	 * built with M_NOWAIT (we are in IB_POLL_WORKQUEUE context and MUST NOT
+	 * SLEEP) before the call.  clnt_bck_svccall takes only ct_lock + wakeup
+	 * (no sleep, no XDR decode, and it m_freem's an unmatched/late reply and
+	 * honors ct_closing itself), so it is safe here.  On copy-alloc failure
+	 * we drop and repost; the client/session layer retransmits.  We return
+	 * WITHOUT enqueueing to xr_mq or calling xprt_active -- a diverted reply
+	 * is never a forward call.  Use the symbolic REPLY enum, never a literal.
+	 */
+	if (msg->rpc_len >= 8 && xprt->xp_p2 != NULL &&
+	    be32dec((const char *)msg->rpc + 4) == REPLY) {
+		struct mbuf *rm;
+
+		rm = m_getm2(NULL, msg->rpc_len, M_NOWAIT, MT_DATA, M_PKTHDR);
+		if (rm == NULL)
+			return (0);	/* drop; client retransmits the CB */
+		m_copyback(rm, 0, msg->rpc_len, msg->rpc);
+		rm->m_pkthdr.len = msg->rpc_len;
+		clnt_bck_svccall(xprt->xp_p2, rm,
+		    be32dec((const char *)msg->rpc));
+		return (0);	/* matched (or freed) by the CB client; repost */
+	}
 
 	q = malloc(sizeof(*q), M_SVCRDMA, M_NOWAIT);
 	if (q == NULL)
@@ -1255,6 +1387,20 @@ svc_rdma_sro_disconnect(void *ctx, struct svc_rdma_conn *conn)
 	xr->xr_died = true;
 	mtx_unlock(&xr->xr_lock);
 
+	/*
+	 * Quiesce the NFSv4.1 backchannel CLIENT (if one is bound) AFTER xr_conn
+	 * is NULL: an in-flight CB send now drops with ENOTCONN, and CLNT_CLOSE
+	 * (clnt_bck_close) sets ct_closing so any late CB REPLY still arriving on
+	 * the draining recv ring hits the ct_closing guard in clnt_bck_svccall
+	 * and is m_freem'd rather than matched against state about to be freed.
+	 * Do NOT release or NULL xp_p2 here -- svc_rdma_xprt_destroy holds the
+	 * single CLNT_RELEASE, on the last SVC_RELEASE after all recv completions
+	 * have drained.  This runs in the sleepable deferred-teardown context
+	 * (svo_listen_stop / CM), so clnt_bck_close's msleep is legal.
+	 */
+	if (xprt->xp_p2 != NULL)
+		CLNT_CLOSE((CLIENT *)xprt->xp_p2);
+
 	/* Detach our back-pointer; conn is freed by the verbs layer after we
 	 * return, and must not be dereferenced again. */
 	svc_rdma_conn_set_ctx_wrap(conn, NULL);
@@ -1327,6 +1473,15 @@ svc_rdma_register_verbs(const struct svc_rdma_verbs_ops *ops)
 		return (EBUSY);
 	}
 	svc_rdma_verbs = ops;
+	/*
+	 * Arm the link-safe backchannel send hook (rpc/krpc.h, defined NULL in
+	 * rpc/clnt_bck.c) atomically with the verbs table under this lock, so
+	 * clnt_bck_call can drive an NFSv4.1 callback over an RDMA xprt only when
+	 * the OFED verbs table is live.  clnt_bck_call reaches svc_rdma_bck_send
+	 * solely through this pointer, so the always-compiled krpc never names an
+	 * OFED symbol.
+	 */
+	clnt_bck_rdma_send = svc_rdma_bck_send;
 	mtx_unlock(&svc_rdma_verbs_lock);
 
 	printf("svc_rdma(krpc): ibcore verbs registered\n");
@@ -1378,6 +1533,15 @@ svc_rdma_unregister_verbs(const struct svc_rdma_verbs_ops *ops)
 
 	mtx_lock(&svc_rdma_verbs_lock);
 	svc_rdma_verbs = NULL;
+	/*
+	 * Disarm the backchannel send hook atomically with the verbs table.
+	 * svo_listen_stop() above already delivered sro_disconnect for every
+	 * live conn (NULLing each xr_conn and CLNT_CLOSE'ing each xp_p2), so no
+	 * clnt_bck_call can still be mid-send; any future socket-less send now
+	 * falls back to ENOTCONN -> RPC_CANTSEND, and no stale pointer into this
+	 * (about-to-unload) module remains.
+	 */
+	clnt_bck_rdma_send = NULL;
 	svc_rdma_verbs_stopping = false;
 	mtx_unlock(&svc_rdma_verbs_lock);
 
