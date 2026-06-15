@@ -2685,6 +2685,18 @@ svc_rdma_write_free(struct svc_rdma_write_state *ws)
 
 	dev = (conn != NULL && conn->sc_id != NULL) ? conn->sc_id->device : NULL;
 
+	/*
+	 * Detach-before-free contract -- the cornerstone of the ABA
+	 * safety argued in svc_rdma_wc_rdma_write.  Every caller (the
+	 * completion one-shot, the pre-insert error paths, the drained
+	 * teardown) has already removed ws from sc_writes -- or never
+	 * inserted it -- and cleared ws_active before reaching here, so a
+	 * freed write is never on the registry for a stale or duplicate
+	 * completion to re-find.  A still-active (hence possibly still-
+	 * registered) write must never be freed.
+	 */
+	MPASS(!ws->ws_active);
+
 	if (ws->ws_src_mapped) {
 		if (dev != NULL)
 			ib_dma_unmap_single(dev, ws->ws_src_dma, ws->ws_srclen,
@@ -3065,6 +3077,15 @@ svc_rdma_wc_rdma_write(struct ib_cq *cq, struct ib_wc *wc)
 	mtx_unlock(&conn->sc_lock);
 	if (ws == NULL)
 		return;
+
+	/*
+	 * Registry coherence (defense in depth): the write we matched on
+	 * sc_writes was created for THIS conn (whose CQ delivered this
+	 * completion), so ws_conn must point back at conn.  A mismatch
+	 * would mean a clobbered ws_cqe/ws_conn or a cross-conn alias --
+	 * trip loudly under INVARIANTS rather than free the wrong state.
+	 */
+	MPASS(ws->ws_conn == conn);
 
 	if (wc->status != IB_WC_SUCCESS) {
 		if (wc->status != IB_WC_WR_FLUSH_ERR) {
