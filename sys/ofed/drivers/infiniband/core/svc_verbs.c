@@ -1434,11 +1434,13 @@ svc_rdma_parse_header(const void *buf, uint32_t len, struct svc_rdma_msg *out)
 	/*
 	 * word3: rdma_proc.  We decode chunk lists for RDMA_MSG and RDMA_NOMSG
 	 * (both carry the read/write/reply lists, RFC 8166 4.3); any other proc
-	 * (RDMA_MSGP/RDMA_DONE/RDMA_ERROR/unknown) is out of scope -> close.
+	 * (RDMA_MSGP/RDMA_DONE/RDMA_ERROR/unknown) is well-formed but not served:
+	 * EOPNOTSUPP -> close (RDMA_DONE belongs to the deprecated read-read model;
+	 * RDMA_ERROR is a server->client reply; none are valid client->server v1).
 	 */
 	proc = be32dec((const char *)buf + 12);
 	if (proc != RDMA_MSG && proc != RDMA_NOMSG)
-		return (EBADMSG);
+		return (EOPNOTSUPP);	/* well-formed v1 header, proc not served (RFC 8166) */
 
 	/* Initialize the bounded output; sub-decoders fill the counts. */
 	out->xid     = be32dec((const char *)buf + 0);	/* word0 */
@@ -1598,9 +1600,9 @@ svc_rdma_wc_recv(struct ib_cq *cq, struct ib_wc *wc)
 				    "xid=0x%08x, replying ERR_VERS and closing\n",
 				    msg.xid);
 			else if (rc == EOPNOTSUPP)
-				printf("nfsrdma: RPC-over-RDMA request exceeds "
-				    "chunk/segment caps, closing (%u bytes)\n",
-				    len);
+				printf("nfsrdma: unsupported RPC-over-RDMA "
+				    "request (proc or over fixed cap), closing "
+				    "(%u bytes)\n", len);
 			else
 				printf("nfsrdma: malformed RPC-over-RDMA header "
 				    "(%u bytes), closing\n", len);
