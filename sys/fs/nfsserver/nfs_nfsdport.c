@@ -220,6 +220,12 @@ static bool nfsrv_recalldeleg = false;
 SYSCTL_BOOL(_vfs_nfsd, OID_AUTO, recalldeleg, CTLFLAG_RW,
     &nfsrv_recalldeleg, 0,
     "When set remove/rename recalls delegations for same client");
+static int nfsrv_filesync_via_fsync = 1;
+SYSCTL_INT(_vfs_nfsd, OID_AUTO, filesync_via_fsync, CTLFLAG_RW,
+    &nfsrv_filesync_via_fsync, 0,
+    "For a FILE_SYNC/DATA_SYNC WRITE, do one async write plus one ranged "
+    "fsync of the written range (as NFS COMMIT does) instead of a "
+    "synchronous per-block write (IO_SYNC); preserves durability");
 
 /*
  * nfsrv_dsdirsize can only be increased and only when the nfsd threads are
@@ -1272,7 +1278,7 @@ nfsvno_write(struct vnode *vp, off_t off, int retlen, int *stable,
     struct mbuf *mp, char *cp, struct ucred *cred, struct thread *p)
 {
 	struct iovec *iv;
-	int cnt, ioflags, error;
+	int cnt, ioflags, error, dofsync;
 	struct uio io, *uiop = &io;
 	struct nfsheur *nh;
 
@@ -1287,9 +1293,34 @@ nfsvno_write(struct vnode *vp, off_t off, int retlen, int *stable,
 		return (error);
 	}
 
+	/*
+	 * A FILE_SYNC/DATA_SYNC WRITE must be durable before we reply.  The
+	 * traditional way is IO_SYNC, which makes ffs_write() do a synchronous
+	 * bwrite()+bufwait() for every file-system block -- e.g. 32 serial
+	 * device round-trips for a single 1MB write, which off-CPU profiling
+	 * showed dominates WRITE latency (~8ms/op) and caps O_DIRECT throughput
+	 * far below the backing store.  Instead, when nfsrv_filesync_via_fsync
+	 * is set, issue one async (delayed) write and then make the written
+	 * range durable with a single ranged fsync -- the exact work the NFS
+	 * COMMIT path (nfsvno_fsync) already performs.  This is durability-
+	 * equivalent to "UNSTABLE write immediately followed by COMMIT of the
+	 * same range", composed of two already-tested primitives; we report
+	 * success only after the fsync returns.  The vnode lock is held across
+	 * both, so no operation interleaves between the write and its flush.
+	 *
+	 * Only do this when the write fits the ranged-fsync fast path
+	 * (retlen <= MAX_COMMIT_COUNT); above that, nfsvno_fsync() falls back
+	 * to a whole-file VOP_FSYNC, which per-write would be O(file size).
+	 * For those (rare, only if srvmaxio is raised past MAX_COMMIT_COUNT)
+	 * keep the traditional synchronous per-block write.
+	 */
+	dofsync = 0;
 	if (*stable == NFSWRITE_UNSTABLE)
 		ioflags = IO_NODELOCKED;
-	else
+	else if (nfsrv_filesync_via_fsync && retlen <= MAX_COMMIT_COUNT) {
+		ioflags = IO_NODELOCKED;
+		dofsync = 1;
+	} else
 		ioflags = (IO_SYNC | IO_NODELOCKED);
 	error = nfsrv_createiovecw(retlen, mp, cp, &iv, &cnt);
 	if (error != 0)
@@ -1309,6 +1340,15 @@ nfsvno_write(struct vnode *vp, off_t off, int retlen, int *stable,
 	if (error == 0)
 		nh->nh_nextoff = uiop->uio_offset;
 	free(iv, M_TEMP);
+	/*
+	 * Durably commit just the written range for a stable write.  vp is
+	 * held LK_EXCLUSIVE here, the same lock state nfsvno_fsync expects on
+	 * the COMMIT path.  A failure here is reported as a write error (the
+	 * data is in the cache and the client will retry idempotently), which
+	 * is safer than acking a write we could not make durable.
+	 */
+	if (error == 0 && dofsync)
+		error = nfsvno_fsync(vp, off, retlen, cred, p);
 
 	NFSEXITCODE(error);
 	return (error);
