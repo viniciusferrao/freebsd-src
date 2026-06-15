@@ -248,6 +248,18 @@ struct svc_rdma_qent {
 	bool		sq_has_reply;
 	uint32_t	sq_xid;
 	struct svc_rdma_write_chunk sq_reply;
+	/*
+	 * Write-list carry (write-list READ engine).  If the request offered an
+	 * RFC 8166 WRITE list (a Linux NFS/RDMA client offers one for every READ,
+	 * to receive the read data by DDP -- no reply chunk), the FIRST write chunk
+	 * is captured here (RFC 8267 maps the single DDP-eligible READ result to one
+	 * write chunk).  Like sq_reply it is a pure value type, safe to copy past
+	 * the recv buffer's repost.  sq_has_writes distinguishes "no write list"
+	 * from a zeroed chunk.  xp_recv moves it (and sq_xid) into the pending table
+	 * so xp_reply can RDMA-Write the over-inline READ data into it.
+	 */
+	bool		sq_has_writes;
+	struct svc_rdma_write_chunk sq_writes;
 };
 STAILQ_HEAD(svc_rdma_qhead, svc_rdma_qent);
 
@@ -267,6 +279,24 @@ struct svc_rdma_reply_pend {
 	bool		rp_valid;
 	uint32_t	rp_xid;
 	struct svc_rdma_write_chunk rp_reply;
+	/*
+	 * Write-list READ engine carry.  rp_has_writes + rp_writes hold the
+	 * client's (single) write-list chunk for an over-inline READ reply.
+	 * rp_has_ddp + rp_ddp_off/rp_ddp_len hold the DDP boundary the nfsd READ
+	 * path supplied via SVC_CONTROL(SVCSET_READDDP) (offset of the read data
+	 * within the reply BODY, and its unpadded length).  Both are filled at
+	 * different times -- the write list in xp_recv from the qent, the DDP
+	 * boundary later from xp_control on the SAME xid's request thread -- and
+	 * both are consumed together by xp_reply.  rp_has_reply replaces the old
+	 * implicit "rp_valid means a reply chunk is present" meaning so an entry can
+	 * exist for a write-list-only READ.  All guarded by xr_lock.
+	 */
+	bool		rp_has_reply;
+	bool		rp_has_writes;
+	struct svc_rdma_write_chunk rp_writes;
+	bool		rp_has_ddp;
+	uint32_t	rp_ddp_off;
+	uint32_t	rp_ddp_len;
 };
 
 struct svc_rdma_xprt {
@@ -328,7 +358,8 @@ svc_rdma_drain_queue(struct svc_rdma_xprt *xr)
  */
 static void
 svc_rdma_reply_pend_insert(struct svc_rdma_xprt *xr, uint32_t xid,
-    const struct svc_rdma_write_chunk *reply)
+    bool has_reply, const struct svc_rdma_write_chunk *reply,
+    bool has_writes, const struct svc_rdma_write_chunk *writes)
 {
 	int i, free_slot = -1;
 
@@ -342,9 +373,55 @@ svc_rdma_reply_pend_insert(struct svc_rdma_xprt *xr, uint32_t xid,
 			free_slot = i;			/* remember first free */
 	}
 	if (free_slot >= 0) {
-		xr->xr_pend[free_slot].rp_valid = true;
-		xr->xr_pend[free_slot].rp_xid = xid;
-		xr->xr_pend[free_slot].rp_reply = *reply;
+		struct svc_rdma_reply_pend *p = &xr->xr_pend[free_slot];
+
+		p->rp_valid = true;
+		p->rp_xid = xid;
+		p->rp_has_reply = has_reply;
+		if (has_reply)
+			p->rp_reply = *reply;
+		p->rp_has_writes = has_writes;
+		if (has_writes)
+			p->rp_writes = *writes;
+		/*
+		 * The DDP boundary is filled LATER by svc_rdma_readddp_set() (from
+		 * xp_control on the request thread); start it cleared so a request
+		 * with no READ-DDP op never carries a stale boundary into xp_reply.
+		 */
+		p->rp_has_ddp = false;
+		p->rp_ddp_off = 0;
+		p->rp_ddp_len = 0;
+	}
+	mtx_unlock(&xr->xr_lock);
+}
+
+/*
+ * Record the DDP {off,len} boundary the nfsd READ path supplied via
+ * SVC_CONTROL(SVCSET_READDDP) into this xid's pending entry (write-list READ
+ * engine).  Runs on the request's pool thread between xp_recv (which inserted the
+ * entry) and xp_reply (which consumes it).  Sets the boundary on the FIRST READ
+ * for the xid only -- a COMPOUND with several DDP-eligible READs reduces just one
+ * result (RFC 8267), so later READs are ignored and fall back to inline.  If no
+ * pending entry exists (no write list was offered) this is a no-op: with no write
+ * chunk there is nowhere to DDP, so the boundary is irrelevant.  Guarded by
+ * xr_lock.
+ */
+static void
+svc_rdma_readddp_set(struct svc_rdma_xprt *xr, uint32_t xid, uint32_t off,
+    uint32_t len)
+{
+	int i;
+
+	mtx_lock(&xr->xr_lock);
+	for (i = 0; i < SVC_RDMA_REPLY_PEND; i++) {
+		if (xr->xr_pend[i].rp_valid && xr->xr_pend[i].rp_xid == xid) {
+			if (!xr->xr_pend[i].rp_has_ddp) {
+				xr->xr_pend[i].rp_has_ddp = true;
+				xr->xr_pend[i].rp_ddp_off = off;
+				xr->xr_pend[i].rp_ddp_len = len;
+			}
+			break;
+		}
 	}
 	mtx_unlock(&xr->xr_lock);
 }
@@ -357,7 +434,7 @@ svc_rdma_reply_pend_insert(struct svc_rdma_xprt *xr, uint32_t xid,
  */
 static bool
 svc_rdma_reply_pend_take(struct svc_rdma_xprt *xr, uint32_t xid,
-    struct svc_rdma_write_chunk *reply)
+    struct svc_rdma_reply_pend *out)
 {
 	int i;
 	bool found = false;
@@ -365,7 +442,7 @@ svc_rdma_reply_pend_take(struct svc_rdma_xprt *xr, uint32_t xid,
 	mtx_lock(&xr->xr_lock);
 	for (i = 0; i < SVC_RDMA_REPLY_PEND; i++) {
 		if (xr->xr_pend[i].rp_valid && xr->xr_pend[i].rp_xid == xid) {
-			*reply = xr->xr_pend[i].rp_reply;
+			*out = xr->xr_pend[i];	/* whole entry (value type) */
 			xr->xr_pend[i].rp_valid = false;
 			found = true;
 			break;
@@ -428,8 +505,10 @@ svc_rdma_xprt_recv(SVCXPRT *xprt, struct rpc_msg *msg,
 		 * it.  Done before freeing the qent.  A full table just means this
 		 * reply falls back to the inline-or-drop path -- never an over-write.
 		 */
-		if (q->sq_has_reply)
-			svc_rdma_reply_pend_insert(xr, q->sq_xid, &q->sq_reply);
+		if (q->sq_has_reply || q->sq_has_writes)
+			svc_rdma_reply_pend_insert(xr, q->sq_xid,
+			    q->sq_has_reply, &q->sq_reply,
+			    q->sq_has_writes, &q->sq_writes);
 		free(q, M_SVCRDMA);
 
 		/*
@@ -541,16 +620,17 @@ svc_rdma_xprt_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 {
 	struct svc_rdma_xprt *xr = (struct svc_rdma_xprt *)xprt->xp_p1;
 	struct svc_rdma_conn *conn;
-	struct svc_rdma_write_chunk reply;
+	struct svc_rdma_reply_pend pend;
 	struct mbuf *mrep;
 	char *buf;
 	XDR xdrs;
 	uint32_t hdr[7];
 	uint32_t seqval = 0;
 	u_int rlen, total;
+	u_int nfsreply_len = 0;
 	int rc;
 	bool_t stat = TRUE;
-	bool have_reply_chunk;
+	bool have_pend;
 
 	/*
 	 * Build the ONC RPC reply into a fresh pkthdr mbuf, mirroring
@@ -565,6 +645,15 @@ svc_rdma_xprt_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 		if (!xdr_replymsg(&xdrs, msg)) {
 			stat = FALSE;
 		} else {
+			/*
+			 * Capture the NFS reply body length BEFORE it is consumed
+			 * into the reply chain (write-list READ engine).  xdr_putmbuf
+			 * (xdrmbuf_putmbuf) tail-links the body verbatim, so the RPC
+			 * reply-header length is (rlen - nfsreply_len) and the DDP
+			 * read-data offset within the marshalled reply is that header
+			 * length + the body-relative offset nfsd recorded.
+			 */
+			nfsreply_len = m_length(m, NULL);
 			(void)xdr_putmbuf(&xdrs, m);
 			m = NULL;	/* body now owned by the reply chain */
 		}
@@ -602,7 +691,7 @@ svc_rdma_xprt_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 	 * only on the over-inline path below; if the reply fits inline we simply drop
 	 * the (taken) chunk and reply inline, which RFC 8166 permits.
 	 */
-	have_reply_chunk = svc_rdma_reply_pend_take(xr, msg->rm_xid, &reply);
+	have_pend = svc_rdma_reply_pend_take(xr, msg->rm_xid, &pend);
 
 	/*
 	 * INLINE bound.  RPCRDMA_HDR_MIN + reply must fit one inline send buffer.  A
@@ -615,7 +704,85 @@ svc_rdma_xprt_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 	 * exceeds the offered chunk, which we treat as the same drop.
 	 */
 	if (total > SVC_RDMA_REPLY_INLINE) {
-		if (have_reply_chunk) {
+		/*
+		 * Write-list READ engine (RFC 8166 reduction).  An over-inline READ
+		 * whose data is DDP-eligible into the client's write list: the request
+		 * offered a write list (captured at recv) AND the nfsd READ path
+		 * stamped the DDP boundary {off,len} via SVCSET_READDDP.  RDMA-Write
+		 * the read data into the write list and SEND a reduced RDMA_MSG
+		 * instead of dropping.  The data sits at rpchdr + ddp_off within mrep,
+		 * where rpchdr = rlen - nfsreply_len.  The read data mbuf was XDR
+		 * round-up padded by nfsvno_read (NFSM_RNDUP(cnt)), so the inline
+		 * reduced body must excise the PADDED span [doff, doff+padded) while
+		 * the write list receives exactly ddp_len (unpadded) bytes (RFC 8166
+		 * 3.4.5).  Bounds-check the padded window against the marshalled reply
+		 * before trusting it; a failed bound falls through to the existing
+		 * reply-chunk / drop path.  Strictly prefer this over the reply-chunk
+		 * path: a READ never offers a reply chunk.
+		 */
+		if (have_pend && pend.rp_has_writes && pend.rp_has_ddp &&
+		    pend.rp_ddp_len > 0 && svc_rdma_verbs != NULL &&
+		    svc_rdma_verbs->svo_conn_write_list != NULL) {
+			u_int hdrbytes = rlen - nfsreply_len;
+			u_int doff = hdrbytes + pend.rp_ddp_off;
+			u_int dlen = pend.rp_ddp_len;
+			u_int padded = (dlen + 3u) & ~3u;
+			u_int reducedlen;
+			char *data, *reduced;
+
+			if (nfsreply_len <= rlen && padded <= rlen &&
+			    doff <= rlen - padded) {
+				/*
+				 * data: the unpadded read bytes for the RDMA Write.
+				 * reduced: the inline body with [doff, doff+padded)
+				 * removed (the data AND its XDR pad) -- head [0,doff)
+				 * ++ tail [doff+padded, rlen).
+				 */
+				reducedlen = rlen - padded;
+				data = malloc(dlen, M_SVCRDMA, M_WAITOK);
+				reduced = malloc(reducedlen, M_SVCRDMA, M_WAITOK);
+				m_copydata(mrep, doff, dlen, data);
+				if (doff > 0)
+					m_copydata(mrep, 0, doff, reduced);
+				if (rlen > doff + padded)
+					m_copydata(mrep, doff + padded,
+					    rlen - (doff + padded),
+					    reduced + doff);
+				m_freem(mrep);
+
+				mtx_lock(&xr->xr_lock);
+				conn = xr->xr_conn;
+				if (conn != NULL && svc_rdma_verbs != NULL &&
+				    svc_rdma_verbs->svo_conn_write_list != NULL) {
+					rc = svc_rdma_verbs->svo_conn_write_list(
+					    conn, msg->rm_xid, &pend.rp_writes,
+					    data, dlen, reduced, reducedlen);
+					if (rc == 0)
+						seqval = ++xr->xr_seq;
+				} else
+					rc = ENOTCONN;
+				mtx_unlock(&xr->xr_lock);
+
+				free(data, M_SVCRDMA);
+				free(reduced, M_SVCRDMA);
+
+				if (rc != 0) {
+					if (rc != ENOTCONN &&
+					    ppsratecheck(&svc_rdma_log_last,
+					    &svc_rdma_log_pps, 5))
+						printf("svc_rdma: write-list "
+						    "READ post failed: %d "
+						    "(xid=0x%08x, %u bytes)\n",
+						    rc, msg->rm_xid, dlen);
+					return (FALSE);
+				}
+				if (seq != NULL)
+					*seq = seqval;
+				return (TRUE);
+			}
+			/* boundary out of range: fall through to reply-chunk/drop. */
+		}
+		if (have_pend && pend.rp_has_reply) {
 			/*
 			 * Linearize the marshalled ONC RPC reply ALONE (no RFC 8166
 			 * header -- the verbs layer builds the RDMA_NOMSG header).  Post
@@ -631,7 +798,7 @@ svc_rdma_xprt_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 			if (conn != NULL && svc_rdma_verbs != NULL &&
 			    svc_rdma_verbs->svo_conn_reply_chunk != NULL) {
 				rc = svc_rdma_verbs->svo_conn_reply_chunk(conn,
-				    msg->rm_xid, &reply, buf, rlen);
+				    msg->rm_xid, &pend.rp_reply, buf, rlen);
 				if (rc == 0)
 					seqval = ++xr->xr_seq;
 			} else
@@ -725,8 +892,30 @@ svc_rdma_xprt_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 static bool_t
 svc_rdma_xprt_control(SVCXPRT *xprt, const u_int rq, void *in)
 {
+	struct svc_rdma_xprt *xr = (struct svc_rdma_xprt *)xprt->xp_p1;
+	const struct svcxprt_readddp *rd;
 
-	return (FALSE);
+	switch (rq) {
+	case SVCSET_READDDP:
+		/*
+		 * The nfsd READ path located the DDP-eligible read data within the
+		 * reply body it is building (write-list READ engine).  Stamp the
+		 * {off,len} onto this xid's pending entry (created at recv when a
+		 * write list was offered); xp_reply consumes it to RDMA-Write the
+		 * data into the client's write chunk and send a reduced reply.  No
+		 * write list -> no pending entry -> silent no-op (the reply falls
+		 * back to inline / drop).  Unknown commands keep the FALSE no-op.
+		 */
+		if (xr == NULL || in == NULL)
+			return (FALSE);
+		rd = (const struct svcxprt_readddp *)in;
+		if (rd->rd_len == 0)
+			return (FALSE);
+		svc_rdma_readddp_set(xr, rd->rd_xid, rd->rd_off, rd->rd_len);
+		return (TRUE);
+	default:
+		return (FALSE);
+	}
 }
 
 /*
@@ -901,10 +1090,20 @@ svc_rdma_sro_recv(void *ctx, struct svc_rdma_conn *conn,
 	 * the ONC RPC xid so xp_reply (a later pool thread) can find it.
 	 */
 	q->sq_has_reply = msg->reply_present;
-	if (msg->reply_present) {
+	/*
+	 * Capture the FIRST write-list chunk too (write-list READ engine): a READ
+	 * offers a write list (not a reply chunk) to receive its data by DDP.
+	 * msg->writes is a pure value type, safe to copy here.  RFC 8267 maps the
+	 * single DDP-eligible READ result to one write chunk, so we carry
+	 * writes[0] only.  sq_xid is set whenever EITHER list is present.
+	 */
+	q->sq_has_writes = (msg->wr_nchunks > 0);
+	if (msg->reply_present || q->sq_has_writes)
 		q->sq_xid = msg->xid;
+	if (msg->reply_present)
 		q->sq_reply = msg->reply;
-	}
+	if (q->sq_has_writes)
+		q->sq_writes = msg->writes[0];
 
 	mtx_lock(&xr->xr_lock);
 	STAILQ_INSERT_TAIL(&xr->xr_mq, q, sq_link);
@@ -962,6 +1161,13 @@ svc_rdma_sro_recv_mbuf(void *ctx, struct svc_rdma_conn *conn, struct mbuf *m,
 	 * sro_recv: msg->reply is a pure value type, safe to copy by value).
 	 */
 	q->sq_has_reply = has_reply;
+	/*
+	 * The RDMA-Read-assembled NFS WRITE path has no outbound write list to
+	 * carry (the read list it consumed is inbound), so there is nothing to
+	 * capture for the write-list READ engine.  q is M_NOWAIT (not M_ZERO), so
+	 * sq_has_writes MUST be explicitly cleared here.
+	 */
+	q->sq_has_writes = false;
 	if (has_reply) {
 		q->sq_xid = xid;
 		q->sq_reply = *reply;
