@@ -83,6 +83,7 @@
 #include <sys/kernel.h>		/* SYSUNINIT, bootverbose */
 #include <sys/lock.h>
 #include <sys/malloc.h>		/* malloc/free, MALLOC_DEFINE */
+#include <sys/mbuf.h>		/* zero-copy read-sink mbuf assembly (TASK_003f-3) */
 #include <sys/mutex.h>
 #include <sys/queue.h>		/* TAILQ: per-listener connection registry */
 #include <sys/socket.h>
@@ -399,6 +400,30 @@ struct svc_rdma_read_state {
 	struct ib_rdma_wr	 rs_wr[SVC_RDMA_MAX_READ_SEGS];
 	struct ib_sge		 rs_sge[SVC_RDMA_MAX_READ_SEGS];
 };
+
+/*
+ * mbuf ext_free for the read sink (TASK_003f-3).  The mbuf carries the sink
+ * buffer pointer DIRECTLY as ext_arg1; this callback runs at refcount->0
+ * (EXT_DISPOSABLE -> fires exactly once) and frees ONLY that PLAIN CPU MEMORY.
+ *
+ * CRITICAL: the sink mbuf is nfsd-owned and OUTLIVES the conn -- it can be freed
+ * long after svc_rdma_conn_free_verbs has run rdma_destroy_id(sc_id), which
+ * RELEASES the ib_device.  Therefore this callback MUST NOT touch the device:
+ * the DMA mapping is torn down in svc_rdma_wc_rdma_read (Review fix (b)), while
+ * the conn and device are provably alive (the completion runs on this conn's CQ),
+ * leaving the mbuf owning plain memory only.  No ib_device, no dma cookie here ->
+ * no device use-after-free on DEVICE_REMOVAL / HCA kldunload.  free() never
+ * sleeps or takes sc_lock/xr_lock, so the callback adds no lock-order edge and
+ * cannot deadlock the teardown.
+ */
+static void
+svc_rdma_read_extfree(struct mbuf *m)
+{
+	void *buf = m->m_ext.ext_arg1;
+
+	if (buf != NULL)
+		free(buf, M_NFSRDMA);
+}
 
 /*
  * Durable outbound-write state (TASK_003f-4) -- the OUTBOUND data path's analogue
@@ -1911,6 +1936,42 @@ svc_rdma_read_start(struct svc_rdma_conn *conn, struct svc_rdma_recv *rr,
 		}
 	}
 	mtx_unlock(&conn->sc_lock);
+	/*
+	 * RE-STOCK an evacuated slot (TASK_003f-3, Edit 7).  A prior zero-copy
+	 * detach handed this slot's buffer to an mbuf and left rb_buf == NULL
+	 * (rb_mapped == false).  Re-stock it lazily here -- OFF the latency path
+	 * (the read that evacuated it already completed) and OUTSIDE sc_lock so the
+	 * contigmalloc/map does not nest the DMA lock under sc_lock (the same
+	 * lock-order discipline svc_rdma_read_free relies on).  On failure, return
+	 * the slot to the pool and fall through to the per-read fallback alloc.
+	 */
+	if (rs->rs_rb != NULL && rs->rs_rb->rb_buf == NULL) {
+		struct svc_rdma_readbuf *rb = rs->rs_rb;
+		void *nbuf;
+		u64 ndma;
+
+		nbuf = contigmalloc(SVC_RDMA_MAX_READ, M_NFSRDMA, M_NOWAIT, 0,
+		    ~(vm_paddr_t)0, PAGE_SIZE, 0);
+		if (nbuf != NULL) {
+			ndma = ib_dma_map_single(dev, nbuf, SVC_RDMA_MAX_READ,
+			    DMA_FROM_DEVICE);
+			if (ib_dma_mapping_error(dev, ndma)) {
+				free(nbuf, M_NFSRDMA);
+				nbuf = NULL;
+			}
+		}
+		if (nbuf == NULL) {
+			/* Re-stock failed: release the slot, take the fallback. */
+			mtx_lock(&conn->sc_lock);
+			rb->rb_inuse = false;
+			mtx_unlock(&conn->sc_lock);
+			rs->rs_rb = NULL;
+		} else {
+			rb->rb_buf = nbuf;
+			rb->rb_dma = ndma;
+			rb->rb_mapped = true;
+		}
+	}
 	if (rs->rs_rb != NULL) {
 		rs->rs_buf = rs->rs_rb->rb_buf;
 		rs->rs_dma = rs->rs_rb->rb_dma;
@@ -2064,6 +2125,61 @@ svc_rdma_read_start(struct svc_rdma_conn *conn, struct svc_rdma_recv *rr,
 }
 
 /*
+ * Hand the read sink to the zero-copy mbuf (TASK_003f-3).  Transfers ownership of
+ * the DMA'd destination buffer + its mapping out of rr_rs and into the bufp/dmap
+ * out-params; the caller unmaps it (in the completion, device alive) and wraps the
+ * resulting plain-memory buffer in an EXT_DISPOSABLE mbuf.  *maplenp returns the
+ * length the buffer was MAPPED at, so the caller's ib_dma_unmap_single matches the
+ * original map exactly: SVC_RDMA_MAX_READ for a POOLED buffer (the pool maps every
+ * slot at SVC_RDMA_MAX_READ at accept time), rs_total for the per-read FALLBACK
+ * buffer (mapped at rs_total in read_start).  For a POOLED sink the slot is
+ * EVACUATED (rb_buf=NULL, rb_dma=0, rb_mapped=false, rb_inuse=false, rs_rb=NULL)
+ * so the pool no longer owns that buffer; svc_rdma_read_start re-stocks the empty
+ * slot lazily (Edit 7).  rs_buf/rs_dma/rs_mapped are cleared unconditionally, so
+ * the subsequent svc_rdma_read_free becomes a no-op for the SINK (it still frees
+ * rs_head).  Done under sc_lock so the slot/rr_rs fields flip atomically against a
+ * concurrent read_free / teardown.  Caller holds NO lock.
+ */
+static void
+svc_rdma_read_sink_detach(struct svc_rdma_conn *conn,
+    struct svc_rdma_read_state *rs, void **bufp, u64 *dmap, uint32_t *maplenp)
+{
+	mtx_lock(&conn->sc_lock);
+	if (rs->rs_rb != NULL) {
+		*bufp = rs->rs_rb->rb_buf;
+		*dmap = rs->rs_rb->rb_dma;
+		*maplenp = SVC_RDMA_MAX_READ;	/* pool slot mapped at MAX_READ */
+		rs->rs_rb->rb_buf = NULL;	/* evacuated: pool no longer owns it */
+		rs->rs_rb->rb_dma = 0;
+		rs->rs_rb->rb_mapped = false;
+		rs->rs_rb->rb_inuse = false;	/* slot free to be re-stocked */
+		rs->rs_rb = NULL;
+	} else {
+		*bufp = rs->rs_buf;
+		*dmap = rs->rs_dma;
+		*maplenp = rs->rs_total;	/* fallback mapped at rs_total */
+	}
+	rs->rs_buf = NULL;
+	rs->rs_dma = 0;
+	rs->rs_mapped = false;		/* read_free now unmaps/frees nothing for the sink */
+	mtx_unlock(&conn->sc_lock);
+}
+
+/*
+ * Alloc-failure unwind for a DETACHED sink that no mbuf took ownership of.  The
+ * caller already unmapped the sink (in svc_rdma_wc_rdma_read, right after detach
+ * and BEFORE the extref/mbuf alloc), so this is now plain CPU memory: just free
+ * it, exactly once.  No device touch here (and none possible -- the mapping is
+ * already gone), matching svc_rdma_read_extfree.
+ */
+static void
+svc_rdma_read_sink_free_detached(void *buf)
+{
+	if (buf != NULL)
+		free(buf, M_NFSRDMA);
+}
+
+/*
  * Release the durable read state for a recv: unmap+free the server destination
  * buffer and free the inline-head copy, EXACTLY ONCE.  RECLAIM IS DRIVEN BY THE
  * idempotent rs_mapped (unmap) and rs_buf/rs_head != NULL (free) tokens -- the
@@ -2178,8 +2294,6 @@ svc_rdma_wc_rdma_read(struct ib_cq *cq, struct ib_wc *wc)
 	struct svc_rdma_read_state *rs;
 	struct svc_rdma_recv *rr;
 	struct svc_rdma_conn *conn;
-	struct svc_rdma_msg dispatch;
-	char *body;
 	uint32_t pos, bodylen;
 	int rc;
 	bool ready, first;
@@ -2250,80 +2364,165 @@ svc_rdma_wc_rdma_read(struct ib_cq *cq, struct ib_wc *wc)
 	    rs->rs_total, DMA_FROM_DEVICE);
 
 	/*
-	 * Assemble in place: rs_buf currently holds [read_data] of rs_total bytes.
-	 * We need [head[0,pos)][read_data][head[pos,headlen)].  Rather than grow
-	 * rs_buf, build the assembled body in a fresh allocation sized to the
-	 * bounded bodylen.  M_NOWAIT (completion context): on failure drop the call
-	 * (free state + repost; the RC client retransmits) rather than block.
+	 * ZERO-COPY ASSEMBLE (TASK_003f-3).  rs_buf (the read sink) holds [read_data]
+	 * of rs_total bytes, already DMA-synced for the CPU above.  Instead of
+	 * malloc(bodylen) + 3 memcpy + a second copy in sro_recv, build an mbuf chain
+	 *     mhead(head[0,pos)) -> mext(EXT_DISPOSABLE sink) -> [mt(head[pos,headlen))]
+	 * where mext wraps the DMA'd sink as external storage owned by its own
+	 * ext_free (svc_rdma_read_extfree); only the two small (<=4 KiB) head fragments
+	 * are copied.  Ownership of the sink TRANSFERS to mext via m_extadd, so after
+	 * detach the verbs teardown never touches it (see svc_rdma_read_sink_detach).
+	 *
+	 * All allocations are M_NOWAIT (completion context); on ANY failure we drop the
+	 * call (the RC client retransmits) and free EXACTLY the sink/chain we hold --
+	 * never twice, never zero.  m_getm2 pre-sizes each head fragment so the
+	 * internally-M_NOWAIT m_copyback cannot SILENTLY TRUNCATE on extend.
 	 */
-	body = malloc(bodylen, M_NFSRDMA, M_NOWAIT);
-	if (body == NULL) {
-		if (ppsratecheck(&svc_rdma_log_last, &svc_rdma_log_pps, 5))
-			printf("nfsrdma: RDMA Read assemble alloc failed, "
-			    "dropping call\n");
+	{
+		struct mbuf *mhead, *mext, *mt;
+		struct svc_rdma_write_chunk reply = { 0 };
+		void *sinkbuf;
+		u64 sinkdma;
+		uint32_t sinkmaplen, xid = 0;
+		bool has_reply = false;
+
+		/*
+		 * Take the sink out of rr_rs (locals only from here), then UNMAP it
+		 * IMMEDIATELY while conn + device are provably alive (this completion
+		 * runs on this conn's CQ).  The data is already CPU-coherent from the
+		 * ib_dma_sync_single_for_cpu above, so after the unmap the sink is plain
+		 * CPU memory.  Review fix (b): the mbuf must own NO device handle -- it
+		 * outlives the conn, and a later ext_free touching a device released by
+		 * rdma_destroy_id() at teardown would be a use-after-free.  Unmap LENGTH
+		 * = sinkmaplen, the length the buffer was originally mapped at.
+		 */
+		svc_rdma_read_sink_detach(conn, rs, &sinkbuf, &sinkdma, &sinkmaplen);
+		ib_dma_unmap_single(conn->sc_id->device, sinkdma, sinkmaplen,
+		    DMA_FROM_DEVICE);
+
+		/* The EXT segment over the (now plain-memory) sink. */
+		mext = m_get(M_NOWAIT, MT_DATA);
+		if (mext == NULL) {
+			/* No mbuf took the sink yet: free the plain buffer, once. */
+			svc_rdma_read_sink_free_detached(sinkbuf);
+			svc_rdma_read_free(conn, rr);	/* frees rs_head */
+			svc_rdma_repost(conn, rr);
+			return;
+		}
+
+		/*
+		 * EXT_DISPOSABLE wraps the plain sink buffer as external storage; the
+		 * buffer pointer is carried DIRECTLY as ext_arg1 and svc_rdma_read_extfree
+		 * frees it.  flags=0: EXT_DISPOSABLE already selects the embedded-refcount
+		 * branch internally (so ext_free fires EXACTLY ONCE at refcount->0, even
+		 * if nfsd m_copym's the chain -- m_dupcl shadows the EMBREF), and passing
+		 * EXT_FLAG_EMBREF in `flags` would wrongly OR a bit into m_flags.  From
+		 * this point the sink is owned by mext; freeing mext (directly or via
+		 * m_freem of any chain containing it) releases the sink via ext_free.
+		 */
+		m_extadd(mext, (char *)sinkbuf, rs->rs_total,
+		    svc_rdma_read_extfree, sinkbuf, NULL, 0, EXT_DISPOSABLE);
+		mext->m_len = rs->rs_total;
+
+		/*
+		 * head[0,pos): the chain head, carries the pkthdr.  Pre-size with
+		 * m_getm2 (>= pos bytes, never less than a pkthdr mbuf) so m_copyback
+		 * cannot truncate the <=4 KiB head copy.
+		 */
+		mhead = m_getm2(NULL, pos, M_NOWAIT, MT_DATA, M_PKTHDR);
+		if (mhead == NULL) {
+			m_freem(mext);		/* releases sink via ext_free, once */
+			svc_rdma_read_free(conn, rr);
+			svc_rdma_repost(conn, rr);
+			return;
+		}
+		if (pos != 0)
+			m_copyback(mhead, 0, pos, rs->rs_head);
+		mhead->m_next = mext;
+
+		/* head[pos,headlen): the post-splice tail, if any. */
+		if (rs->rs_headlen > pos) {
+			uint32_t tlen = rs->rs_headlen - pos;
+
+			mt = m_getm2(NULL, tlen, M_NOWAIT, MT_DATA, 0);
+			if (mt == NULL) {
+				/* mhead owns mext (and thus the sink): one m_freem. */
+				m_freem(mhead);
+				svc_rdma_read_free(conn, rr);
+				svc_rdma_repost(conn, rr);
+				return;
+			}
+			m_copyback(mt, 0, tlen, rs->rs_head + pos);
+			mext->m_next = mt;
+		}
+		mhead->m_pkthdr.len = bodylen;
+
+		/*
+		 * Capture the reply-chunk identity into LOCALS BEFORE read_free
+		 * (stale-read hardening, review NIT): rs_msg is durable storage in rr
+		 * that read_free does not currently touch, but reading it after the
+		 * reclaim is fragile -- snapshot it now and pass the locals below.
+		 */
+		xid = rs->rs_msg.xid;
+		has_reply = rs->rs_msg.reply_present;
+		if (has_reply)
+			reply = rs->rs_msg.reply;	/* pure value copy */
+
+		/* rs_head is copied into the small mbufs; the sink already detached. */
 		svc_rdma_read_free(conn, rr);
+
+		/*
+		 * Dispatch the assembled chain under the SAME readiness gate +
+		 * sc_upcalls barrier as the inline path.  EVERY branch that did
+		 * sc_upcalls++ balances it with --sc_upcalls + wakeup under sc_lock
+		 * (a leak hangs teardown forever), and the chain is freed EXACTLY
+		 * once: sro_recv_mbuf takes ownership on return 0 (we must NOT free),
+		 * and on every other outcome we m_freem(mhead) ourselves.
+		 *
+		 * REPOST AT COMPLETION (the original placement -- Edit 6 reverted).
+		 * rr_buf is NOT reposted until this completion fully returns, so the
+		 * single-owner rr_rs invariant holds (svc_verbs.c "One posted receive
+		 * buffer" note): no new call can land on rr_buf or touch rr_rs while a
+		 * read is in flight.  We repost on the normal-completion exits
+		 * (dispatch-success AND not-ready/no-consumer), but NOT on the
+		 * consumer-reject path (it closes the conn; the teardown owns rr_buf).
+		 */
+		mtx_lock(&conn->sc_lock);
+		ready = (conn->sc_state == SC_UP && conn->sc_newconn_done);
+		if (ready)
+			conn->sc_upcalls++;
+		mtx_unlock(&conn->sc_lock);
+
+		if (ready && conn->sc_ops != NULL &&
+		    conn->sc_ops->sro_recv_mbuf != NULL) {
+			rc = conn->sc_ops->sro_recv_mbuf(conn->sc_ctx, conn,
+			    mhead, xid, has_reply, &reply);
+			mtx_lock(&conn->sc_lock);
+			if (--conn->sc_upcalls == 0)
+				wakeup(&conn->sc_upcalls);
+			mtx_unlock(&conn->sc_lock);
+			if (rc != 0) {
+				/* Consumer rejected: it did NOT take the chain. */
+				m_freem(mhead);
+				svc_rdma_conn_close(conn);
+				return;		/* closing: do NOT repost */
+			}
+			/* On rc == 0 the consumer owns mhead; do not touch it. */
+		} else {
+			/* Not ready / no consumer: we still own the chain. */
+			m_freem(mhead);
+			if (ready) {
+				mtx_lock(&conn->sc_lock);
+				if (--conn->sc_upcalls == 0)
+					wakeup(&conn->sc_upcalls);
+				mtx_unlock(&conn->sc_lock);
+			}
+		}
+
+		/* Normal completion: repost rr_buf for the next call (original). */
 		svc_rdma_repost(conn, rr);
 		return;
 	}
-	if (pos != 0)
-		memcpy(body, rs->rs_head, pos);
-	memcpy(body + pos, rs->rs_buf, rs->rs_total);
-	if (rs->rs_headlen > pos)
-		memcpy(body + pos + rs->rs_total, rs->rs_head + pos,
-		    rs->rs_headlen - pos);
-
-	/*
-	 * Dispatch the assembled body to the consumer under the SAME readiness gate
-	 * + sc_upcalls barrier as the inline path.  The synthetic svc_rdma_msg
-	 * carries the durable xid/credit/proc and the assembled body as rpc/rpc_len
-	 * (the consumer copies it into an mbuf in sro_recv -- exactly as for an
-	 * inline call -- so nfsd sees the complete NFS WRITE).  ready guarantees
-	 * sro_newconn completed and the conn is SC_UP.  We drop the sc_upcalls
-	 * refcount before acting on the result (a close enqueues a teardown whose
-	 * barrier waits sc_upcalls == 0).
-	 */
-	dispatch = rs->rs_msg;
-	dispatch.rpc = body;
-	dispatch.rpc_len = bodylen;
-	/* The body is now self-contained; the consumer sees no chunk lists. */
-	dispatch.rd_nchunks = 0;
-	dispatch.wr_nchunks = 0;
-	dispatch.reply_present = false;
-	dispatch.rdma_proc = RDMA_MSG;
-
-	mtx_lock(&conn->sc_lock);
-	ready = (conn->sc_state == SC_UP && conn->sc_newconn_done);
-	if (ready)
-		conn->sc_upcalls++;
-	mtx_unlock(&conn->sc_lock);
-
-	rc = 0;
-	if (ready) {
-		if (conn->sc_ops != NULL && conn->sc_ops->sro_recv != NULL)
-			rc = conn->sc_ops->sro_recv(conn->sc_ctx, conn,
-			    &dispatch);
-		mtx_lock(&conn->sc_lock);
-		if (--conn->sc_upcalls == 0)
-			wakeup(&conn->sc_upcalls);
-		mtx_unlock(&conn->sc_lock);
-	}
-
-	free(body, M_NFSRDMA);
-
-	/*
-	 * Done with the read: free the durable state.  We are the first (and only)
-	 * completion (rs_active was test-and-cleared at the top), so this is the
-	 * sole normal-completion reclaimer; svc_rdma_read_free is idempotent on
-	 * rs_mapped/rs_buf so even a racing drained teardown reclaim is a no-op.
-	 * Then either close (consumer rejected) or repost rr_buf for the next call.
-	 */
-	svc_rdma_read_free(conn, rr);
-
-	if (rc != 0) {
-		svc_rdma_conn_close(conn);
-		return;
-	}
-	svc_rdma_repost(conn, rr);
 }
 
 /*

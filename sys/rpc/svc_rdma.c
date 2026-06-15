@@ -922,6 +922,61 @@ svc_rdma_sro_recv(void *ctx, struct svc_rdma_conn *conn,
 }
 
 /*
+ * sro_recv_mbuf: zero-copy variant of sro_recv for the RDMA-Read-assembled NFS
+ * WRITE path (TASK_003f-3).  Same IB_POLL_WORKQUEUE context and MUST-NOT-SLEEP
+ * rule as sro_recv, same sro_newconn-happened-before guarantee.  m is a COMPLETE
+ * ONC RPC call already assembled by the verbs layer as an mbuf chain (small head
+ * fragments bracketing one EXT_DISPOSABLE segment over the DMA'd read sink); we
+ * enqueue it with NO copy (no m_getm2/m_copyback of the body).  On return 0
+ * ownership of m transfers to us (drained via xr_mq / svc_rdma_drain_queue);
+ * on any drop we m_freem(m) here, which runs the verbs-layer ext_free and
+ * releases the read sink.  reply is a pure value type captured iff has_reply.
+ */
+static int
+svc_rdma_sro_recv_mbuf(void *ctx, struct svc_rdma_conn *conn, struct mbuf *m,
+    uint32_t xid, bool has_reply, const struct svc_rdma_write_chunk *reply)
+{
+	SVCXPRT *xprt = svc_rdma_conn_get_ctx_wrap(conn);
+	struct svc_rdma_xprt *xr;
+	struct svc_rdma_qent *q;
+
+	if (xprt == NULL) {	/* newconn must have run first (header contract) */
+		m_freem(m);	/* runs ext_free -> releases the read sink */
+		return (0);
+	}
+	xr = (struct svc_rdma_xprt *)xprt->xp_p1;
+
+	if (m->m_pkthdr.len == 0) {
+		m_freem(m);
+		return (0);	/* nothing to dispatch; repost */
+	}
+
+	q = malloc(sizeof(*q), M_SVCRDMA, M_NOWAIT);
+	if (q == NULL) {
+		m_freem(m);	/* drop; client retransmits */
+		return (0);
+	}
+	q->sq_m = m;		/* OWNERSHIP TRANSFERS; no m_getm2/m_copyback */
+
+	/*
+	 * Capture the reply chunk if the client offered one (same rationale as
+	 * sro_recv: msg->reply is a pure value type, safe to copy by value).
+	 */
+	q->sq_has_reply = has_reply;
+	if (has_reply) {
+		q->sq_xid = xid;
+		q->sq_reply = *reply;
+	}
+
+	mtx_lock(&xr->xr_lock);
+	STAILQ_INSERT_TAIL(&xr->xr_mq, q, sq_link);
+	mtx_unlock(&xr->xr_lock);
+
+	xprt_active(xprt);	/* xr_lock dropped (same discipline as sro_recv) */
+	return (0);
+}
+
+/*
  * sro_disconnect: the connection is going away.  Sleepable teardown context,
  * delivered ONCE and paired with newconn, AFTER every sro_recv has returned (the
  * verbs layer drains in-flight upcalls first), so no sro_recv runs concurrently.
@@ -972,6 +1027,7 @@ svc_rdma_sro_disconnect(void *ctx, struct svc_rdma_conn *conn)
 static const struct svc_rdma_ops svc_rdma_consumer_ops = {
 	.sro_newconn	= svc_rdma_sro_newconn,
 	.sro_recv	= svc_rdma_sro_recv,
+	.sro_recv_mbuf	= svc_rdma_sro_recv_mbuf,
 	.sro_disconnect	= svc_rdma_sro_disconnect,
 };
 
