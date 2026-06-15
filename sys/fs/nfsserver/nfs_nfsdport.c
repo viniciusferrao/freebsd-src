@@ -210,6 +210,12 @@ SYSCTL_INT(_vfs_nfsd, OID_AUTO, filesync_via_fsync, CTLFLAG_RW,
     "For a FILE_SYNC/DATA_SYNC WRITE, do one async write plus one ranged "
     "fsync of the written range (as NFS COMMIT does) instead of a "
     "synchronous per-block write (IO_SYNC); preserves durability");
+static int nfsrv_fsync_pipelined = 1;
+SYSCTL_INT(_vfs_nfsd, OID_AUTO, fsync_pipelined, CTLFLAG_RW,
+    &nfsrv_fsync_pipelined, 0,
+    "In nfsvno_fsync()'s ranged flush, issue the dirty buffers in the range "
+    "asynchronously (bawrite) and wait once for them to complete, instead of "
+    "a serial synchronous bwrite() per buffer; same buffers, same durability");
 
 /*
  * nfsrv_dsdirsize can only be increased and only when the nfsd threads are
@@ -1960,6 +1966,7 @@ nfsvno_fsync(struct vnode *vp, u_int64_t off, int cnt, struct ucred *cred,
 		 */
 		int iosize = vp->v_mount->mnt_stat.f_iosize;
 		int iomask = iosize - 1;
+		int pipelined = nfsrv_fsync_pipelined;
 		struct bufobj *bo;
 		daddr_t lblkno;
 
@@ -2007,8 +2014,13 @@ nfsvno_fsync(struct vnode *vp, u_int64_t off, int cnt, struct ucred *cred,
 			    	if ((bp->b_flags & (B_DELWRI|B_INVAL)) ==
 				    B_DELWRI) {
 					bremfree(bp);
-					bp->b_flags &= ~B_ASYNC;
-					bwrite(bp);
+					/* async; one wait below collects them */
+					if (pipelined) {
+						bawrite(bp);
+					} else {
+						bp->b_flags &= ~B_ASYNC;
+						bwrite(bp);
+					}
 					++nfs_commit_miss;
 				} else
 					BUF_UNLOCK(bp);
@@ -2020,6 +2032,18 @@ nfsvno_fsync(struct vnode *vp, u_int64_t off, int cnt, struct ucred *cred,
 			cnt -= iosize;
 			++lblkno;
 		}
+		/*
+		 * Wait once for the async writes issued above to reach the
+		 * disk before returning, so a stable write/COMMIT is still
+		 * durable.  bufobj_wwait() waits for all of the vnode's
+		 * outstanding output (a superset of this range): durability-
+		 * safe -- we never reply before the requested bytes are on
+		 * disk -- at worst a small over-wait on unrelated in-flight
+		 * writes to the same file.  BO_LOCK is held; bufobj_wwait()
+		 * drops and reacquires it while sleeping.
+		 */
+		if (pipelined)
+			(void)bufobj_wwait(bo, 0, 0);
 		BO_UNLOCK(bo);
 	}
 	NFSEXITCODE(error);
