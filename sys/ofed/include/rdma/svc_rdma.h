@@ -510,6 +510,14 @@ int	svc_rdma_conn_write_list_pages(struct svc_rdma_conn *conn, uint32_t xid,
 uint32_t svc_rdma_conn_credits(struct svc_rdma_conn *conn);
 
 /*
+ * Pre-allocate the calling krpc pool thread's linuxkpi `current` shadow off-lock
+ * (#59), so a later ib_post_send under the xr_lock leaf mutex does not trigger
+ * the M_WAITOK alloc inside mlx5_ib_post_send.  Idempotent and cheap after the
+ * first call on a thread.
+ */
+void	svc_rdma_thread_setup(void);
+
+/*
  * ===========================================================================
  * Cross-module verbs-ops registration (TASK_003e-2a).
  *
@@ -602,6 +610,18 @@ struct svc_rdma_verbs_ops {
 	 */
 	int	(*svo_conn_error)(struct svc_rdma_conn *conn, uint32_t xid,
 		    uint32_t errcode);
+	/*
+	 * svo_thread_setup -> svc_rdma_thread_setup (#59).  The krpc reply paths
+	 * post (ib_post_send) while holding the xr_lock leaf mutex, on the
+	 * assumption that the post does not sleep.  mlx5_ib_post_send breaks that
+	 * the FIRST time a given krpc pool thread enters it: linuxkpi allocates the
+	 * thread's `current` shadow with M_WAITOK, a sleepable uma_zalloc under the
+	 * mutex (WITNESS warns).  The consumer calls this OFF-LOCK at the top of a
+	 * reply, where M_WAITOK is legal, to pre-allocate that shadow so the
+	 * under-lock post never allocates.  OPTIONAL (NULL-checked); a no-op on an
+	 * older ibcore (the warning, which is non-fatal, simply persists there).
+	 */
+	void	(*svo_thread_setup)(void);
 };
 
 /*
