@@ -1017,7 +1017,7 @@ svc_rdma_cm_event_handler(struct rdma_cm_id *id, struct rdma_cm_event *event)
 				 */
 				svc_rdma_mr_selftest(conn);
 			}
-			if (ppsratecheck(&svc_rdma_log_last,
+			if (bootverbose && ppsratecheck(&svc_rdma_log_last,
 			    &svc_rdma_log_pps, 5))
 				printf("nfsrdma: connection established\n");
 			return (0);
@@ -1086,7 +1086,8 @@ svc_rdma_cm_event_handler(struct rdma_cm_id *id, struct rdma_cm_event *event)
 		 * never reentrant-destroys the passed-in id.
 		 */
 		sa = (const struct sockaddr *)&id->route.addr.dst_addr;
-		if (ppsratecheck(&svc_rdma_log_last, &svc_rdma_log_pps, 5)) {
+		if (bootverbose &&
+		    ppsratecheck(&svc_rdma_log_last, &svc_rdma_log_pps, 5)) {
 			if (sa->sa_family == AF_INET) {
 				uint32_t a;
 
@@ -1736,12 +1737,6 @@ svc_rdma_wc_recv(struct ib_cq *cq, struct ib_wc *wc)
 	}
 
 	if (msg.rd_nchunks != 0) {
-		if (ppsratecheck(&svc_rdma_log_last, &svc_rdma_log_pps, 5))
-			printf("nfsrdma: RPC-over-RDMA v1 %s xid=0x%08x credit=%u "
-			    "read_list=%u segs inline head=%u bytes (RDMA Read)\n",
-			    msg.rdma_proc == RDMA_NOMSG ? "RDMA_NOMSG" :
-			    "RDMA_MSG", msg.xid, msg.credit, msg.rd_nchunks,
-			    msg.rpc_len);
 		rc = svc_rdma_read_start(conn, rr, &msg, len);
 		if (rc != 0)
 			svc_rdma_conn_close(conn);
@@ -1752,12 +1747,6 @@ svc_rdma_wc_recv(struct ib_cq *cq, struct ib_wc *wc)
 		 */
 		return;
 	}
-
-	if (ppsratecheck(&svc_rdma_log_last, &svc_rdma_log_pps, 5))
-		printf("nfsrdma: RPC-over-RDMA v1 RDMA_MSG xid=0x%08x credit=%u "
-		    "inline rpc=%u bytes reply_chunk=%u (dispatching)\n",
-		    msg.xid, msg.credit, msg.rpc_len,
-		    msg.reply_present ? msg.reply.wc_nsegs : 0);
 
 	/*
 	 * Readiness gate + upcall barrier (TASK_003e-1).  sro_newconn is delivered
@@ -3202,10 +3191,6 @@ svc_rdma_wc_rdma_write(struct ib_cq *cq, struct ib_wc *wc)
 		return;
 	}
 
-	if (ppsratecheck(&svc_rdma_log_last, &svc_rdma_log_pps, 5))
-		printf("nfsrdma: reply chunk written + RDMA_NOMSG header sent "
-		    "(%u bytes)\n", ws->ws_srclen);
-
 	svc_rdma_write_free(ws);
 }
 
@@ -4015,7 +4000,8 @@ svc_rdma_wc_reg(struct ib_cq *cq, struct ib_wc *wc)
 		return;
 	}
 
-	if (ppsratecheck(&svc_rdma_log_last, &svc_rdma_log_pps, 5))
+	if (bootverbose &&
+	    ppsratecheck(&svc_rdma_log_last, &svc_rdma_log_pps, 5))
 		printf("nfsrdma: FRWR self-test register+invalidate ok "
 		    "(rkey rotated)\n");
 
@@ -4679,9 +4665,6 @@ svc_rdma_wc_send(struct ib_cq *cq, struct ib_wc *wc)
 		return;
 	}
 
-	if (ppsratecheck(&svc_rdma_log_last, &svc_rdma_log_pps, 5))
-		printf("nfsrdma: reply sent (send completion)\n");
-
 	/* Return the buffer to the bounded pool. */
 	mtx_lock(&conn->sc_lock);
 	ss->ss_inuse = false;
@@ -5045,7 +5028,7 @@ svc_rdma_conn_destroy(void *arg, int pending __unused)
 	if (conn->sc_id != NULL)
 		rdma_destroy_id(conn->sc_id);
 
-	if (ppsratecheck(&svc_rdma_log_last, &svc_rdma_log_pps, 5))
+	if (bootverbose && ppsratecheck(&svc_rdma_log_last, &svc_rdma_log_pps, 5))
 		printf("nfsrdma: connection torn down\n");
 
 	/*
@@ -5316,7 +5299,7 @@ svc_rdma_accept(struct rdma_cm_id *id)
 		}
 	}
 	conn->sc_max_send_sge = max_send_sge;	/* 3f-19: page-gather loop reads this */
-	if (ppsratecheck(&svc_rdma_log_last, &svc_rdma_log_pps, 1))
+	if (bootverbose && ppsratecheck(&svc_rdma_log_last, &svc_rdma_log_pps, 1))
 		printf("nfsrdma: QP up: send-queue %u WRs, send-sge %u\n",
 		    max_send_wr, max_send_sge);
 
@@ -5565,7 +5548,7 @@ svc_rdma_accept(struct rdma_cm_id *id)
 		svc_rdma_conn_peeraddr(conn, &pss);
 		if (pss.ss_family == AF_INET)
 			a = ((struct sockaddr_in *)&pss)->sin_addr.s_addr;
-		if (ppsratecheck(&svc_rdma_log_last, &svc_rdma_log_pps, 5))
+		if (bootverbose && ppsratecheck(&svc_rdma_log_last, &svc_rdma_log_pps, 5))
 			printf("nfsrdma: accept: recv_depth=%d send_depth=%d "
 			    "peer_af=%d peer_be=0x%08x\n", conn->sc_nrecv,
 			    conn->sc_nsend, pss.ss_family, a);
@@ -5678,7 +5661,8 @@ svc_rdma_listen_start_ops(uint16_t port, const struct svc_rdma_ops *ops,
 	svc_rdma_listen_port = port;
 	mtx_unlock(&svc_rdma_listener.sl_lock);
 
-	printf("nfsrdma: listening on port %u\n", port);
+	if (bootverbose)
+		printf("nfsrdma: listening on port %u\n", port);
 	return (0);
 
 out_destroy:
@@ -5769,7 +5753,8 @@ svc_rdma_listen_stop(void)
 
 	if (id != NULL) {
 		rdma_destroy_id(id);
-		printf("nfsrdma: listener stopped\n");
+		if (bootverbose)
+			printf("nfsrdma: listener stopped\n");
 	}
 
 	/*
