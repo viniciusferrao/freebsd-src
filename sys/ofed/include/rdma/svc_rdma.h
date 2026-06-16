@@ -79,6 +79,16 @@
 
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/malloc.h>
+
+/*
+ * The verbs layer's malloc type (defined in svc_verbs.c).  Declared here so the
+ * krpc consumer can allocate the RDMA-Write SOURCE buffer for svo_conn_write_list
+ * with the SAME type the engine frees it with: the consumer fills that buffer
+ * from the reply mbuf BEFORE taking its xprt lock (keeping the per-READ copy off
+ * the lock), then hands ownership to the engine, which frees it at completion.
+ */
+MALLOC_DECLARE(M_NFSRDMA);
 
 /*
  * Opaque per-accepted-connection handle.  The concrete struct svc_rdma_conn is
@@ -451,7 +461,7 @@ int	svc_rdma_conn_reply_chunk(struct svc_rdma_conn *conn, uint32_t xid,
  * exceeds the inline send buffer, ENOMEM, EBUSY, ENOTCONN, or the posted errno.
  */
 int	svc_rdma_conn_write_list(struct svc_rdma_conn *conn, uint32_t xid,
-	    const struct svc_rdma_write_chunk *write, const void *data,
+	    const struct svc_rdma_write_chunk *write, void *src,
 	    uint32_t datalen, const void *reduced, uint32_t reducedlen);
 
 /*
@@ -524,7 +534,7 @@ struct svc_rdma_verbs_ops {
 	 * READs simply fall back to the existing drop.
 	 */
 	int	(*svo_conn_write_list)(struct svc_rdma_conn *conn, uint32_t xid,
-		    const struct svc_rdma_write_chunk *write, const void *data,
+		    const struct svc_rdma_write_chunk *write, void *src,
 		    uint32_t datalen, const void *reduced, uint32_t reducedlen);
 	void	(*svo_conn_set_ctx)(struct svc_rdma_conn *conn, void *cctx);
 	void	*(*svo_conn_get_ctx)(struct svc_rdma_conn *conn);

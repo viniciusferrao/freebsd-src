@@ -776,20 +776,30 @@ svc_rdma_xprt_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 			u_int dlen = pend.rp_ddp_len;
 			u_int padded = (dlen + 3u) & ~3u;
 			u_int reducedlen;
-			char *data, *reduced;
+			char *reduced;
+			void *src;
 
 			if (nfsreply_len <= rlen && padded <= rlen &&
 			    doff <= rlen - padded) {
 				/*
-				 * data: the unpadded read bytes for the RDMA Write.
-				 * reduced: the inline body with [doff, doff+padded)
-				 * removed (the data AND its XDR pad) -- head [0,doff)
-				 * ++ tail [doff+padded, rlen).
+				 * src: the unpadded read bytes for the RDMA Write,
+				 * copied into a contiguous DMA source HERE, BEFORE
+				 * taking xr_lock -- the per-READ data copy is the
+				 * read ceiling (it used to run inside the engine
+				 * under xr_lock, serializing every concurrent read),
+				 * so we keep it off the lock and hand the filled
+				 * buffer to the engine, which only maps + posts under
+				 * the lock and OWNS src from the call on (frees it at
+				 * completion).  contigmalloc + M_NFSRDMA so the free
+				 * type matches the engine's.  reduced: the inline body
+				 * with [doff, doff+padded) removed (the data AND its
+				 * XDR pad) -- head [0,doff) ++ tail [doff+padded,rlen).
 				 */
 				reducedlen = rlen - padded;
-				data = malloc(dlen, M_SVCRDMA, M_WAITOK);
+				src = contigmalloc(dlen, M_NFSRDMA, M_WAITOK, 0,
+				    ~(vm_paddr_t)0, PAGE_SIZE, 0);
 				reduced = malloc(reducedlen, M_SVCRDMA, M_WAITOK);
-				m_copydata(mrep, doff, dlen, data);
+				m_copydata(mrep, doff, dlen, src);
 				if (doff > 0)
 					m_copydata(mrep, 0, doff, reduced);
 				if (rlen > doff + padded)
@@ -804,14 +814,15 @@ svc_rdma_xprt_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 				    svc_rdma_verbs->svo_conn_write_list != NULL) {
 					rc = svc_rdma_verbs->svo_conn_write_list(
 					    conn, msg->rm_xid, &pend.rp_writes,
-					    data, dlen, reduced, reducedlen);
+					    src, dlen, reduced, reducedlen);
 					if (rc == 0)
 						seqval = ++xr->xr_seq;
-				} else
+				} else {
 					rc = ENOTCONN;
+					free(src, M_NFSRDMA);	/* engine never took it */
+				}
 				mtx_unlock(&xr->xr_lock);
 
-				free(data, M_SVCRDMA);
 				free(reduced, M_SVCRDMA);
 
 				if (rc != 0) {
