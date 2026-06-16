@@ -487,9 +487,10 @@ svc_rdma_read_extfree(struct mbuf *m)
  *
  *   ws_link  - sc_writes registry linkage (sc_lock); inserted at post, removed on
  *              the first completion (or by the drained teardown).
- *   ws_cqe   - completion callback for the chain (aliased by every WR's wr_cqe;
- *              the chain signals ONLY the tail header SEND, so a single completion
- *              lands in svc_rdma_wc_rdma_write with this ws via container_of).
+ *   ws_cqe   - completion callback for the chain.  ONLY the signaled tail SEND
+ *              aliases &ws_cqe; the unsignaled RDMA Write WRs route to the per-conn
+ *              sink cqe (TASK_003f-20), so svc_rdma_wc_rdma_write runs EXACTLY ONCE
+ *              per ws (recovered via container_of), with no duplicate flush CQE.
  *   ws_src   - the source buffer the RDMA Writes read FROM (the marshalled ONC RPC
  *              reply), malloc'd ws_srclen bytes, DMA-mapped DMA_TO_DEVICE.
  *   ws_srclen- the reply length (server-known, bounded <= SVC_RDMA_MAX_WRITE).
@@ -684,12 +685,30 @@ struct svc_rdma_conn {
 	 * malloc'd on demand (it has no recv-buffer home) and threaded here under
 	 * sc_lock so the drained teardown can reclaim a write still in flight at
 	 * close -- the exact analogue of how rr_rs lets the teardown reclaim an
-	 * in-flight read.  Each in-flight write's WR chain is accounted in sc_sends
-	 * (armed only under SC_UP), so it is already drained by the sc_sends barrier
-	 * before ib_drain_qp(); this list only owns the EXACTLY-ONCE free of the
-	 * write state's source/header buffers + DMA maps after the drain.
+	 * in-flight read.  sc_sends accounts only the POST CALL (incremented before
+	 * ib_post_send, decremented right after it RETURNS), NOT the async WR, so it
+	 * is NOT the barrier that drains in-flight write WRs -- ib_drain_qp() is.
+	 * This list owns the EXACTLY-ONCE free of a write's source/header buffers +
+	 * DMA maps + the write state itself: by its completion if one runs, else by
+	 * the post-drain teardown.
 	 */
 	TAILQ_HEAD(, svc_rdma_write_state) sc_writes;	/* in-flight writes (sc_lock) */
+	/*
+	 * Sink completion for the UNSIGNALED RDMA Write WRs of a chain (TASK_003f-20).
+	 * On QP error every WR of a chain flushes, signaled or not; if the writes
+	 * aliased &ws->ws_cqe (as the signaled tail SEND does) they would deliver
+	 * DUPLICATE completions for one ws, and the first completion's free-then-
+	 * recycle of the ws ADDRESS let a trailing duplicate re-match a recycled live
+	 * ws and free it mid-post (ABA GPF under ~256 concurrent reads).  Routing the
+	 * unsignaled writes to this per-conn sink instead means svc_rdma_wc_rdma_write
+	 * runs EXACTLY ONCE per ws (only the signaled SEND), so no stale completion can
+	 * ever alias a freed/recycled ws -- the write path is now ABA-immune like the
+	 * recv/send pools.  Set once at accept, never freed until the drained teardown.
+	 * The two counters are touched only by the (single-threaded) send-CQ workqueue.
+	 */
+	struct ib_cqe		 sc_write_sink_cqe;	/* unsignaled-write flush sink */
+	uint64_t		 sc_write_sink_flushes;	/* write WRs flushed to sink */
+	uint64_t		 sc_write_sink_errs;	/* non-flush write WR errors */
 	struct task		 sc_teardown;	/* deferred (sleepable) unwind */
 	TAILQ_ENTRY(svc_rdma_conn) sc_link;	/* registry (svc_rdma_conns_lock) */
 
@@ -834,6 +853,7 @@ static void svc_rdma_read_free(struct svc_rdma_conn *conn,
     struct svc_rdma_recv *rr);
 static void svc_rdma_repost(struct svc_rdma_conn *conn, struct svc_rdma_recv *rr);
 static void svc_rdma_wc_rdma_write(struct ib_cq *cq, struct ib_wc *wc);
+static void svc_rdma_wc_write_sink(struct ib_cq *cq, struct ib_wc *wc);
 static void svc_rdma_write_free(struct svc_rdma_write_state *ws);
 int svc_rdma_conn_write_list(struct svc_rdma_conn *conn, uint32_t xid,
     const struct svc_rdma_write_chunk *write, void *src,
@@ -2281,9 +2301,10 @@ svc_rdma_read_sink_free_detached(void *buf)
  *
  * The DMA / read-vs-teardown rule: the server buffer's DMA mapping MUST stay live
  * until the device is done writing into it (the read completion) or the QP is
- * drained (teardown); ib_drain_qp() guarantees no read completion can fire after
- * it, so the teardown calling this for a read that never completed is safe -- no
- * concurrent completion can be touching rs_buf/rs_dma.
+ * drained AND the recv CQ freed (teardown).  ib_drain_qp() drains the QP, but the
+ * recv buffers (and this read state) are reclaimed only AFTER ib_free_cq(), whose
+ * flush_work() is the barrier that quiesces the completion workqueue; so by the
+ * time the teardown calls this no read completion can be touching rs_buf/rs_dma.
  */
 static void
 svc_rdma_read_free(struct svc_rdma_conn *conn, struct svc_rdma_recv *rr)
@@ -2641,9 +2662,10 @@ svc_rdma_wc_rdma_read(struct ib_cq *cq, struct ib_wc *wc)
  *     with an error completion, which we handle by CLOSING -- never by trusting.
  *
  * COMPLETION-vs-TEARDOWN lifetime (the #1 hazard), mirroring 3f-3 EXACTLY:
- *   - the RDMA Write chain + the header SEND are accounted in sc_sends (armed only
- *     under SC_UP), so the drained teardown's barrier waits them out before
- *     ib_drain_qp();
+ *   - sc_sends accounts only the POST CALL (incremented under SC_UP, decremented
+ *     right after ib_post_send returns), NOT the async WRs; ib_drain_qp() -- not
+ *     the sc_sends barrier -- is what quiesces the in-flight write/SEND WRs before
+ *     the teardown reclaims;
  *   - the write state (source + header buffers + DMA maps) lives in a malloc'd
  *     svc_rdma_write_state threaded on conn->sc_writes and is freed/unmapped
  *     EXACTLY ONCE -- on the (tail-SEND) completion, or by the teardown for a write
@@ -2673,9 +2695,11 @@ svc_rdma_wc_rdma_read(struct ib_cq *cq, struct ib_wc *wc)
  * the detach is done at the call site under sc_lock to keep the registry coherent.
  *
  * The DMA / write-vs-teardown rule: the source mapping MUST stay live until the
- * device is done READING it (the write completion) or the QP is drained
- * (teardown); ib_drain_qp() guarantees no write completion can fire after it, so
- * the teardown calling this for a write that never completed is safe.
+ * device is done READING it (the write completion) or the QP is drained AND the
+ * send CQ freed (teardown).  The teardown reclaims write state only AFTER
+ * ib_free_cq(), whose flush_work() quiesces the completion workqueue (ib_drain_qp()
+ * alone does not -- a dispatched-but-unrun SEND completion may remain), so the
+ * teardown calling this for a write that never completed is safe.
  */
 static void
 svc_rdma_write_free(struct svc_rdma_write_state *ws)
@@ -2733,8 +2757,8 @@ svc_rdma_write_free(struct svc_rdma_write_state *ws)
  * buf/len are the marshalled ONC RPC reply BODY ONLY; reply is the parsed,
  * validated reply chunk the client offered (a pure value type the consumer
  * captured during sro_recv).  On success an RDMA Write chain + the header SEND are
- * on the SQ, accounted in sc_sends, and the write state is on sc_writes until the
- * completion (or teardown) frees it.  Returns 0 or a positive errno; on nonzero it
+ * on the SQ and the write state is on sc_writes until the tail-SEND completion (or
+ * the drained teardown) frees it.  Returns 0 or a positive errno; on nonzero it
  * has already released everything it allocated for a NEVER-posted attempt (a
  * posted-but-failed chain is left for the drained teardown -- the partial-post
  * rule).
@@ -2882,8 +2906,9 @@ svc_rdma_conn_reply_chunk(struct svc_rdma_conn *conn, uint32_t xid,
 	 * registration needed for the SOURCE of a write), and the peer's { rkey,
 	 * remote_addr } passed VERBATIM.  Chain them next->next; all UNSIGNALED.  Then
 	 * chain the header SEND last and SIGNAL ONLY IT, so a single completion fires
-	 * for the whole chain.  ws_cqe.done routes that completion to
-	 * svc_rdma_wc_rdma_write; every WR's wr_cqe aliases &ws_cqe.
+	 * for the whole chain.  The SEND's wr_cqe aliases &ws_cqe (-> ws); the
+	 * UNSIGNALED write WRs route to the per-conn sink cqe instead, so a flushed
+	 * write never delivers a duplicate completion for this ws (TASK_003f-20).
 	 *
 	 * We emit a WR only for a segment that actually carries bytes (wlen > 0); once
 	 * the reply is exhausted, trailing client segments get length 0 in the header
@@ -2903,7 +2928,7 @@ svc_rdma_conn_reply_chunk(struct svc_rdma_conn *conn, uint32_t xid,
 		ws->ws_sge[k].lkey = conn->sc_pd->local_dma_lkey;
 
 		memset(&ws->ws_wr[k], 0, sizeof(ws->ws_wr[k]));
-		ws->ws_wr[k].wr.wr_cqe = &ws->ws_cqe;
+		ws->ws_wr[k].wr.wr_cqe = &conn->sc_write_sink_cqe;	/* 3f-20 */
 		ws->ws_wr[k].wr.sg_list = &ws->ws_sge[k];
 		ws->ws_wr[k].wr.num_sge = 1;
 		ws->ws_wr[k].wr.opcode = IB_WR_RDMA_WRITE;
@@ -2971,11 +2996,13 @@ svc_rdma_conn_reply_chunk(struct svc_rdma_conn *conn, uint32_t xid,
 	/*
 	 * PARTIAL-POST rule (mlx5 commits the built prefix on a mid-chain failure while
 	 * returning -ENOMEM): on rc != 0 do NOT reclaim inline -- a committed prefix is
-	 * live and its flush/error completion will run svc_rdma_wc_rdma_write via
-	 * container_of on ws.  Leave ws on sc_writes with ws_active/ws_*_mapped intact;
-	 * the DRAINED teardown (svc_rdma_conn_free_verbs, after ib_drain_qp) is the
-	 * single reclaimer.  We DO still decrement sc_sends (the posting op finished) so
-	 * the barrier can reach 0 and drain the committed prefix, then close.
+	 * live.  A committed unsignaled write WR flushes to the per-conn sink cqe (not to
+	 * svc_rdma_wc_rdma_write); a committed tail SEND flushes to svc_rdma_wc_rdma_write
+	 * and frees ws; if the SEND was NOT reached, no completion frees ws, so the
+	 * DRAINED teardown (svc_rdma_conn_free_verbs, after ib_drain_qp) is the single
+	 * reclaimer.  Leave ws on sc_writes with ws_active/ws_*_mapped intact.  We DO
+	 * still decrement sc_sends (the posting op finished); ib_drain_qp then quiesces
+	 * the committed prefix before the teardown reclaims, then close.
 	 */
 	mtx_lock(&conn->sc_lock);
 	if (--conn->sc_sends == 0)
@@ -2993,47 +3020,70 @@ svc_rdma_conn_reply_chunk(struct svc_rdma_conn *conn, uint32_t xid,
 }
 
 /*
+ * Sink completion for the UNSIGNALED RDMA Write WRs of a chain (TASK_003f-20).
+ * Dispatched on the SAME SEND-CQ IB_POLL_WORKQUEUE context as the real write/send
+ * handlers.  An unsignaled WR raises NO completion on success, so this is reached
+ * ONLY when the QP is in error and the WR flushes (IB_WC_WR_FLUSH_ERR), or in the
+ * rare case the HCA reports a per-WR fault (bad rkey/addr/len) on the write itself.
+ * It must touch NO ws: the write states are owned and freed via the signaled tail
+ * SEND's svc_rdma_wc_rdma_write, and a flushed write WR carries this shared per-conn
+ * cqe, not any ws_cqe.  Recover conn from cq->cq_context (== conn) and do O(1) work:
+ * count the event, and on a non-flush fault close the connection (idempotent) so a
+ * bad client rkey surfaces promptly instead of waiting for the trailing SEND flush.
+ * The counters are read/written only by this single-threaded workqueue, so they
+ * need no lock.
+ */
+static void
+svc_rdma_wc_write_sink(struct ib_cq *cq, struct ib_wc *wc)
+{
+	struct svc_rdma_conn *conn = cq->cq_context;
+
+	MPASS(cq->poll_ctx == IB_POLL_WORKQUEUE);
+
+	if (wc->status == IB_WC_SUCCESS)
+		return;				/* unsignaled: not expected, ignore */
+	if (wc->status == IB_WC_WR_FLUSH_ERR) {
+		conn->sc_write_sink_flushes++;	/* QP draining: the SEND closes */
+		return;
+	}
+	conn->sc_write_sink_errs++;
+	if (ppsratecheck(&svc_rdma_log_last, &svc_rdma_log_pps, 5))
+		printf("nfsrdma: RDMA Write WR error %u (bad rkey/addr/len), "
+		    "closing\n", wc->status);
+	svc_rdma_conn_close(conn);
+}
+
+/*
  * RDMA Write completion (TASK_003f-4).  Dispatched by the CQ core in the same
  * IB_POLL_WORKQUEUE context as the read/send handlers; keep it short, take no
- * sleepable lock, start no blocking teardown.  The signaled tail SEND's wr_cqe
- * aliases &ws->ws_cqe, so container_of recovers the write state, then the conn.
+ * sleepable lock, start no blocking teardown.  ONLY the signaled tail SEND of a
+ * write chain carries &ws->ws_cqe (the unsignaled write WRs carry the per-conn
+ * sink cqe -- TASK_003f-20), so container_of recovers the write state, then conn,
+ * and this handler runs EXACTLY ONCE per ws: once on the SEND's success, or once
+ * on the SEND's flush when the QP went to error.  There is therefore NO duplicate
+ * completion for a ws and NO stale CQE can alias a freed/recycled ws address --
+ * the prior design aliased every WR to &ws_cqe, so a flush storm delivered a
+ * duplicate per unsignaled WR and the first completion's free-then-recycle of the
+ * ws ADDRESS let a trailing duplicate re-match a recycled live ws and free it
+ * mid-ib_post_send (the 256-concurrent-read ABA GPF).
  *
- * ONE-SHOT (the multi-completion guard).  A partially-committed chained post can
- * deliver MORE THAN ONE completion for a single write (flush/error CQEs fire for
- * the unsignaled prefix WRs too), so this handler can be invoked >1x for one ws.
- * Unlike svc_rdma_wc_rdma_read -- whose rs_active state is EMBEDDED in the recv and
- * never freed at completion -- the write state is a STANDALONE malloc the first
- * completion FREES, so a duplicate completion must NEVER dereference ws (it may be
- * freed).  We therefore recover conn from cq->cq_context (== conn, set at
- * ib_alloc_cq) WITHOUT touching ws, then under sc_lock prove ownership by SEARCHING
- * sc_writes for the exact ws pointer: comparing the (possibly dangling) candidate
- * address against live list entries is legal; dereferencing it is not.  Only if ws
- * is still ON the list (and ws_active) do we own it -- remove it, clear ws_active,
- * and proceed to dereference/free it.  A duplicate finds ws already off the list
- * and returns having dereferenced nothing.  Every completion for this write lands
- * on the SEND CQ, whose IB_POLL_WORKQUEUE work item cannot run concurrently with
- * itself, so the duplicates are serialized: the first completion fully frees ws
- * before any duplicate runs, and the list search is the safe membership test
- * across that free.  ABA safety (a freed ws re-malloc'd at the same address):
- * duplicate completions arise ONLY from a teardown flush or a partial-post, and
- * BOTH publish SC_CLOSING (via svc_rdma_conn_close) before any new reply_chunk can
- * insert a ws -- the SC_UP gate in svc_rdma_conn_reply_chunk then refuses the
- * insert, so no live ws can occupy the freed address while a stale duplicate is
- * still pending.  The pure-success path produces exactly one completion (the
- * unsignaled writes raise none), so there is no duplicate to alias.  If that
- * SC_UP-gate ordering is ever relaxed, this membership test must be revisited.
- * sc_sends is NOT touched here (decremented once at the post site).
+ * The sc_writes membership search is retained as DEFENSE IN DEPTH: recover conn
+ * from cq->cq_context WITHOUT touching ws, then under sc_lock confirm ws is still
+ * ON the list (and ws_active) before dereferencing it.  The only way it is absent
+ * is a SEND completion that races the drained teardown after the teardown already
+ * detached+freed it (the teardown runs only after ib_drain_qp(), which is FIFO on
+ * this same CQ, so in practice the SEND completion precedes it); the search makes
+ * that benign rather than a UAF.  sc_sends is NOT touched here (it is decremented
+ * once at the post site; it accounts the post CALL, not the async WR).
  *
- * SUCCESS (first completion): the reply has been RDMA-Written into the client's
- * reply chunk and the RDMA_NOMSG header SEND has been transmitted, so the device
- * is done reading ws_src/ws_hdr -- free the write state.
+ * SUCCESS: the reply was RDMA-Written into the client's chunk and the header SEND
+ * transmitted, so the device is done reading ws_src/ws_hdr -- free the write state.
  *
- * ERROR/FLUSH (first completion): a bad client rkey/addr/length fails the WR (the
- * HCA enforced the rkey), or the chain flushed during teardown.  IB_WC_WR_FLUSH_ERR
- * is swallowed; any other status closes.  In BOTH cases we have already removed ws
- * from sc_writes under the one-shot, so we free it here (the teardown will no longer
- * see it); ib_drain_qp() (FIFO, after the sc_sends barrier) guarantees no other
- * completion for this ws can still be in flight.
+ * FLUSH/ERROR: the chain flushed (the QP is going down -- a bad rkey on a write
+ * reaches the sink, or a teardown drain).  Close on ANY non-success before the
+ * free (idempotent); the write state is freed here since we removed it from the
+ * registry.  The teardown walks sc_writes only AFTER ib_free_cq() has flush_work()ed
+ * this CQ, so no completion for a ws is still in flight when it does.
  */
 static void
 svc_rdma_wc_rdma_write(struct ib_cq *cq, struct ib_wc *wc)
@@ -3094,8 +3144,28 @@ svc_rdma_wc_rdma_write(struct ib_cq *cq, struct ib_wc *wc)
 				printf("nfsrdma: RDMA Write completion error %u "
 				    "(bad rkey/addr/len or fault), closing\n",
 				    wc->status);
-			svc_rdma_conn_close(conn);
 		}
+		/*
+		 * Close on ANY non-success completion -- INCLUDING flush -- BEFORE the
+		 * free, so SC_CLOSING is published first.  This closes an ABA window the
+		 * one-shot essay above relies on NOT existing: a single bad/stale client
+		 * rkey faults one RDMA-Write WR, which puts the whole QP in ERR and
+		 * FLUSHES every other in-flight write, raising a storm of
+		 * IB_WC_WR_FLUSH_ERR completions ahead of the one error CQE.  The old
+		 * code closed only on the NON-flush sub-case, so the first flush freed
+		 * its ws while the conn was still SC_UP; a krpc pool thread then passed
+		 * the SC_UP insert gate, malloc recycled that exact address as a NEW
+		 * live ws and posted it, and a trailing duplicate flush matched the new
+		 * ws by address and freed it mid-post -> corrupted num_sge at
+		 * ib_post_send + a use-after-free deref of ws_cqe in the completion
+		 * workqueue (GPF), reproducible under ~256 concurrent small reads.
+		 * Closing here publishes SC_CLOSING on the FIRST flush, so the SC_UP
+		 * gate refuses every recycled insert while duplicate flushes drain.  A
+		 * flush means the QP is already in ERR (the connection is going down
+		 * regardless), so closing is correct; svc_rdma_conn_close is idempotent,
+		 * so a normal drained-teardown flush remains a no-op.
+		 */
+		svc_rdma_conn_close(conn);
 		svc_rdma_write_free(ws);
 		return;
 	}
@@ -3319,7 +3389,7 @@ svc_rdma_conn_write_list(struct svc_rdma_conn *conn, uint32_t xid,
 		ws->ws_sge[k].lkey = conn->sc_pd->local_dma_lkey;
 
 		memset(&ws->ws_wr[k], 0, sizeof(ws->ws_wr[k]));
-		ws->ws_wr[k].wr.wr_cqe = &ws->ws_cqe;
+		ws->ws_wr[k].wr.wr_cqe = &conn->sc_write_sink_cqe;	/* 3f-20 */
 		ws->ws_wr[k].wr.sg_list = &ws->ws_sge[k];
 		ws->ws_wr[k].wr.num_sge = 1;
 		ws->ws_wr[k].wr.opcode = IB_WR_RDMA_WRITE;
@@ -4304,13 +4374,17 @@ svc_rdma_conn_close(struct svc_rdma_conn *conn)
  * Free every verbs resource a connection owns, in strict reverse order of
  * allocation, NULL-guarding each so this tolerates an arbitrary partial build
  * and is idempotent.  It does NOT touch sc_id (the teardown task destroys that
- * after this returns) and it does NOT drain: the caller (svc_rdma_conn_destroy)
- * MUST have already drained the QP via ib_drain_qp() so that no completion can
- * fire against the buffers/conn this frees.
+ * after this returns).  The caller (svc_rdma_conn_destroy) MUST have already
+ * drained the QP via ib_drain_qp(); this routine then frees the CQs FIRST, and
+ * ib_free_cq()'s flush_work() -- NOT ib_drain_qp() -- is the barrier that
+ * guarantees the completion workqueue has dispatched every completion, so no
+ * completion can fire against the writes/buffers/conn this frees afterward.
  *
- * Order: QP (clears sc_id->qp) -> recv CQ -> send CQ -> unmap+free each recv
- * buffer -> unmap+free each send buffer -> unmap+dereg each FRWR MR -> PD.  A CQ
- * is never freed under a live QP, and the PD (whose local_dma_lkey the recv/send
+ * Order: QP (clears sc_id->qp) -> recv CQ -> send CQ -> reclaim in-flight writes
+ * -> unmap+free each recv buffer -> unmap+free each send buffer -> unmap+dereg
+ * each FRWR MR -> PD.  The CQs are freed BEFORE any completion-referenced state
+ * (writes/recv/send buffers) so the workqueue is quiesced first.  A CQ is never
+ * freed under a live QP, and the PD (whose local_dma_lkey the recv/send
  * SGEs reference, and whose usecnt every MR holds) outlives every buffer and MR
  * that used it -- so the MR pool is deregistered BEFORE ib_dealloc_pd().
  * rdma_destroy_qp() is the cm_id-paired QP destructor: it must only be called
@@ -4327,17 +4401,36 @@ svc_rdma_conn_free_verbs(struct svc_rdma_conn *conn)
 		rdma_destroy_qp(conn->sc_id);
 
 	/*
-	 * Reclaim any outbound RDMA Write (TASK_003f-4) still in flight at close.
-	 * svc_rdma_conn_destroy() has already run the sc_sends barrier + ib_drain_qp()
-	 * before calling us, so no RDMA Write completion can still be touching a write
-	 * state or its DMA mappings -- every committed (even partially-posted) write WR
-	 * has flushed, but its completion handler only FREES a write whose one-shot it
-	 * won; a write left on sc_writes here is one whose completion never ran (closed
-	 * before establish, or a never-posted attempt that a racing close stranded), so
-	 * WE are its single reclaimer.  Detach each under sc_lock and free it (unmaps
+	 * Free the CQs BEFORE reclaiming any completion-referenced state
+	 * (TASK_003f-20).  ib_free_cq() flush_work()s the completion workqueue, so
+	 * once it returns NO completion can still run; that is the real quiescence
+	 * barrier, NOT ib_drain_qp().  Under heavy close churn -- every ENOMEM /
+	 * SQ-full post closes the conn -- a SUCCESSFUL tail-SEND completion can still
+	 * be sitting undispatched in the send CQ when this teardown runs; ib_drain_qp()
+	 * does not guarantee the workqueue has dispatched it.  The recv buffers, send
+	 * pool, and MRs are freed AFTER the CQs for exactly this reason; the sc_writes
+	 * reclaim below MUST be too.  (Empirically: reclaiming ws before the CQ free
+	 * let a pending SEND completion dereference a freed ws_cqe -> GPF in
+	 * ib_cq_poll_work, the 256-concurrent-read crash.)
+	 */
+	if (conn->sc_rcq != NULL) {
+		ib_free_cq(conn->sc_rcq);
+		conn->sc_rcq = NULL;
+	}
+	if (conn->sc_scq != NULL) {
+		ib_free_cq(conn->sc_scq);
+		conn->sc_scq = NULL;
+	}
+
+	/*
+	 * Reclaim any outbound RDMA Write (TASK_003f-4) whose completion NEVER ran:
+	 * a never-posted / partially-posted attempt a racing close stranded, or a
+	 * write whose tail SEND never reached the SQ.  The CQ frees above guarantee
+	 * every dispatched completion has finished (each reclaimed its OWN ws via the
+	 * sc_writes one-shot), so what remains here has no pending completion and WE
+	 * are its single reclaimer.  Detach each under sc_lock and free it (unmaps
 	 * ws_src/ws_hdr via the idempotent mapped tokens, frees the state) -- exactly
-	 * once.  We take sc_lock only to pop the list; svc_rdma_write_free does not
-	 * sleep, but we drop the lock across it to avoid holding it over the frees.
+	 * once.  svc_rdma_write_free does not sleep; we drop the lock across it.
 	 */
 	for (;;) {
 		struct svc_rdma_write_state *ws;
@@ -4352,15 +4445,6 @@ svc_rdma_conn_free_verbs(struct svc_rdma_conn *conn)
 		if (ws == NULL)
 			break;
 		svc_rdma_write_free(ws);
-	}
-
-	if (conn->sc_rcq != NULL) {
-		ib_free_cq(conn->sc_rcq);
-		conn->sc_rcq = NULL;
-	}
-	if (conn->sc_scq != NULL) {
-		ib_free_cq(conn->sc_scq);
-		conn->sc_scq = NULL;
 	}
 
 	if (conn->sc_recv != NULL) {
@@ -4533,13 +4617,17 @@ svc_rdma_conn_free_verbs(struct svc_rdma_conn *conn)
  *      WR on its queue, and BLOCKS (wait_for_completion) until that sentinel CQE
  *      is reaped.  Step 1 made this safe by guaranteeing no other context is
  *      still posting on the SQ or RQ (the drain contract requires exactly that).
- *      CQs are FIFO, so when this returns EVERY earlier recv AND send completion
- *      -- including any flushed WRs and the now-quiesced reposts/sends from step
- *      1 -- has already run svc_rdma_wc_recv()/svc_rdma_wc_send() to completion.
- *      No completion can fire after this point.
- *   4. svc_rdma_conn_free_verbs() -- destroy QP, free CQs, unmap+free buffers,
- *      unmap+ib_dereg_mr the FRWR pool (3f-2), dealloc PD.  Safe now: step 3
- *      guarantees nothing is touching them -- in particular no REG_MR/LOCAL_INV
+ *      This flushes the QP and bounds the work, but it does NOT by itself
+ *      guarantee the completion WORKQUEUE has dispatched every earlier CQE:
+ *      empirically a SUCCESSFUL tail-SEND completion can still be sitting
+ *      undispatched in the send CQ when this returns.  The hard quiescence
+ *      barrier is ib_free_cq()'s flush_work() in step 4.
+ *   4. svc_rdma_conn_free_verbs() -- destroy QP, then free the CQs (ib_free_cq()
+ *      flush_work()s the completion workqueue: AFTER this no completion can run),
+ *      THEN reclaim in-flight writes, unmap+free buffers, unmap+ib_dereg_mr the
+ *      FRWR pool (3f-2), dealloc PD.  Freeing the CQs before any
+ *      completion-referenced state is what makes the rest safe -- in particular
+ *      no REG_MR/LOCAL_INV
  *      completion can be reading an MR or its DMA mapping, the MR-vs-DMA lifetime
  *      guarantee the reviewer cares about.
  *   5. rdma_destroy_id() -- a QP must be destroyed before its id (rdma_cm.h);
@@ -4691,6 +4779,7 @@ svc_rdma_accept(struct rdma_cm_id *id)
 	mtx_init(&conn->sc_lock, "nfsrdma_conn", NULL, MTX_DEF);
 	TASK_INIT(&conn->sc_teardown, 0, svc_rdma_conn_destroy, conn);
 	TAILQ_INIT(&conn->sc_writes);	/* in-flight RDMA Write registry (3f-4) */
+	conn->sc_write_sink_cqe.done = svc_rdma_wc_write_sink;	/* 3f-20 */
 	conn->sc_state = SC_CONNECTING;
 	conn->sc_id = id;
 	id->context = conn;
