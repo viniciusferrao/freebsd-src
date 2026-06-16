@@ -253,6 +253,22 @@ MALLOC_DEFINE(M_NFSRDMA, "nfsrdma", "NFS over RDMA server");
  */
 #define	SVC_RDMA_MAX_WRITE	(1U << 20)	/* 1 MiB whole-reply cap */
 #define	SVC_RDMA_MAX_WRITE_SEGS	SVC_RDMA_MAX_SEGS
+/*
+ * Zero-copy outbound-READ page-gather bounds (TASK_003f-19).  The M_EXTPG read
+ * source is up to SVC_RDMA_MAX_WRITE bytes of page-aligned data = MAX_WRITE_PAGES
+ * page SGEs.  Each RDMA Write WR gathers up to MAX_SEND_SGE pages (one fully
+ * packed M_EXTPG mbuf), and a WR never crosses a write-list segment (distinct
+ * rkey/remote_addr), so the WR count is bounded by pages/SGE + one partial WR per
+ * segment.  The krpc collect helper rejects (=> contigmalloc fallback) anything
+ * that would exceed MAX_WRITE_PAGES, so these arrays never overflow.
+ */
+#define	SVC_RDMA_MAX_SEND_SGE	MBUF_PEXT_MAX_PGS	/* 8 on amd64: pages per M_EXTPG mbuf */
+#define	SVC_RDMA_MAX_WRITE_PAGES (SVC_RDMA_MAX_WRITE / PAGE_SIZE)	/* 256 */
+#define	SVC_RDMA_MAX_WRITE_WRS	(SVC_RDMA_MAX_WRITE_PAGES / SVC_RDMA_MAX_SEND_SGE + \
+				 SVC_RDMA_MAX_WRITE_SEGS)	/* 32 + 16 */
+/* Total SGEs: one per page, plus one extra each time a non-page-aligned segment
+ * boundary splits a page across two WRs (<= SEGS such splits). */
+#define	SVC_RDMA_MAX_WRITE_SGE	(SVC_RDMA_MAX_WRITE_PAGES + SVC_RDMA_MAX_WRITE_SEGS)	/* 272 */
 
 /*
  * Per-connection pool of pre-allocated, pre-DMA-mapped CONTIGUOUS RDMA-Read
@@ -522,8 +538,23 @@ struct svc_rdma_write_state {
 	bool			 ws_hdr_mapped;
 	bool			 ws_active;	/* completion one-shot guard (sc_lock) */
 	int			 ws_nwr;
-	struct ib_rdma_wr	 ws_wr[SVC_RDMA_MAX_WRITE_SEGS];
-	struct ib_sge		 ws_sge[SVC_RDMA_MAX_WRITE_SEGS];
+	/*
+	 * Zero-copy M_EXTPG page source (TASK_003f-19), used ONLY by
+	 * svc_rdma_conn_write_list_pages; M_ZERO-clear on every other path so the
+	 * write_free unmap/free is a no-op for reply_chunk and the contig write_list.
+	 *   ws_npgs/ws_pg_dma/ws_pg_len - the per-page DMA maps of the read data;
+	 *     ws_pages_mapped gates the unmap, which iterates ws_npgs (PAGES) and
+	 *     NEVER ws_nwr (a WR may gather several pages).
+	 *   ws_keepm - the source M_EXTPG mbuf chain; the engine owns it and
+	 *     m_freem()s it in svc_rdma_write_free (the pages must outlive the Write).
+	 */
+	uint32_t		 ws_npgs;
+	bool			 ws_pages_mapped;
+	struct mbuf		*ws_keepm;
+	u64			 ws_pg_dma[SVC_RDMA_MAX_WRITE_PAGES];
+	uint32_t		 ws_pg_len[SVC_RDMA_MAX_WRITE_PAGES];
+	struct ib_rdma_wr	 ws_wr[SVC_RDMA_MAX_WRITE_WRS];
+	struct ib_sge		 ws_sge[SVC_RDMA_MAX_WRITE_SGE];
 	struct ib_send_wr	 ws_sndwr;
 	struct ib_sge		 ws_sndsge;
 };
@@ -709,6 +740,7 @@ struct svc_rdma_conn {
 	struct ib_cqe		 sc_write_sink_cqe;	/* unsignaled-write flush sink */
 	uint64_t		 sc_write_sink_flushes;	/* write WRs flushed to sink */
 	uint64_t		 sc_write_sink_errs;	/* non-flush write WR errors */
+	uint32_t		 sc_max_send_sge;	/* granted send-SGE cap (3f-19) */
 	struct task		 sc_teardown;	/* deferred (sleepable) unwind */
 	TAILQ_ENTRY(svc_rdma_conn) sc_link;	/* registry (svc_rdma_conns_lock) */
 
@@ -2721,6 +2753,23 @@ svc_rdma_write_free(struct svc_rdma_write_state *ws)
 	 */
 	MPASS(!ws->ws_active);
 
+	/*
+	 * Zero-copy M_EXTPG page source (TASK_003f-19): unmap EACH mapped page.
+	 * Drive the loop off ws_npgs (PAGES), never ws_nwr (a WR gathers several
+	 * pages, so coalescing by WR would leak).  ws_pages_mapped is the idempotent
+	 * token; ws_npgs is bumped incrementally as pages map, so a mid-map failure
+	 * unmaps exactly the mapped prefix.  ws_npgs==0 on every non-page path.
+	 */
+	if (ws->ws_pages_mapped) {
+		uint32_t p;
+
+		for (p = 0; p < ws->ws_npgs; p++)
+			if (dev != NULL)
+				ib_dma_unmap_single(dev, ws->ws_pg_dma[p],
+				    ws->ws_pg_len[p], DMA_TO_DEVICE);
+		ws->ws_pages_mapped = false;
+	}
+
 	if (ws->ws_src_mapped) {
 		if (dev != NULL)
 			ib_dma_unmap_single(dev, ws->ws_src_dma, ws->ws_srclen,
@@ -2740,6 +2789,15 @@ svc_rdma_write_free(struct svc_rdma_write_state *ws)
 	if (ws->ws_hdr != NULL) {
 		free(ws->ws_hdr, M_NFSRDMA);
 		ws->ws_hdr = NULL;
+	}
+	/*
+	 * Free the source M_EXTPG mbuf chain LAST (TASK_003f-19): the device read
+	 * the data pages out of it, so it had to outlive the RDMA Write; this is the
+	 * sole reference drop.  ws_keepm is NULL on every non-page path.
+	 */
+	if (ws->ws_keepm != NULL) {
+		m_freem(ws->ws_keepm);
+		ws->ws_keepm = NULL;
 	}
 	ws->ws_active = false;
 	free(ws, M_NFSRDMA);
@@ -3462,6 +3520,296 @@ svc_rdma_conn_write_list(struct svc_rdma_conn *conn, uint32_t xid,
 	 */
 badsrc:
 	free(src, M_NFSRDMA);
+	return (rc);
+}
+
+/*
+ * Zero-copy twin of svc_rdma_conn_write_list (TASK_003f-19, Rick Macklem's
+ * enable_mextpg direction).  Same contract, lifetime, completion, one-shot, sink
+ * cqe (3f-20) and partial-post rules; the ONLY difference is the RDMA Write
+ * SOURCE.  Instead of a contigmalloc'd copy the caller hands us the READ reply's
+ * M_EXTPG data pages (mrep + pages[0..npages), summing to datalen) -- already in
+ * page-aligned wired kernel pages -- which we map DMA_TO_DEVICE one page at a time
+ * and gather into the write WRs (up to sc_max_send_sge pages per WR, never
+ * crossing a write-list segment).  We TAKE OWNERSHIP of mrep on EVERY return
+ * (0 or errno) -- a faithful twin of svc_rdma_conn_write_list's "engine owns src
+ * on every return": a pre-ws validation failure m_freem()s it at the badm label,
+ * a post-ws failure through svc_rdma_write_free, and success / committed partial
+ * post at write completion or drain (the device read those pages, so they must
+ * outlive the Write).  The caller must NOT touch mrep after this call.
+ */
+int
+svc_rdma_conn_write_list_pages(struct svc_rdma_conn *conn, uint32_t xid,
+    const struct svc_rdma_write_chunk *write, struct mbuf *mrep,
+    const struct svc_rdma_page *pages, uint32_t npages,
+    uint32_t datalen, const void *reduced, uint32_t reducedlen)
+{
+	struct svc_rdma_write_state *ws;
+	struct ib_device *dev = conn->sc_id->device;
+	const struct ib_send_wr *bad_wr;
+	uint64_t capacity, pgsum;
+	uint32_t i, n, off, remaining, hdrlen, sendlen, p, pgoff, nsge_total;
+	char *h;
+	int rc;
+
+	/* Validate datalen + write-chunk shape, IDENTICAL to write_list. */
+	if (datalen == 0 || datalen > SVC_RDMA_MAX_WRITE) {
+		rc = EINVAL;
+		goto badm;
+	}
+	n = write->wc_nsegs;
+	if (n == 0 || n > SVC_RDMA_MAX_WRITE_SEGS) {
+		rc = EINVAL;
+		goto badm;
+	}
+	capacity = 0;
+	for (i = 0; i < n; i++) {
+		uint32_t slen = write->wc_segs[i].rs_length;
+
+		if (slen == 0 || slen > SVC_RDMA_MAX_SEG_LEN) {
+			rc = EINVAL;
+			goto badm;
+		}
+		capacity += slen;
+	}
+	if ((uint64_t)datalen > capacity) {
+		rc = EMSGSIZE;
+		goto badm;
+	}
+
+	/*
+	 * Validate the page vector (server-built, but bound it anyway): count fits
+	 * the arrays, each page <= PAGE_SIZE, and the pages sum EXACTLY to datalen
+	 * (the never-over-write invariant -- we write neither more nor less than the
+	 * read data the header advertises).
+	 */
+	if (npages == 0 || npages > SVC_RDMA_MAX_WRITE_PAGES) {
+		rc = EINVAL;
+		goto badm;
+	}
+	pgsum = 0;
+	for (p = 0; p < npages; p++) {
+		if (pages[p].pg_len == 0 || pages[p].pg_len > PAGE_SIZE) {
+			rc = EINVAL;
+			goto badm;
+		}
+		pgsum += pages[p].pg_len;
+	}
+	if (pgsum != datalen) {
+		rc = EINVAL;
+		goto badm;
+	}
+
+	/* Reduced-RDMA_MSG header size check, IDENTICAL to write_list. */
+	hdrlen = RPCRDMA_HDR_FIXED + RPCRDMA_WORD + 2 * RPCRDMA_WORD +
+	    n * (RPCRDMA_SEG_WORDS * RPCRDMA_WORD) + RPCRDMA_WORD + RPCRDMA_WORD;
+	if ((uint64_t)hdrlen + reducedlen > SVC_RDMA_INLINE) {
+		rc = EMSGSIZE;
+		goto badm;
+	}
+	sendlen = hdrlen + reducedlen;
+
+	ws = malloc(sizeof(*ws), M_NFSRDMA, M_NOWAIT | M_ZERO);
+	if (ws == NULL) {
+		rc = ENOMEM;
+		goto badm;
+	}
+	ws->ws_conn = conn;
+	ws->ws_srclen = datalen;
+	/*
+	 * Ownership transfer point: ws owns mrep from here on, so EVERY post-alloc
+	 * error path (all of which call svc_rdma_write_free) m_freem()s it exactly
+	 * once.  Set it BEFORE the page map loop.
+	 */
+	ws->ws_keepm = mrep;
+
+	/*
+	 * Map each source page DMA_TO_DEVICE.  Bump ws_npgs and set ws_pages_mapped
+	 * INCREMENTALLY, so on a mid-loop mapping error svc_rdma_write_free unmaps
+	 * exactly the mapped prefix (no leak, no manual unwind).  The page is a wired
+	 * kernel page reachable through the direct map (PHYS_TO_DMAP); no FRWR/MR
+	 * registration is needed for a LOCAL source -- the PD's local_dma_lkey covers
+	 * it, same as the contig path.
+	 */
+	for (p = 0; p < npages; p++) {
+		u64 d = ib_dma_map_single(dev,
+		    (void *)(PHYS_TO_DMAP(pages[p].pg_pa) + pages[p].pg_off),
+		    pages[p].pg_len, DMA_TO_DEVICE);
+
+		if (ib_dma_mapping_error(dev, d)) {
+			svc_rdma_write_free(ws);	/* unmaps prefix, m_freem(mrep) */
+			return (EIO);
+		}
+		ws->ws_pg_dma[p] = d;
+		ws->ws_pg_len[p] = pages[p].pg_len;
+		ws->ws_npgs = p + 1;
+		ws->ws_pages_mapped = true;
+	}
+
+	/* Build the reduced-RDMA_MSG SEND buffer, IDENTICAL to write_list. */
+	ws->ws_hdrlen = sendlen;
+	ws->ws_hdr = malloc(sendlen, M_NFSRDMA, M_NOWAIT);
+	if (ws->ws_hdr == NULL) {
+		svc_rdma_write_free(ws);
+		return (ENOMEM);
+	}
+	h = ws->ws_hdr;
+	be32enc(h +  0, xid);
+	be32enc(h +  4, RPCRDMA_VERSION);
+	be32enc(h +  8, (uint32_t)conn->sc_nrecv);
+	be32enc(h + 12, RDMA_MSG);
+	be32enc(h + 16, 0);
+	be32enc(h + 20, 1);
+	be32enc(h + 24, n);
+	off = 28;
+	remaining = datalen;
+	for (i = 0; i < n; i++) {
+		uint32_t slen = write->wc_segs[i].rs_length;
+		uint32_t wlen = (remaining < slen) ? remaining : slen;
+
+		be32enc(h + off + 0, write->wc_segs[i].rs_handle);
+		be32enc(h + off + 4, wlen);
+		be64enc(h + off + 8, write->wc_segs[i].rs_offset);
+		off += RPCRDMA_SEG_WORDS * RPCRDMA_WORD;
+		remaining -= wlen;
+	}
+	be32enc(h + off, 0);
+	off += RPCRDMA_WORD;
+	be32enc(h + off, 0);
+	off += RPCRDMA_WORD;
+	if (reducedlen > 0)
+		memcpy(h + off, reduced, reducedlen);
+	ws->ws_hdr_dma = ib_dma_map_single(dev, ws->ws_hdr, sendlen,
+	    DMA_TO_DEVICE);
+	if (ib_dma_mapping_error(dev, ws->ws_hdr_dma)) {
+		svc_rdma_write_free(ws);
+		return (EIO);
+	}
+	ws->ws_hdr_mapped = true;
+
+	/*
+	 * Build the RDMA Write WR chain.  Walk write-list segments OUTER and source
+	 * pages INNER in lockstep: cap each segment at min(remaining, rs_length)
+	 * (never-over-write), gather consecutive pages into one WR's SGE list up to
+	 * sc_max_send_sge, and start a new WR when the SGE list fills OR the segment
+	 * ends (a WR carries exactly one segment's rkey/remote_addr).  Unsignaled,
+	 * routed to the per-conn sink cqe (3f-20); only the tail SEND is signaled.
+	 */
+	ws->ws_cqe.done = svc_rdma_wc_rdma_write;
+	remaining = datalen;
+	p = 0;
+	pgoff = 0;
+	nsge_total = 0;
+	ws->ws_nwr = 0;
+	for (i = 0; i < n && remaining > 0; i++) {
+		uint32_t slen = write->wc_segs[i].rs_length;
+		uint32_t wlen = (remaining < slen) ? remaining : slen;
+		uint64_t raddr = write->wc_segs[i].rs_offset;
+		uint32_t seg_left = wlen;
+
+		while (seg_left > 0) {
+			int k = ws->ws_nwr;
+			struct ib_sge *sg = &ws->ws_sge[nsge_total];
+			int nsge = 0;
+			uint32_t wbytes = 0;
+
+			if (k >= SVC_RDMA_MAX_WRITE_WRS) {
+				svc_rdma_write_free(ws);
+				return (EMSGSIZE);
+			}
+			while (seg_left > 0 && nsge < (int)conn->sc_max_send_sge &&
+			    p < npages && nsge_total < SVC_RDMA_MAX_WRITE_SGE) {
+				uint32_t pavail = ws->ws_pg_len[p] - pgoff;
+				uint32_t take = (seg_left < pavail) ? seg_left : pavail;
+
+				sg[nsge].addr = ws->ws_pg_dma[p] + pgoff;
+				sg[nsge].length = take;
+				sg[nsge].lkey = conn->sc_pd->local_dma_lkey;
+				nsge++;
+				nsge_total++;
+				wbytes += take;
+				seg_left -= take;
+				pgoff += take;
+				if (pgoff == ws->ws_pg_len[p]) {
+					p++;
+					pgoff = 0;
+				}
+			}
+			if (nsge == 0 || (seg_left > 0 && p >= npages)) {
+				/* pages ran out mid-segment, or SGE array full: bug/overflow */
+				svc_rdma_write_free(ws);
+				return (EFAULT);
+			}
+			memset(&ws->ws_wr[k], 0, sizeof(ws->ws_wr[k]));
+			ws->ws_wr[k].wr.wr_cqe = &conn->sc_write_sink_cqe;	/* 3f-20 */
+			ws->ws_wr[k].wr.sg_list = sg;
+			ws->ws_wr[k].wr.num_sge = nsge;
+			ws->ws_wr[k].wr.opcode = IB_WR_RDMA_WRITE;
+			ws->ws_wr[k].wr.send_flags = 0;		/* unsignaled */
+			ws->ws_wr[k].remote_addr = raddr;
+			ws->ws_wr[k].rkey = write->wc_segs[i].rs_handle;
+			ws->ws_nwr++;
+			raddr += wbytes;
+		}
+		remaining -= wlen;
+	}
+
+	/* The tail reduced-RDMA_MSG SEND, signaled -- one completion per chain. */
+	ws->ws_sndsge.addr = ws->ws_hdr_dma;
+	ws->ws_sndsge.length = sendlen;
+	ws->ws_sndsge.lkey = conn->sc_pd->local_dma_lkey;
+	memset(&ws->ws_sndwr, 0, sizeof(ws->ws_sndwr));
+	ws->ws_sndwr.wr_cqe = &ws->ws_cqe;
+	ws->ws_sndwr.sg_list = &ws->ws_sndsge;
+	ws->ws_sndwr.num_sge = 1;
+	ws->ws_sndwr.opcode = IB_WR_SEND;
+	ws->ws_sndwr.send_flags = IB_SEND_SIGNALED;
+	ws->ws_sndwr.next = NULL;
+
+	for (i = 0; i + 1 < (uint32_t)ws->ws_nwr; i++)
+		ws->ws_wr[i].wr.next = &ws->ws_wr[i + 1].wr;
+	if (ws->ws_nwr > 0)
+		ws->ws_wr[ws->ws_nwr - 1].wr.next = &ws->ws_sndwr;
+
+	mtx_lock(&conn->sc_lock);
+	if (conn->sc_state != SC_UP) {
+		mtx_unlock(&conn->sc_lock);
+		svc_rdma_write_free(ws);
+		return (ENOTCONN);
+	}
+	TAILQ_INSERT_TAIL(&conn->sc_writes, ws, ws_link);
+	ws->ws_active = true;
+	conn->sc_sends++;
+	mtx_unlock(&conn->sc_lock);
+
+	rc = ib_post_send(conn->sc_id->qp,
+	    ws->ws_nwr > 0 ? &ws->ws_wr[0].wr : &ws->ws_sndwr, &bad_wr);
+
+	mtx_lock(&conn->sc_lock);
+	if (--conn->sc_sends == 0)
+		wakeup(&conn->sc_upcalls);
+	mtx_unlock(&conn->sc_lock);
+
+	if (rc != 0) {
+		if (ppsratecheck(&svc_rdma_log_last, &svc_rdma_log_pps, 5))
+			printf("nfsrdma: ib_post_send (write-list READ pages) failed: "
+			    "%d (prefix may be committed; drain reclaims)\n", rc);
+		svc_rdma_conn_close(conn);
+		return (rc < 0 ? -rc : rc);
+	}
+	return (0);
+
+	/*
+	 * Pre-ws-allocation failures (validation, EMSGSIZE, ENOMEM before ws
+	 * exists): we own mrep but never attached it to a ws, so m_freem() it here
+	 * -- the "engine owns mrep on every return" contract, mirroring the contig
+	 * twin's badsrc.  Every path AFTER ws_keepm = mrep frees mrep through
+	 * svc_rdma_write_free (or, on a committed partial post, at drain) and must
+	 * not reach this label.
+	 */
+badm:
+	if (mrep != NULL)
+		m_freem(mrep);
 	return (rc);
 }
 
@@ -4762,7 +5110,7 @@ svc_rdma_accept(struct rdma_cm_id *id)
 	struct svc_rdma_conn *conn;
 	struct ib_device *dev = id->device;
 	const struct ib_recv_wr *bad_wr;
-	u32 max_wr, max_send_wr, max_sge;
+	u32 max_wr, max_send_wr, max_sge, max_send_sge;
 	u32 send_vec, recv_vec;
 	int i, rc;
 
@@ -4849,13 +5197,22 @@ svc_rdma_accept(struct rdma_cm_id *id)
 		max_wr = dev->attrs.max_qp_wr;
 	max_send_wr = max_wr + 2 * SVC_RDMA_MR_DEPTH +
 	    max_wr * SVC_RDMA_MAX_READ_SEGS +
-	    max_wr * (SVC_RDMA_MAX_WRITE_SEGS + 1);
+	    max_wr * (SVC_RDMA_MAX_WRITE_WRS + 1);	/* 3f-19: page-gather chain */
 	if (dev->attrs.max_qp_wr > 0 &&
 	    (u32)dev->attrs.max_qp_wr < max_send_wr)
 		max_send_wr = dev->attrs.max_qp_wr;
 	max_sge = 1;
 	if (dev->attrs.max_sge > 0 && (u32)dev->attrs.max_sge < max_sge)
 		max_sge = dev->attrs.max_sge;
+	/*
+	 * Recv WRs use one SGE (an inline recv buffer); send WRs gather up to
+	 * SVC_RDMA_MAX_SEND_SGE pages for the zero-copy outbound READ (3f-19),
+	 * clamped to the device.  The page-gather loop uses the GRANTED value
+	 * (conn->sc_max_send_sge), set after rdma_create_qp.
+	 */
+	max_send_sge = SVC_RDMA_MAX_SEND_SGE;
+	if (dev->attrs.max_sge > 0 && (u32)dev->attrs.max_sge < max_send_sge)
+		max_send_sge = dev->attrs.max_sge;
 
 	conn->sc_pd = ib_alloc_pd(dev, 0);
 	if (IS_ERR(conn->sc_pd)) {
@@ -4919,20 +5276,55 @@ svc_rdma_accept(struct rdma_cm_id *id)
 	qp_attr.qp_type = IB_QPT_RC;
 	qp_attr.cap.max_send_wr = max_send_wr;
 	qp_attr.cap.max_recv_wr = max_wr;
-	qp_attr.cap.max_send_sge = max_sge;
+	qp_attr.cap.max_send_sge = max_send_sge;	/* 3f-19 page gather */
 	qp_attr.cap.max_recv_sge = max_sge;
 	qp_attr.cap.max_inline_data = 0;
 
 	/*
-	 * rdma_create_qp() records the QP in id->qp on success; on failure
-	 * id->qp stays NULL, which is exactly what svc_rdma_conn_free_verbs()
-	 * relies on to decide whether to rdma_destroy_qp().
+	 * Create the QP.  The page-gather SQ (3f-19) requests a large send queue
+	 * whose per-WQE size is inflated by max_send_sge; on some providers the
+	 * ideal SQ exceeds what can be allocated and rdma_create_qp returns
+	 * -ENOMEM (mlx5 rounds the WQE-buffer up to a power of two, so the exact
+	 * ceiling is hard to predict statically).  Rather than guess, request the
+	 * ideal size and, on ENOMEM, halve max_send_wr and retry down to a floor
+	 * that still holds ONE full in-flight chain (one inbound read + one
+	 * page-write reply + its SEND + MR head-room).  A smaller SQ only means
+	 * ib_post_send can fill under heavy concurrency -- which every post path
+	 * already handles by closing the connection -- never a silent overflow.
+	 * rdma_create_qp() records id->qp on success; on failure id->qp stays
+	 * NULL, which svc_rdma_conn_free_verbs() relies on to decide whether to
+	 * rdma_destroy_qp().  The provider may write granted caps back into
+	 * qp_attr.cap, so we keep using our own max_send_sge (<= requested) for
+	 * conn->sc_max_send_sge, never the written-back value.
 	 */
-	rc = rdma_create_qp(id, conn->sc_pd, &qp_attr);
-	if (rc != 0) {
-		printf("nfsrdma: rdma_create_qp failed: %d\n", rc < 0 ? -rc : rc);
-		goto fail;
+	{
+		u32 min_send_wr = max_wr + 2 * SVC_RDMA_MR_DEPTH +
+		    SVC_RDMA_MAX_READ_SEGS + (SVC_RDMA_MAX_WRITE_WRS + 1);
+
+		if (min_send_wr > max_send_wr)		/* tiny-cap device */
+			min_send_wr = max_send_wr;
+		for (;;) {
+			qp_attr.cap.max_send_wr = max_send_wr;
+			rc = rdma_create_qp(id, conn->sc_pd, &qp_attr);
+			if (rc == 0)
+				break;
+			if ((rc == -ENOMEM || rc == ENOMEM) &&
+			    max_send_wr > min_send_wr) {
+				u32 half = max_send_wr / 2;
+
+				max_send_wr = (half > min_send_wr) ?
+				    half : min_send_wr;
+				continue;
+			}
+			printf("nfsrdma: rdma_create_qp failed: %d\n",
+			    rc < 0 ? -rc : rc);
+			goto fail;
+		}
 	}
+	conn->sc_max_send_sge = max_send_sge;	/* 3f-19: page-gather loop reads this */
+	if (ppsratecheck(&svc_rdma_log_last, &svc_rdma_log_pps, 1))
+		printf("nfsrdma: QP up: send-queue %u WRs, send-sge %u\n",
+		    max_send_wr, max_send_sge);
 
 	/*
 	 * Allocate and post the receive buffers.  Each buffer is a fixed
@@ -5517,6 +5909,7 @@ static const struct svc_rdma_verbs_ops ibcore_verbs_ops = {
 	.svo_conn_send		= svc_rdma_conn_send,
 	.svo_conn_reply_chunk	= svc_rdma_conn_reply_chunk,
 	.svo_conn_write_list	= svc_rdma_conn_write_list,
+	.svo_conn_write_list_pages = svc_rdma_conn_write_list_pages,
 	.svo_conn_set_ctx	= svc_rdma_conn_set_ctx,
 	.svo_conn_get_ctx	= svc_rdma_conn_get_ctx,
 	.svo_conn_credits	= svc_rdma_conn_credits,

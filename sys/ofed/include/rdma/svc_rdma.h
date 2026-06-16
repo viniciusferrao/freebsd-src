@@ -90,6 +90,25 @@
  */
 MALLOC_DECLARE(M_NFSRDMA);
 
+struct mbuf;
+
+/*
+ * Zero-copy outbound-READ source descriptor (TASK_003f-19).  When the nfsd builds
+ * a READ reply in M_EXTPG page-list mbufs (Rick Macklem's enable_mextpg path), the
+ * krpc consumer hands the verbs engine the data pages directly instead of a
+ * contigmalloc'd copy.  Each descriptor is one page's worth of read data: pg_pa is
+ * the PHYSICAL address (from m_epg_pa[i]) -- the engine maps PHYS_TO_DMAP(pg_pa) +
+ * pg_off, never a vm_page_t (some EXTPG pages are unmanaged) -- pg_off is the
+ * intra-page byte offset (0 for read data) and pg_len the bytes in this page; the
+ * sum of pg_len over the array equals datalen.  The engine takes ownership of the
+ * source mbuf chain and m_freem()s it at write completion.
+ */
+struct svc_rdma_page {
+	vm_paddr_t	pg_pa;
+	uint32_t	pg_off;
+	uint32_t	pg_len;
+};
+
 /*
  * Opaque per-accepted-connection handle.  The concrete struct svc_rdma_conn is
  * defined privately in svc_verbs.c (it carries the cm_id, QP/CQ/PD, buffer
@@ -465,6 +484,20 @@ int	svc_rdma_conn_write_list(struct svc_rdma_conn *conn, uint32_t xid,
 	    uint32_t datalen, const void *reduced, uint32_t reducedlen);
 
 /*
+ * Zero-copy twin of svc_rdma_conn_write_list (TASK_003f-19): RDMA-Write the READ
+ * data DIRECTLY from the reply's M_EXTPG pages (pages[]/npages, summing to
+ * datalen) instead of a contigmalloc'd copy.  Same lifetime/completion/
+ * partial-post rules.  Takes OWNERSHIP of mrep on EVERY return (0 or a positive
+ * errno) -- like svc_rdma_conn_write_list's "engine owns src on every return" --
+ * and m_freem()s it at completion, at drain on a committed partial post, or
+ * immediately on an early error.  The caller must NOT touch mrep after this call.
+ */
+int	svc_rdma_conn_write_list_pages(struct svc_rdma_conn *conn, uint32_t xid,
+	    const struct svc_rdma_write_chunk *write, struct mbuf *mrep,
+	    const struct svc_rdma_page *pages, uint32_t npages,
+	    uint32_t datalen, const void *reduced, uint32_t reducedlen);
+
+/*
  * Report the flow-control credit the verbs layer GRANTED this connection: the
  * number of receive buffers (and thus recv WRs) it actually posted, which is the
  * value a reply's RPC-over-RDMA header should advertise in rdma_credit (RFC 8166
@@ -535,6 +568,20 @@ struct svc_rdma_verbs_ops {
 	 */
 	int	(*svo_conn_write_list)(struct svc_rdma_conn *conn, uint32_t xid,
 		    const struct svc_rdma_write_chunk *write, void *src,
+		    uint32_t datalen, const void *reduced, uint32_t reducedlen);
+	/*
+	 * svo_conn_write_list_pages -> svc_rdma_conn_write_list_pages: the
+	 * zero-copy twin of svo_conn_write_list (TASK_003f-19).  The source is the
+	 * READ reply's M_EXTPG data pages (mrep + pages[]/npages) instead of a
+	 * contigmalloc'd copy.  The engine OWNS mrep on EVERY return (0 or errno) and
+	 * m_freem()s it at completion, at drain on a committed partial post, or
+	 * immediately on an early error; the caller must NOT touch mrep afterward.
+	 * OPTIONAL (NULL-checked at the call site): an older ibcore without it leaves
+	 * the krpc consumer on the contigmalloc fallback.
+	 */
+	int	(*svo_conn_write_list_pages)(struct svc_rdma_conn *conn, uint32_t xid,
+		    const struct svc_rdma_write_chunk *write, struct mbuf *mrep,
+		    const struct svc_rdma_page *pages, uint32_t npages,
 		    uint32_t datalen, const void *reduced, uint32_t reducedlen);
 	void	(*svo_conn_set_ctx)(struct svc_rdma_conn *conn, void *cctx);
 	void	*(*svo_conn_get_ctx)(struct svc_rdma_conn *conn);
