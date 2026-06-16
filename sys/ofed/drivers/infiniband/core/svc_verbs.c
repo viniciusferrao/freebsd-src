@@ -836,7 +836,7 @@ static void svc_rdma_repost(struct svc_rdma_conn *conn, struct svc_rdma_recv *rr
 static void svc_rdma_wc_rdma_write(struct ib_cq *cq, struct ib_wc *wc);
 static void svc_rdma_write_free(struct svc_rdma_write_state *ws);
 int svc_rdma_conn_write_list(struct svc_rdma_conn *conn, uint32_t xid,
-    const struct svc_rdma_write_chunk *write, const void *data,
+    const struct svc_rdma_write_chunk *write, void *src,
     uint32_t datalen, const void *reduced, uint32_t reducedlen);
 
 /*
@@ -3140,7 +3140,7 @@ svc_rdma_wc_rdma_write(struct ib_cq *cq, struct ib_wc *wc)
  */
 int
 svc_rdma_conn_write_list(struct svc_rdma_conn *conn, uint32_t xid,
-    const struct svc_rdma_write_chunk *write, const void *data,
+    const struct svc_rdma_write_chunk *write, void *src,
     uint32_t datalen, const void *reduced, uint32_t reducedlen)
 {
 	struct svc_rdma_write_state *ws;
@@ -3156,16 +3156,20 @@ svc_rdma_conn_write_list(struct svc_rdma_conn *conn, uint32_t xid,
 	 * not reach here (the consumer skips DDP for cnt == 0); a read over the
 	 * whole-transfer cap is refused rather than written.
 	 */
-	if (datalen == 0 || datalen > SVC_RDMA_MAX_WRITE)
-		return (EINVAL);
+	if (datalen == 0 || datalen > SVC_RDMA_MAX_WRITE) {
+		rc = EINVAL;
+		goto badsrc;
+	}
 
 	/*
 	 * Re-validate the write chunk SHAPE at post time (untrusted peer), exactly
 	 * as reply_chunk re-validates the reply chunk.
 	 */
 	n = write->wc_nsegs;
-	if (n == 0 || n > SVC_RDMA_MAX_WRITE_SEGS)
-		return (EINVAL);
+	if (n == 0 || n > SVC_RDMA_MAX_WRITE_SEGS) {
+		rc = EINVAL;
+		goto badsrc;
+	}
 
 	/*
 	 * Offered CAPACITY (sum of segment lengths) with no uint32 overflow,
@@ -3176,12 +3180,16 @@ svc_rdma_conn_write_list(struct svc_rdma_conn *conn, uint32_t xid,
 	for (i = 0; i < n; i++) {
 		uint32_t slen = write->wc_segs[i].rs_length;
 
-		if (slen == 0 || slen > SVC_RDMA_MAX_SEG_LEN)
-			return (EINVAL);
+		if (slen == 0 || slen > SVC_RDMA_MAX_SEG_LEN) {
+			rc = EINVAL;
+			goto badsrc;
+		}
 		capacity += slen;
 	}
-	if ((uint64_t)datalen > capacity)
-		return (EMSGSIZE);
+	if ((uint64_t)datalen > capacity) {
+		rc = EMSGSIZE;
+		goto badsrc;
+	}
 
 	/*
 	 * The reduced RDMA_MSG SEND = transport header (with the echoed write
@@ -3206,8 +3214,10 @@ svc_rdma_conn_write_list(struct svc_rdma_conn *conn, uint32_t xid,
 	    n * (RPCRDMA_SEG_WORDS * RPCRDMA_WORD) +	/* the segments */
 	    RPCRDMA_WORD +				/* write list terminator */
 	    RPCRDMA_WORD;				/* reply chunk absent */
-	if ((uint64_t)hdrlen + reducedlen > SVC_RDMA_INLINE)
-		return (EMSGSIZE);
+	if ((uint64_t)hdrlen + reducedlen > SVC_RDMA_INLINE) {
+		rc = EMSGSIZE;
+		goto badsrc;
+	}
 	sendlen = hdrlen + reducedlen;
 
 	/*
@@ -3216,24 +3226,25 @@ svc_rdma_conn_write_list(struct svc_rdma_conn *conn, uint32_t xid,
 	 * zeroed so every token starts false/NULL.
 	 */
 	ws = malloc(sizeof(*ws), M_NFSRDMA, M_NOWAIT | M_ZERO);
-	if (ws == NULL)
-		return (ENOMEM);
+	if (ws == NULL) {
+		rc = ENOMEM;
+		goto badsrc;
+	}
 	ws->ws_conn = conn;
 
 	/*
-	 * Copy the read data into the DMA source buffer and map it DMA_TO_DEVICE
-	 * (the HCA READS it to push into the client).  contigmalloc for the same
-	 * reason as reply_chunk's ws_src: a multi-page transfer must be physically
-	 * contiguous for ib_dma_map_single.
+	 * Take ownership of the caller-supplied DMA source buffer and map it
+	 * DMA_TO_DEVICE (the HCA READS it to push into the client).  src was
+	 * contigmalloc'd AND filled with the read data by the caller BEFORE it took
+	 * xr_lock -- the ~100 us per-READ copy that used to run here under the lock
+	 * (serializing every concurrent read, the measured read ceiling) is now off
+	 * the critical section; this routine only maps + posts.  contigmalloc'd for
+	 * the same reason as reply_chunk's ws_src: a multi-page transfer must be
+	 * physically contiguous for ib_dma_map_single.  ws owns src from here on
+	 * (svc_rdma_write_free frees it).
 	 */
 	ws->ws_srclen = datalen;
-	ws->ws_src = contigmalloc(datalen, M_NFSRDMA, M_NOWAIT, 0,
-	    ~(vm_paddr_t)0, PAGE_SIZE, 0);
-	if (ws->ws_src == NULL) {
-		free(ws, M_NFSRDMA);
-		return (ENOMEM);
-	}
-	memcpy(ws->ws_src, data, datalen);
+	ws->ws_src = src;
 	ws->ws_src_dma = ib_dma_map_single(dev, ws->ws_src, datalen,
 	    DMA_TO_DEVICE);
 	if (ib_dma_mapping_error(dev, ws->ws_src_dma)) {
@@ -3371,6 +3382,17 @@ svc_rdma_conn_write_list(struct svc_rdma_conn *conn, uint32_t xid,
 		return (rc < 0 ? -rc : rc);
 	}
 	return (0);
+
+	/*
+	 * Pre-ws-allocation failures (untrusted-peer validation, EMSGSIZE, ENOMEM):
+	 * we own the caller's src buffer but never attached it to a ws, so free it
+	 * here.  Once ws exists and ws_src = src, every later path frees src through
+	 * svc_rdma_write_free (the completion, the SC_UP/post-fail teardown), so they
+	 * must NOT reach this label.
+	 */
+badsrc:
+	free(src, M_NFSRDMA);
+	return (rc);
 }
 
 /*
