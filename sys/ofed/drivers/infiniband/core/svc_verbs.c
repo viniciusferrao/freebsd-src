@@ -73,6 +73,7 @@
 #include <linux/netdevice.h>	/* init_net */
 #include <linux/dma-mapping.h>	/* DMA_FROM_DEVICE */
 #include <linux/scatterlist.h>	/* sg_init_one for the FRWR map (TASK_003f-2) */
+#include <linux/sched.h>	/* linux_set_current for the krpc post threads (#59) */
 #include <rdma/rdma_cm.h>
 #include <rdma/ib_verbs.h>
 #include <rdma/svc_rdma.h>	/* consumer upcall interface (TASK_003e-1) */
@@ -4359,6 +4360,26 @@ svc_rdma_conn_credits(struct svc_rdma_conn *conn)
 
 	return ((uint32_t)conn->sc_nrecv);
 }
+
+/*
+ * Pre-allocate the calling thread's linuxkpi `current` shadow (#59).  The krpc
+ * reply paths call ib_post_send while holding the xr_lock leaf mutex, trusting
+ * that the post does not sleep.  That holds EXCEPT the first time a given krpc
+ * pool thread enters mlx5_ib_post_send: it dereferences `current`, and linuxkpi
+ * lazily allocates the per-thread shadow with M_WAITOK (a sleepable uma_zalloc),
+ * which WITNESS flags under the mutex.  The krpc consumer calls this once at the
+ * top of a reply -- OFF every lock, where M_WAITOK is legal -- so the shadow
+ * already exists when the under-lock post runs and mlx5 never allocates.
+ * linux_set_current is a no-op once the shadow is set, so per-reply calls are
+ * cheap.  Declared in <rdma/svc_rdma.h>.
+ */
+void
+svc_rdma_thread_setup(void)
+{
+
+	linux_set_current(curthread);
+}
+
 /*
  * Surface the connection's PEER address (TASK_003f-6).  RDMA-CM resolved the
  * client's address into the cm_id during connection setup; for NFS-over-RDMA the
@@ -5888,6 +5909,7 @@ static const struct svc_rdma_verbs_ops ibcore_verbs_ops = {
 	.svo_conn_credits	= svc_rdma_conn_credits,
 	.svo_conn_peeraddr	= svc_rdma_conn_peeraddr,
 	.svo_conn_error		= svc_rdma_conn_error,
+	.svo_thread_setup	= svc_rdma_thread_setup,
 };
 
 /*
