@@ -711,6 +711,22 @@ svc_rdma_xprt_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 	bool have_pend;
 
 	/*
+	 * Pre-allocate this pool thread's linuxkpi `current` shadow OFF-LOCK (#59)
+	 * before any of the post sites below run ib_post_send under xr_lock: the
+	 * first mlx5_ib_post_send on a fresh krpc thread would otherwise do that
+	 * M_WAITOK alloc while holding the leaf mutex (WITNESS warns).  Optional op,
+	 * NULL on an older ibcore.  Snapshot svc_rdma_verbs into a local so the
+	 * NULL-check and the call use the SAME pointer (no TOCTOU on the global, and
+	 * the snapshot targets the never-freed registered table).
+	 */
+	{
+		const struct svc_rdma_verbs_ops *vops = svc_rdma_verbs;
+
+		if (vops != NULL && vops->svo_thread_setup != NULL)
+			vops->svo_thread_setup();
+	}
+
+	/*
 	 * Build the ONC RPC reply into a fresh pkthdr mbuf, mirroring
 	 * svc_vc_reply (minus the record-mark reservation: the RDMA transport
 	 * header is prepended after marshalling, not in-band).
@@ -1101,6 +1117,15 @@ svc_rdma_bck_send(SVCXPRT *xprt, struct mbuf *mreq)
 	char *buf;
 	u_int rlen, total;
 	int rc;
+
+	/* Pre-warm the linuxkpi `current` shadow off-lock before the post (#59);
+	 * snapshot the global so the NULL-check and call use one pointer. */
+	{
+		const struct svc_rdma_verbs_ops *vops = svc_rdma_verbs;
+
+		if (vops != NULL && vops->svo_thread_setup != NULL)
+			vops->svo_thread_setup();
+	}
 
 	rlen = m_length(mreq, NULL);
 	total = RPCRDMA_HDR_MIN + rlen;
