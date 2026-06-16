@@ -175,6 +175,7 @@ typedef struct __rpc_svcxprt {
 	uid_t		xp_uid;
 	gid_t		*xp_gidp;
 	int		xp_doneddp;
+	bool		xp_extpg;	/* xprt can DMA M_EXTPG read replies */
 } SVCXPRT;
 
 /*

@@ -632,6 +632,66 @@ svc_rdma_xprt_ack(SVCXPRT *xprt, uint32_t *ack)
  * overflow -- a drop is not fatal (the client's RC retransmit / a later op
  * proceeds; the recv side is unaffected).
  */
+
+/*
+ * Bound on zero-copy READ source pages: SVC_RDMA_MAX_WRITE (1 MiB) / PAGE_SIZE,
+ * matching SVC_RDMA_MAX_WRITE_PAGES in svc_verbs.c (the engine re-checks it).
+ */
+#define	SVC_RDMA_RD_MAXPGS	((1U << 20) / PAGE_SIZE)
+
+/*
+ * Collect the M_EXTPG data pages for the read span [doff, doff+dlen) of the reply
+ * mbuf chain (TASK_003f-19, Rick Macklem's enable_mextpg path), so the verbs
+ * engine can RDMA-Write them directly instead of from a contigmalloc'd copy.
+ * Returns the page count on success, or 0 to mean "not cleanly M_EXTPG -- use the
+ * contigmalloc fallback".  Conservative by construction: it requires doff to land
+ * exactly on an mbuf boundary, every mbuf in the span to be M_EXTPG with no
+ * embedded TLS header/trailer and a page-aligned start (m_epg_1st_off == 0), and
+ * the page count to fit pd[0..maxpd); any deviation returns 0.  Read-only walk; no
+ * locks, no allocation, no ownership change.
+ */
+static int
+svc_rdma_collect_extpg(struct mbuf *m, u_int doff, u_int dlen,
+    struct svc_rdma_page *pd, int maxpd)
+{
+	u_int cum, need;
+	int npd;
+
+	cum = 0;
+	while (m != NULL && cum + (u_int)m->m_len <= doff) {
+		cum += m->m_len;
+		m = m->m_next;
+	}
+	if (m == NULL || cum != doff)
+		return (0);		/* doff not on an mbuf boundary */
+
+	npd = 0;
+	need = dlen;
+	while (need > 0) {
+		int pg;
+
+		if (m == NULL || (m->m_flags & M_EXTPG) == 0 ||
+		    m->m_epg_hdrlen != 0 || m->m_epg_trllen != 0 ||
+		    m->m_epg_1st_off != 0)
+			return (0);	/* not a clean page-aligned EXTPG data mbuf */
+		for (pg = 0; pg < m->m_epg_npgs && need > 0; pg++) {
+			u_int plen = m_epg_pagelen(m, pg, 0);
+
+			if (plen > need)
+				plen = need;	/* trim the final (padded) page to dlen */
+			if (npd >= maxpd)
+				return (0);	/* more pages than the engine can take */
+			pd[npd].pg_pa = m->m_epg_pa[pg];
+			pd[npd].pg_off = 0;
+			pd[npd].pg_len = plen;
+			npd++;
+			need -= plen;
+		}
+		m = m->m_next;
+	}
+	return (npd);
+}
+
 static bool_t
 svc_rdma_xprt_reply(SVCXPRT *xprt, struct rpc_msg *msg,
     struct sockaddr *addr, struct mbuf *m, uint32_t *seq)
@@ -778,52 +838,86 @@ svc_rdma_xprt_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 			u_int reducedlen;
 			char *reduced;
 			void *src;
+			struct svc_rdma_page *pgs;
+			int npg;
 
 			if (nfsreply_len <= rlen && padded <= rlen &&
 			    doff <= rlen - padded) {
 				/*
-				 * src: the unpadded read bytes for the RDMA Write,
-				 * copied into a contiguous DMA source HERE, BEFORE
-				 * taking xr_lock -- the per-READ data copy is the
-				 * read ceiling (it used to run inside the engine
-				 * under xr_lock, serializing every concurrent read),
-				 * so we keep it off the lock and hand the filled
-				 * buffer to the engine, which only maps + posts under
-				 * the lock and OWNS src from the call on (frees it at
-				 * completion).  contigmalloc + M_NFSRDMA so the free
-				 * type matches the engine's.  reduced: the inline body
-				 * with [doff, doff+padded) removed (the data AND its
-				 * XDR pad) -- head [0,doff) ++ tail [doff+padded,rlen).
+				 * reduced: the inline body with [doff, doff+padded)
+				 * removed (the read data AND its XDR pad) -- head
+				 * [0,doff) ++ tail [doff+padded,rlen).  Built off the
+				 * xr_lock either way.
 				 */
 				reducedlen = rlen - padded;
-				src = contigmalloc(dlen, M_NFSRDMA, M_WAITOK, 0,
-				    ~(vm_paddr_t)0, PAGE_SIZE, 0);
 				reduced = malloc(reducedlen, M_SVCRDMA, M_WAITOK);
-				m_copydata(mrep, doff, dlen, src);
 				if (doff > 0)
 					m_copydata(mrep, 0, doff, reduced);
 				if (rlen > doff + padded)
 					m_copydata(mrep, doff + padded,
 					    rlen - (doff + padded),
 					    reduced + doff);
-				m_freem(mrep);
+
+				/*
+				 * ZERO-COPY (TASK_003f-19): if the engine offers the
+				 * page entry point and the read data is a clean M_EXTPG
+				 * page chain, RDMA-Write those pages DIRECTLY -- no
+				 * contigmalloc, no per-READ m_copydata of the data (the
+				 * old read ceiling).  svc_rdma_collect_extpg returns 0
+				 * to fall back to the contiguous copy.  pgs is heap
+				 * (~4 KiB) to stay off the kernel stack.
+				 */
+				pgs = malloc(SVC_RDMA_RD_MAXPGS * sizeof(*pgs),
+				    M_SVCRDMA, M_WAITOK);
+				npg = (svc_rdma_verbs->svo_conn_write_list_pages !=
+				    NULL) ? svc_rdma_collect_extpg(mrep, doff, dlen,
+				    pgs, SVC_RDMA_RD_MAXPGS) : 0;
+				if (npg == 0) {
+					/*
+					 * Fallback: copy the unpadded read data into a
+					 * contiguous DMA source OFF the lock and hand it
+					 * to the contig engine (which owns src).
+					 */
+					src = contigmalloc(dlen, M_NFSRDMA, M_WAITOK,
+					    0, ~(vm_paddr_t)0, PAGE_SIZE, 0);
+					m_copydata(mrep, doff, dlen, src);
+				} else
+					src = NULL;
 
 				mtx_lock(&xr->xr_lock);
 				conn = xr->xr_conn;
-				if (conn != NULL && svc_rdma_verbs != NULL &&
-				    svc_rdma_verbs->svo_conn_write_list != NULL) {
+				if (conn == NULL) {
+					rc = ENOTCONN;
+					if (npg == 0)
+						free(src, M_NFSRDMA);	/* never handed off */
+				} else if (npg > 0) {
+					rc = svc_rdma_verbs->svo_conn_write_list_pages(
+					    conn, msg->rm_xid, &pend.rp_writes, mrep,
+					    pgs, npg, dlen, reduced, reducedlen);
+					/*
+					 * The engine OWNS mrep on EVERY return (0 or
+					 * errno: it frees mrep at badm, through
+					 * svc_rdma_write_free, or at drain on a committed
+					 * partial post), so drop our reference here
+					 * UNCONDITIONALLY -- never m_freem() it below.
+					 */
+					mrep = NULL;
+					if (rc == 0)
+						seqval = ++xr->xr_seq;
+				} else {
 					rc = svc_rdma_verbs->svo_conn_write_list(
 					    conn, msg->rm_xid, &pend.rp_writes,
 					    src, dlen, reduced, reducedlen);
 					if (rc == 0)
 						seqval = ++xr->xr_seq;
-				} else {
-					rc = ENOTCONN;
-					free(src, M_NFSRDMA);	/* engine never took it */
+					/* svo_conn_write_list OWNS src on every return. */
 				}
 				mtx_unlock(&xr->xr_lock);
 
+				free(pgs, M_SVCRDMA);
 				free(reduced, M_SVCRDMA);
+				if (mrep != NULL)
+					m_freem(mrep);	/* fallback/error: engine didn't take it */
 
 				if (rc != 0) {
 					if (rc != ENOTCONN &&
@@ -1156,6 +1250,9 @@ svc_rdma_sro_newconn(void *ctx, struct svc_rdma_conn *conn)
 	xprt->xp_p1 = xr;
 	xprt->xp_p2 = NULL;
 	xprt->xp_ops = &svc_rdma_xp_ops;
+	xprt->xp_extpg = true;		/* TASK_003f-19: nfsd may build M_EXTPG READ
+					 * replies for this xprt; the verbs engine
+					 * RDMA-Writes the data pages directly. */
 	/*
 	 * No xp_idletimeout: the idle reaper (svc_checkidle) calls
 	 * soshutdown(xp_socket,...) unconditionally on a timed-out xprt, which
