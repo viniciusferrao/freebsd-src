@@ -106,6 +106,7 @@
 #include <sys/systm.h>
 #include <sys/endian.h>		/* be32dec: endian- and alignment-safe word decode */
 #include <sys/kernel.h>		/* SYSUNINIT, bootverbose */
+#include <sys/eventhandler.h>	/* vm_lowmem reclaim of the sink cache (#60) */
 #include <sys/lock.h>
 #include <sys/malloc.h>		/* malloc/free, MALLOC_DEFINE */
 #include <sys/mbuf.h>		/* zero-copy read-sink mbuf assembly (TASK_003f-3) */
@@ -272,13 +273,19 @@ MALLOC_DEFINE(M_NFSRDMA, "nfsrdma", "NFS over RDMA server");
 #define	SVC_RDMA_MAX_WRITE_SGE	(SVC_RDMA_MAX_WRITE_PAGES + SVC_RDMA_MAX_WRITE_SEGS)	/* 272 */
 
 /*
- * Per-connection pool of pre-allocated, pre-DMA-mapped CONTIGUOUS RDMA-Read
- * sink buffers (TASK_003f-8).  Each is SVC_RDMA_MAX_READ bytes (the per-request
- * read cap) and mapped DMA_FROM_DEVICE ONCE at accept, so the NFS-WRITE hot path
- * grabs a ready buffer instead of contigmalloc+map per write (which serializes
- * on the global physical-page allocator and caps WRITE throughput).  Capped at
- * the recv depth; a read that finds the pool empty falls back to the per-read
- * contigmalloc path.  16 * 1 MiB = 16 MiB/conn (benchmark-tuned).
+ * Per-connection pool of pre-DMA-mapped CONTIGUOUS RDMA-Read sink buffers
+ * (TASK_003f-8).  Each is SVC_RDMA_MAX_READ bytes (the per-request read cap) and
+ * mapped DMA_FROM_DEVICE ONCE at accept, so the NFS-WRITE hot path grabs a ready
+ * buffer instead of mapping per write.  Capped at the recv depth; a read that
+ * finds the pool empty falls back to a per-read borrow+map.  16 * 1 MiB =
+ * 16 MiB/conn (benchmark-tuned).
+ *
+ * The BACKING memory comes from the global recycle free-list (svc_rdma_sink_get/
+ * put, #60), not contigmalloc per buffer: the zero-copy WRITE hand-off evacuates
+ * a slot and the next read re-stocks it, so without recycling every write would
+ * contigmalloc+free a 1 MiB buffer -- and the free() unmaps KVA and forces a
+ * global TLB shootdown that caps WRITE throughput.  Recycling keeps that memory
+ * out of kmem on the steady-state path.
  */
 #define	SVC_RDMA_READBUF_POOL	16
 
@@ -466,6 +473,160 @@ struct svc_rdma_read_state {
 };
 
 /*
+ * Global recycling free-list for RDMA-Read sink buffers (#60).
+ *
+ * Every inbound NFS WRITE pulls its payload into a SVC_RDMA_MAX_READ-sized,
+ * physically-contiguous sink buffer.  Those were contigmalloc'd and free'd PER
+ * RPC: free()ing 1 MiB of KVA-mapped contiguous memory returns it to kmem,
+ * which UNMAPS the kernel VA and forces a TLB shootdown (an IPI to every CPU)
+ * plus pmap-lock contention.  At small-write rates that one free() dominated
+ * the server (~88% of nfsd on-CPU time, ~455 us/op) and pinned 4 KiB writes at
+ * ~7.8k IOPS regardless of payload size.  The per-conn pool did not help the
+ * WRITE path: the zero-copy hand-off EVACUATES the slot and frees the buffer,
+ * then the next read contigmalloc's a fresh one.
+ *
+ * Mirror what Linux svcrdma does (recycled rw/recv contexts): keep a global
+ * LIFO of fixed-size sink buffers and recycle them across RPCs and connections,
+ * so the steady-state write path never returns memory to kmem and never shoots
+ * down the TLB.  Buffers on the list are PLAIN, UNMAPPED, SVC_RDMA_MAX_READ-
+ * sized contiguous memory -- the DMA mapping is always torn down before a buffer
+ * is put back, and every buffer is full-size so any borrow fits any read.  The
+ * free-list link is stored in the buffer's first word: its contents are dead
+ * while free, and contigmalloc is PAGE_SIZE-aligned so the store is aligned.
+ *
+ * Bounded at SVC_RDMA_SINK_CACHE_MAX buffers (derived from the recv depth, ~4
+ * connections' worth of in-flight reads, NOT a magic constant); a put over the
+ * cap actually free()s (the one remaining path that can unmap/shoot down -- so a
+ * server busier than the cap pays the shootdown only on the overflow margin, a
+ * graceful degradation rather than a cliff).  The cache is ELASTIC: it grows on
+ * demand and is handed back to the system under memory pressure by a vm_lowmem
+ * handler (svc_rdma_sink_reclaim) -- this is contigmalloc memory, the scarcest
+ * allocator, so it must not pin a high-water-mark forever.  Fully drained at
+ * module unload (svc_rdma_uninit), after every connection has torn down.
+ */
+#define	SVC_RDMA_SINK_CACHE_MAX	(4 * SVC_RDMA_RECV_DEPTH)  /* ~256 MiB high-water; vm_lowmem reclaims it */
+static struct mtx svc_rdma_sink_lock;
+static void	*svc_rdma_sink_head;	/* LIFO; next ptr lives in buf[0] */
+static int	 svc_rdma_sink_count;
+static volatile int svc_rdma_sink_draining;	/* set once at unload; never cleared */
+static eventhandler_tag svc_rdma_sink_lowmem_tag; /* vm_lowmem registration (#60) */
+MTX_SYSINIT(svc_rdma_sink_lock, &svc_rdma_sink_lock, "nfsrdma_sink", MTX_DEF);
+
+/*
+ * Borrow a sink buffer: pop the recycle list, else contigmalloc a fresh one.
+ * Always SVC_RDMA_MAX_READ bytes so any buffer fits any read.  M_NOWAIT -- the
+ * callers (CQ workqueue, accept under the CM handler_mutex) are non-sleepable
+ * and already handle NULL.  Returned memory is UNMAPPED; the caller maps it.
+ */
+static void *
+svc_rdma_sink_get(void)
+{
+	void *buf;
+
+	mtx_lock(&svc_rdma_sink_lock);
+	buf = svc_rdma_sink_head;
+	if (buf != NULL) {
+		svc_rdma_sink_head = *(void **)buf;
+		svc_rdma_sink_count--;
+	}
+	mtx_unlock(&svc_rdma_sink_lock);
+	if (buf == NULL)
+		buf = contigmalloc(SVC_RDMA_MAX_READ, M_NFSRDMA, M_NOWAIT, 0,
+		    ~(vm_paddr_t)0, PAGE_SIZE, 0);
+	return (buf);
+}
+
+/*
+ * Return a sink buffer.  It MUST be plain, unmapped, SVC_RDMA_MAX_READ-sized
+ * contiguous memory (the invariant every caller upholds).  Recycle it unless the
+ * cache is full OR we are draining at unload, in which case free() it (bounded,
+ * rare).  NULL-safe.
+ *
+ * The svc_rdma_sink_draining gate makes a LATE put -- a sink mbuf that is nfsd-
+ * owned and outlives the conn (see svc_rdma_read_extfree) and is freed after
+ * svc_rdma_sink_drain() has run at module unload -- free() the buffer back to the
+ * system instead of re-stocking a list that will never be drained again.
+ *
+ * The flag is checked TWICE.  The first check is an unlocked atomic load BEFORE
+ * svc_rdma_sink_lock is taken: at module unload the MTX_SYSINIT teardown of
+ * svc_rdma_sink_lock (SI_SUB_LOCK = 0x1B00000) runs BEFORE malloc_uninit of
+ * M_NFSRDMA (SI_SUB_KMEM = 0x1800000), so a late ext_free in that window must NOT
+ * touch the already-destroyed mutex -- it free()s directly, exactly as the
+ * pre-recycle code did (which took no such lock).  The second check, under the
+ * lock, closes the post-drain re-stock leak (a put that passed the unlocked check
+ * just as drain set the flag still must not cache).  Once M_NFSRDMA itself is
+ * gone the residual exposure (free() / the stored ext_free function pointer) is
+ * inherent to any KLD ext_free and is unchanged from the pre-recycle code.
+ */
+static void
+svc_rdma_sink_put(void *buf)
+{
+	if (buf == NULL)
+		return;
+	if (atomic_load_acq_int(&svc_rdma_sink_draining)) {
+		free(buf, M_NFSRDMA);	/* unload: never touch the (torn-down) lock */
+		return;
+	}
+	mtx_lock(&svc_rdma_sink_lock);
+	if (!svc_rdma_sink_draining &&
+	    svc_rdma_sink_count < SVC_RDMA_SINK_CACHE_MAX) {
+		*(void **)buf = svc_rdma_sink_head;
+		svc_rdma_sink_head = buf;
+		svc_rdma_sink_count++;
+		buf = NULL;
+	}
+	mtx_unlock(&svc_rdma_sink_lock);
+	if (buf != NULL)
+		free(buf, M_NFSRDMA);
+}
+
+/* Pop-and-free every buffer currently on the recycle list (drops the lock for
+ * each free() so the contig free never nests under svc_rdma_sink_lock). */
+static void
+svc_rdma_sink_flush(void)
+{
+	void *buf;
+
+	mtx_lock(&svc_rdma_sink_lock);
+	while ((buf = svc_rdma_sink_head) != NULL) {
+		svc_rdma_sink_head = *(void **)buf;
+		svc_rdma_sink_count--;
+		mtx_unlock(&svc_rdma_sink_lock);
+		free(buf, M_NFSRDMA);
+		mtx_lock(&svc_rdma_sink_lock);
+	}
+	mtx_unlock(&svc_rdma_sink_lock);
+}
+
+/*
+ * vm_lowmem handler (#60): under memory pressure, hand the IDLE recycle cache
+ * back to the system.  In-flight sinks are not on the list and are untouched;
+ * the cache refills on demand (sink_get's contigmalloc fallback) once pressure
+ * passes.  This does NOT set svc_rdma_sink_draining -- it is a transient trim,
+ * the analogue of UMA's per-zone lowmem drain, not the permanent unload drain.
+ */
+static void
+svc_rdma_sink_reclaim(void *arg __unused, int how __unused)
+{
+	svc_rdma_sink_flush();
+}
+
+/*
+ * Free every recycled sink buffer; called from svc_rdma_uninit at unload.  Set
+ * the draining flag FIRST (under the lock) so any concurrent or later put stops
+ * caching and free()s instead -- the list then cannot be re-populated and any
+ * mbuf that outlives this drain returns its buffer to the system, not the list.
+ */
+static void
+svc_rdma_sink_drain(void)
+{
+	mtx_lock(&svc_rdma_sink_lock);
+	atomic_store_rel_int(&svc_rdma_sink_draining, 1);
+	mtx_unlock(&svc_rdma_sink_lock);
+	svc_rdma_sink_flush();
+}
+
+/*
  * mbuf ext_free for the read sink (TASK_003f-3).  The mbuf carries the sink
  * buffer pointer DIRECTLY as ext_arg1; this callback runs at refcount->0
  * (EXT_DISPOSABLE -> fires exactly once) and frees ONLY that PLAIN CPU MEMORY.
@@ -476,17 +637,23 @@ struct svc_rdma_read_state {
  * the DMA mapping is torn down in svc_rdma_wc_rdma_read (Review fix (b)), while
  * the conn and device are provably alive (the completion runs on this conn's CQ),
  * leaving the mbuf owning plain memory only.  No ib_device, no dma cookie here ->
- * no device use-after-free on DEVICE_REMOVAL / HCA kldunload.  free() never
- * sleeps or takes sc_lock/xr_lock, so the callback adds no lock-order edge and
- * cannot deadlock the teardown.
+ * no device use-after-free on DEVICE_REMOVAL / HCA kldunload.  svc_rdma_sink_put
+ * never sleeps and takes only the leaf svc_rdma_sink_lock (never sc_lock/xr_lock,
+ * and nothing is taken while holding it), so the callback adds no lock-order edge
+ * and cannot deadlock the teardown.
  */
 static void
 svc_rdma_read_extfree(struct mbuf *m)
 {
 	void *buf = m->m_ext.ext_arg1;
 
-	if (buf != NULL)
-		free(buf, M_NFSRDMA);
+	/*
+	 * RECYCLE, do not free() (#60): the buffer is plain unmapped
+	 * SVC_RDMA_MAX_READ-sized contiguous memory here (the mapping was torn
+	 * down in svc_rdma_wc_rdma_read).  Returning it to the free-list keeps
+	 * its KVA mapping out of kmem and avoids the per-write TLB shootdown.
+	 */
+	svc_rdma_sink_put(buf);
 }
 
 /*
@@ -2079,13 +2246,12 @@ svc_rdma_read_start(struct svc_rdma_conn *conn, struct svc_rdma_recv *rr,
 		void *nbuf;
 		u64 ndma;
 
-		nbuf = contigmalloc(SVC_RDMA_MAX_READ, M_NFSRDMA, M_NOWAIT, 0,
-		    ~(vm_paddr_t)0, PAGE_SIZE, 0);
+		nbuf = svc_rdma_sink_get();	/* recycle list, else contigmalloc (#60) */
 		if (nbuf != NULL) {
 			ndma = ib_dma_map_single(dev, nbuf, SVC_RDMA_MAX_READ,
 			    DMA_FROM_DEVICE);
 			if (ib_dma_mapping_error(dev, ndma)) {
-				free(nbuf, M_NFSRDMA);
+				svc_rdma_sink_put(nbuf);
 				nbuf = NULL;
 			}
 		}
@@ -2109,9 +2275,13 @@ svc_rdma_read_start(struct svc_rdma_conn *conn, struct svc_rdma_recv *rr,
 		ib_dma_sync_single_for_device(dev, rs->rs_dma, rs->rs_total,
 		    DMA_FROM_DEVICE);
 	} else {
-		/* Fallback: per-read contigmalloc + map (the original path). */
-		rs->rs_buf = contigmalloc(rs->rs_total, M_NFSRDMA, M_NOWAIT, 0,
-		    ~(vm_paddr_t)0, PAGE_SIZE, 0);
+		/*
+		 * Fallback: borrow from the recycle list (else contigmalloc) and
+		 * map (#60).  The buffer is full SVC_RDMA_MAX_READ size but only the
+		 * rs_total prefix is mapped/used, so read_sink_detach's rs_total
+		 * maplen and read_free's rs_total unmap stay exact.
+		 */
+		rs->rs_buf = svc_rdma_sink_get();
 		if (rs->rs_buf == NULL) {
 			free(rs->rs_head, M_NFSRDMA);
 			rs->rs_head = NULL;
@@ -2120,7 +2290,7 @@ svc_rdma_read_start(struct svc_rdma_conn *conn, struct svc_rdma_recv *rr,
 		rs->rs_dma = ib_dma_map_single(dev, rs->rs_buf, rs->rs_total,
 		    DMA_FROM_DEVICE);
 		if (ib_dma_mapping_error(dev, rs->rs_dma)) {
-			free(rs->rs_buf, M_NFSRDMA);
+			svc_rdma_sink_put(rs->rs_buf);
 			rs->rs_buf = NULL;
 			free(rs->rs_head, M_NFSRDMA);
 			rs->rs_head = NULL;
@@ -2304,8 +2474,7 @@ svc_rdma_read_sink_detach(struct svc_rdma_conn *conn,
 static void
 svc_rdma_read_sink_free_detached(void *buf)
 {
-	if (buf != NULL)
-		free(buf, M_NFSRDMA);
+	svc_rdma_sink_put(buf);		/* recycle, do not free() (#60) */
 }
 
 /*
@@ -2361,7 +2530,7 @@ svc_rdma_read_free(struct svc_rdma_conn *conn, struct svc_rdma_recv *rr)
 		rs->rs_mapped = false;
 	}
 	if (rs->rs_buf != NULL) {
-		free(rs->rs_buf, M_NFSRDMA);
+		svc_rdma_sink_put(rs->rs_buf);	/* recycle, do not free() (#60) */
 		rs->rs_buf = NULL;
 	}
 	if (rs->rs_head != NULL) {
@@ -4921,7 +5090,7 @@ svc_rdma_conn_free_verbs(struct svc_rdma_conn *conn)
 				ib_dma_unmap_single(dev, rb->rb_dma,
 				    SVC_RDMA_MAX_READ, DMA_FROM_DEVICE);
 			if (rb->rb_buf != NULL)
-				free(rb->rb_buf, M_NFSRDMA);
+				svc_rdma_sink_put(rb->rb_buf);	/* recycle (#60) */
 		}
 		free(conn->sc_rbpool, M_NFSRDMA);
 		conn->sc_rbpool = NULL;
@@ -5486,12 +5655,13 @@ svc_rdma_accept(struct rdma_cm_id *id)
 	}
 
 	/*
-	 * Read-buffer pool (TASK_003f-8): pre-allocate + DMA-map contiguous read
-	 * sinks so the NFS-WRITE RDMA-Read hot path does not contigmalloc per write.
-	 * Best-effort: cap at the recv depth, and stop at the first allocation/map
-	 * failure (a shorter pool just means more fallback, never an accept failure).
+	 * Read-buffer pool (TASK_003f-8): borrow + DMA-map contiguous read sinks
+	 * (from the global recycle list, #60) so the NFS-WRITE RDMA-Read hot path
+	 * does not allocate+map per write.  Best-effort: cap at the recv depth, and
+	 * stop at the first allocation/map failure (a shorter pool just means more
+	 * fallback, never an accept failure).
 	 *
-	 * M_NOWAIT for the contigmalloc (TASK_003f-10 review SHOULD-FIX): svc_rdma_accept
+	 * M_NOWAIT for the backing contigmalloc (TASK_003f-10 review SHOULD-FIX): svc_rdma_accept
 	 * runs under the RDMA-CM listener's handler_mutex, which serializes ALL new
 	 * connection acceptance.  A 1 MiB PHYSICALLY-contiguous M_WAITOK request can
 	 * block indefinitely on the physical-page allocator under fragmentation, so one
@@ -5509,8 +5679,7 @@ svc_rdma_accept(struct rdma_cm_id *id)
 		for (rbk = 0; rbk < conn->sc_nrbpool; rbk++) {
 			struct svc_rdma_readbuf *rb = &conn->sc_rbpool[rbk];
 
-			rb->rb_buf = contigmalloc(SVC_RDMA_MAX_READ, M_NFSRDMA,
-			    M_NOWAIT, 0, ~(vm_paddr_t)0, PAGE_SIZE, 0);
+			rb->rb_buf = svc_rdma_sink_get();	/* recycle list (#60) */
 			if (rb->rb_buf == NULL) {
 				conn->sc_nrbpool = rbk;	/* short pool */
 				break;
@@ -5518,7 +5687,7 @@ svc_rdma_accept(struct rdma_cm_id *id)
 			rb->rb_dma = ib_dma_map_single(dev, rb->rb_buf,
 			    SVC_RDMA_MAX_READ, DMA_FROM_DEVICE);
 			if (ib_dma_mapping_error(dev, rb->rb_dma)) {
-				free(rb->rb_buf, M_NFSRDMA);
+				svc_rdma_sink_put(rb->rb_buf);
 				rb->rb_buf = NULL;
 				conn->sc_nrbpool = rbk;
 				break;
@@ -5885,6 +6054,13 @@ svc_rdma_uninit(void *arg __unused)
 {
 
 	svc_rdma_listen_stop();
+	/*
+	 * Every connection has now torn down and returned its sink buffers to
+	 * the recycle list (#60); free them.  Runs at SI_ORDER_FIFTH, before the
+	 * MTX_SYSINIT teardown of svc_rdma_sink_lock (SI_SUB_LOCK), so the lock
+	 * is still live.
+	 */
+	svc_rdma_sink_drain();
 }
 SYSUNINIT(svc_rdma_uninit, SI_SUB_OFED_MODINIT, SI_ORDER_FIFTH,
     svc_rdma_uninit, NULL);
@@ -5945,6 +6121,11 @@ svc_rdma_verbs_register(void *arg __unused)
 	rc = svc_rdma_register_verbs(&ibcore_verbs_ops);
 	if (rc != 0)
 		printf("nfsrdma: svc_rdma_register_verbs failed: %d\n", rc);
+	/* Make the sink recycle cache elastic: give it back under memory
+	 * pressure (#60).  svc_rdma_sink_lock is live by now (MTX_SYSINIT runs
+	 * at the earlier SI_SUB_LOCK). */
+	svc_rdma_sink_lowmem_tag = EVENTHANDLER_REGISTER(vm_lowmem,
+	    svc_rdma_sink_reclaim, NULL, EVENTHANDLER_PRI_ANY);
 }
 SYSINIT(svc_rdma_verbs_register, SI_SUB_OFED_MODINIT, SI_ORDER_FIFTH,
     svc_rdma_verbs_register, NULL);
@@ -5987,6 +6168,13 @@ static void
 svc_rdma_verbs_unregister(void *arg __unused)
 {
 
+	/* Drop the vm_lowmem handler FIRST (SIXTH, before any teardown):
+	 * EVENTHANDLER_DEREGISTER waits for an in-flight reclaim to finish, so
+	 * svc_rdma_sink_reclaim cannot race the later svc_rdma_uninit drain. */
+	if (svc_rdma_sink_lowmem_tag != NULL) {
+		EVENTHANDLER_DEREGISTER(vm_lowmem, svc_rdma_sink_lowmem_tag);
+		svc_rdma_sink_lowmem_tag = NULL;
+	}
 	svc_rdma_unregister_verbs(&ibcore_verbs_ops);
 }
 SYSUNINIT(svc_rdma_verbs_unregister, SI_SUB_OFED_MODINIT, SI_ORDER_SIXTH,
