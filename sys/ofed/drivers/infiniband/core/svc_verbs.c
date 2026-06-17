@@ -995,6 +995,20 @@ SYSCTL_NODE(_vfs, OID_AUTO, nfsrdma, CTLFLAG_RW | CTLFLAG_MPSAFE, 0,
     "NFS over RDMA server");
 
 /*
+ * Per-connection read-buffer pool depth (pre-mapped RDMA-Read sink buffers).
+ * Default SVC_RDMA_READBUF_POOL.  Each slot is SVC_RDMA_MAX_READ of pinned
+ * contiguous memory; raising it lets more concurrent inbound NFS WRITEs borrow a
+ * pre-mapped sink instead of taking the per-read borrow+map fallback.  Read at
+ * accept time, so a new connection picks up a change; clamped to the recv depth
+ * at use (and the accept loop stops early on alloc/map failure, never an accept
+ * failure).
+ */
+static int svc_rdma_readbuf_pool = SVC_RDMA_READBUF_POOL;
+SYSCTL_INT(_vfs_nfsrdma, OID_AUTO, readbuf_pool, CTLFLAG_RWTUN,
+    &svc_rdma_readbuf_pool, 0,
+    "Pre-mapped RDMA-Read sink buffers per connection (clamped to recv depth)");
+
+/*
  * Rate limiter for the per-CONNECT_REQUEST log line.  A remote peer controls
  * the arrival rate of connection requests, so logging one line per request
  * unconditionally is a remotely-triggerable console-flood.  ppsratecheck()
@@ -5670,8 +5684,14 @@ svc_rdma_accept(struct rdma_cm_id *id)
 	 * never a stall) -- matching the per-read fallback at svc_rdma_read_start, which
 	 * is M_NOWAIT for the same reason.
 	 */
-	conn->sc_nrbpool = (SVC_RDMA_READBUF_POOL < conn->sc_nrecv) ?
-	    SVC_RDMA_READBUF_POOL : conn->sc_nrecv;
+	{
+		int pool = svc_rdma_readbuf_pool;	/* tunable; snapshot + clamp */
+
+		if (pool < 0)
+			pool = 0;
+		conn->sc_nrbpool = (pool < conn->sc_nrecv) ?
+		    pool : conn->sc_nrecv;
+	}
 	conn->sc_rbpool = malloc(conn->sc_nrbpool * sizeof(*conn->sc_rbpool),
 	    M_NFSRDMA, M_WAITOK | M_ZERO);
 	{
