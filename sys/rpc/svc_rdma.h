@@ -28,7 +28,7 @@
 
 /*
  * svc_rdma.h -- consumer upcall interface for the NFS-over-RDMA server verbs
- * layer (svc_verbs.c, in the ibcore module).
+ * layer (svc_verbs.c, in the nfsrdma module).
  *
  * The verbs layer is decoupled from the RPC policy.  svc_verbs.c
  * owns the RDMA-CM listener, the per-connection QP/CQ/PD, the recv/send buffer
@@ -36,14 +36,15 @@
  * krpc/SVCXPRT/nfsd.  A consumer (the krpc SVCXPRT in
  * sys/rpc/svc_rdma.c) registers a struct svc_rdma_ops upcall table plus an
  * opaque ctx with svc_rdma_listen_start_ops(); the verbs layer then calls back
- * into the consumer at the three lifecycle points (newconn / recv / disconnect)
- * and exposes svc_rdma_conn_send() so the consumer can post a marshalled reply.
+ * into the consumer at its lifecycle upcalls -- newconn, recv (inline sro_recv
+ * or assembled-mbuf sro_recv_mbuf), and disconnect -- and exposes
+ * svc_rdma_conn_send() so the consumer can post a marshalled reply.
  *
  * Module layering (docs/16-svcxprt-rdma-integration.md "Module layering"): the
- * verbs live in the ibcore module; the SVCXPRT/xp_ops live in the krpc layer
+ * verbs live in the nfsrdma module; the SVCXPRT/xp_ops live in the krpc layer
  * built into the kernel.  A kernel built-in cannot hard-link a loadable module's
  * symbols, so the consumer does NOT call these entry points directly at link
- * time -- ibcore registers this ops surface with krpc at module load and krpc
+ * time -- the nfsrdma module registers this ops surface with krpc at module load and krpc
  * invokes it through function pointers.  This header is the shared contract for
  * that registration; it declares only what a consumer needs and keeps every
  * verbs-internal detail (recv/send descriptors, the registry, the barriers)
@@ -208,7 +209,7 @@ struct svc_rdma_msg {
 	const void	*rpc;		/* inline RPC payload (buf + header) */
 	uint32_t	 rpc_len;	/* payload length */
 
-	uint32_t	 rd_nchunks;	/* valid entries in reads[] (<= cap) */
+	uint32_t	 rd_nchunks;	/* valid entries in reads[] */
 	uint32_t	 wr_nchunks;	/* valid entries in writes[] (<= cap) */
 	bool		 reply_present;	/* a reply chunk was encoded */
 	struct svc_rdma_read_chunk  reads[SVC_RDMA_MAX_READ_SEGS];
@@ -235,12 +236,12 @@ struct svc_rdma_msg {
  *
  *       Ordering vs. recv: receive buffers are posted before the connection is
  *       accepted, so the peer's first inline call can complete and reach the
- *       verbs layer BEFORE this ESTABLISHED event.  The verbs layer does NOT
- *       dispatch sro_recv for such an early call -- it drops it and reposts the
- *       buffer; the RC client retransmits the RPC, and a later recv is dispatched
- *       once this sro_newconn has completed and the connection is up.  So the
- *       consumer never sees an sro_recv before sro_newconn has returned; the only
- *       visible effect of the race is a one-retransmit delay on the very first op.
+ *       verbs layer BEFORE this ESTABLISHED event.  Early recvs that arrive
+ *       before (SC_UP && sc_newconn_done) are NOT dropped -- they are held on
+ *       sc_early STAILQ (capped MAX(1, sc_nrecv/2)) and replayed by the
+ *       ESTABLISHED handler after publishing sc_newconn_done.  An RC client
+ *       NEVER retransmits a delivered call; a drop would hang the mount forever.
+ *       So the consumer never sees an sro_recv before sro_newconn has returned.
  *
  *   sro_recv(ctx, conn, msg)  -> 0 to continue, nonzero to drop+close
  *       Called once per successfully-parsed inline RDMA_MSG call, from the recv
@@ -253,10 +254,10 @@ struct svc_rdma_msg {
  *       recv buffer is reposted to the QP as soon as sro_recv returns, so a
  *       consumer that needs the bytes past the call MUST copy them (e.g. into an
  *       mbuf chain) before returning.  The consumer MAY call svc_rdma_conn_send()
- *       synchronously from within sro_recv; that is supported in this context.
- *       Returning nonzero asks the verbs layer to close the
- *       connection (the consumer rejected the call); returning 0 lets the verbs
- *       layer repost and await the next call.
+ *       synchronously from within sro_recv; that is supported in this
+ *       context.  Returning nonzero asks the verbs layer to close the
+ *       connection (the consumer rejected the call); returning 0 lets the
+ *       verbs layer repost and await the next call.
  *
  *   sro_disconnect(ctx, conn)
  *       Delivered EXACTLY ONCE, and PAIRED with sro_newconn: it fires if and only
@@ -306,9 +307,10 @@ struct svc_rdma_ops {
  *
  * Returns 0 on success or a positive FreeBSD errno on failure (EINVAL for a
  * zero port or NULL ops, EBUSY if a listener is already up, or the normalized
- * errno from the rdma_*() bring-up).  ops MUST outlive the listener (it is a
- * function-pointer table the consumer owns; typically a static const in the
- * krpc module), as MUST ctx until svc_rdma_listen_stop() has returned.
+ * errno from the rdma_*() bring-up).  Binds AF_INET only (IPv4/IPoIB/RoCE
+ * wildcard); IPv6/rdma6 dual-stack is a TODO.  ops MUST outlive the listener
+ * (it is a function-pointer table the consumer owns; typically a static const
+ * in the krpc module), as MUST ctx until svc_rdma_listen_stop() has returned.
  */
 int	svc_rdma_listen_start_ops(uint16_t port, const struct svc_rdma_ops *ops,
 	    void *ctx);
@@ -378,7 +380,7 @@ int	svc_rdma_conn_send(struct svc_rdma_conn *conn, const void *buf,
  * (hold a reference keeping conn alive across the call).
  *
  * OPTIONAL verbs op (svo_conn_error): the consumer NULL-checks it at the call
- * site, so an older ibcore that predates it simply falls back to dropping the
+ * site, so an older nfsrdma that predates it simply falls back to dropping the
  * unplaceable reply.
  */
 int	svc_rdma_conn_error(struct svc_rdma_conn *conn, uint32_t xid,
@@ -458,7 +460,8 @@ int	svc_rdma_conn_reply_chunk(struct svc_rdma_conn *conn, uint32_t xid,
  */
 int	svc_rdma_conn_write_list(struct svc_rdma_conn *conn, uint32_t xid,
 	    const struct svc_rdma_write_chunk *write, void *src,
-	    uint32_t datalen, const void *reduced, uint32_t reducedlen);
+	    uint32_t datalen, const void *reduced, uint32_t reducedlen,
+	    bool src_pooled);
 
 /*
  * Zero-copy twin of svc_rdma_conn_write_list: RDMA-Write the READ
@@ -500,19 +503,21 @@ void	svc_rdma_thread_setup(void);
  *
  * Module layering (docs/16-svcxprt-rdma-integration.md "Module layering"): the
  * verbs entry points above (svc_rdma_listen_start_ops / svc_rdma_conn_send /
- * svc_rdma_conn_set_ctx / svc_rdma_conn_get_ctx) are DEFINED in the ibcore
+ * svc_rdma_conn_set_ctx / svc_rdma_conn_get_ctx) are DEFINED in the nfsrdma
  * module (svc_verbs.c).  The SVCXPRT/krpc consumer (sys/rpc/svc_rdma.c) is built
  * INTO the kernel, and a kernel built-in cannot hard-link a loadable module's
  * symbols.  So the call direction is inverted at link time: the krpc layer
  * EXPORTS the two registration entry points below as built-in kernel symbols,
- * and ibcore -- which CAN resolve a built-in kernel symbol -- calls
+ * and nfsrdma -- which CAN resolve a built-in kernel symbol -- calls
  * svc_rdma_register_verbs() at module load to hand krpc a table of the verbs
  * entry points (svc_rdma_verbs_ops).  krpc thereafter reaches the verbs only
- * through that registered table; with no table registered (ibcore not loaded)
+ * through that registered table; with no table registered (nfsrdma not loaded)
  * krpc refuses to create an RDMA transport (returns ENXIO) instead of chasing a
  * NULL or an unresolved symbol.
  *
- * struct svc_rdma_verbs_ops mirrors the verbs entry points one-for-one:
+ * struct svc_rdma_verbs_ops exposes the verbs entry points the consumer needs;
+ * the core entries map as (the optional data engines and pool ops are
+ * documented at their members below):
  *   svo_listen_start  -> svc_rdma_listen_start_ops
  *   svo_listen_stop   -> svc_rdma_listen_stop
  *   svo_conn_send     -> svc_rdma_conn_send
@@ -527,12 +532,12 @@ void	svc_rdma_thread_setup(void);
  * only through svo_listen_stop.  The signature here matches it.)
  *
  * The ops table the caller passes MUST outlive every call krpc can make through
- * it: ibcore passes a static const table and must svc_rdma_unregister_verbs()
+ * it: nfsrdma passes a static const table and must svc_rdma_unregister_verbs()
  * before that table (its module text) can go away.  Registration is single-
  * provider: a second svc_rdma_register_verbs() while one is registered is
  * rejected.  The CORE entries are required (krpc rejects a table missing one
  * with EINVAL); svo_conn_write_list, svo_conn_peeraddr and svo_conn_error are
- * OPTIONAL (NULL-checked at each call site) so an older ibcore predating them
+ * OPTIONAL (NULL-checked at each call site) so an older nfsrdma predating them
  * still registers.
  */
 struct svc_rdma_verbs_ops {
@@ -548,12 +553,13 @@ struct svc_rdma_verbs_ops {
 	 * svo_conn_write_list -> svc_rdma_conn_write_list (write-list READ
 	 * engine).  OPTIONAL: krpc NULL-checks it at the call site (like
 	 * svo_conn_peeraddr) and svc_rdma_register_verbs does NOT require it, so
-	 * an older ibcore predating the engine still registers and over-inline
+	 * an older nfsrdma predating the engine still registers and over-inline
 	 * READs simply fall back to the existing drop.
 	 */
 	int	(*svo_conn_write_list)(struct svc_rdma_conn *conn, uint32_t xid,
 		    const struct svc_rdma_write_chunk *write, void *src,
-		    uint32_t datalen, const void *reduced, uint32_t reducedlen);
+		    uint32_t datalen, const void *reduced, uint32_t reducedlen,
+		    bool src_pooled);
 	/*
 	 * svo_conn_write_list_pages -> svc_rdma_conn_write_list_pages: the
 	 * zero-copy twin of svo_conn_write_list.  The source is the
@@ -561,7 +567,7 @@ struct svc_rdma_verbs_ops {
 	 * contigmalloc'd copy.  The engine OWNS mrep on EVERY return (0 or errno) and
 	 * m_freem()s it at completion, at drain on a committed partial post, or
 	 * immediately on an early error; the caller must NOT touch mrep afterward.
-	 * OPTIONAL (NULL-checked at the call site): an older ibcore without it leaves
+	 * OPTIONAL (NULL-checked at the call site): an older nfsrdma without it leaves
 	 * the krpc consumer on the contigmalloc fallback.
 	 */
 	int	(*svo_conn_write_list_pages)(struct svc_rdma_conn *conn, uint32_t xid,
@@ -581,7 +587,7 @@ struct svc_rdma_verbs_ops {
 	 * (a per-request error; rdma_err is one of the RFC 8166 4.4 codes,
 	 * ERR_CHUNK == 2).  OPTIONAL: krpc NULL-checks it at the call site (like
 	 * svo_conn_write_list / svo_conn_peeraddr) and svc_rdma_register_verbs does
-	 * NOT require it, so an older ibcore predating it still registers and
+	 * NOT require it, so an older nfsrdma predating it still registers and
 	 * over-inline replies with no reply chunk simply fall back to the existing
 	 * silent drop.
 	 */
@@ -596,30 +602,37 @@ struct svc_rdma_verbs_ops {
 	 * mutex (WITNESS warns).  The consumer calls this OFF-LOCK at the top of a
 	 * reply, where M_WAITOK is legal, to pre-allocate that shadow so the
 	 * under-lock post never allocates.  OPTIONAL (NULL-checked); a no-op on an
-	 * older ibcore (the warning, which is non-fatal, simply persists there).
+	 * older nfsrdma (the warning, which is non-fatal, simply persists there).
 	 */
 	void	(*svo_thread_setup)(void);
+	/*
+	 * svo_sink_get / svo_sink_put -- OPTIONAL (NULL-checked at call site).
+	 * Route the write-list fallback buffer through the global recycle pool
+	 * (#B1) instead of per-op contigmalloc/free, eliminating the TLB
+	 * shootdown on the non-M_EXTPG path (same pool that #60 uses for the
+	 * read-sink and reply-chunk source).  When present, svc_rdma.c uses
+	 * svo_sink_get() instead of contigmalloc for the write-list src buffer
+	 * and signals svo_conn_write_list with src_pooled=true so write_free
+	 * calls svo_sink_put() instead of free().
+	 */
+	void	*(*svo_sink_get)(void);
+	void	(*svo_sink_put)(void *buf);
 };
 
 /*
- * Register / unregister the ibcore verbs-ops table with the krpc layer.  These
+ * Register / unregister the nfsrdma verbs-ops table with the krpc layer.  These
  * are DEFINED in sys/rpc/svc_rdma.c (built into the kernel) and CALLED from
- * ibcore (svc_verbs.c) at module load / unload.  register returns 0 on success
+ * the nfsrdma module (svc_verbs.c) at module load / unload.  register returns 0 on success
  * or EBUSY if a table is already registered (or EINVAL for a NULL/incomplete
  * table); unregister is idempotent.  ops MUST outlive the registration window
  * (register .. unregister).
  *
  * Registration is OWNER-KEYED.  svc_rdma_unregister_verbs() takes the SAME ops
  * pointer that the matching svc_rdma_register_verbs() recorded, and is a no-op
- * unless that pointer is the one currently registered.  This is load-bearing in
- * the shipping GENERIC-OFED config: options OFED compiles the provider IN-KERNEL
- * (which registers at boot) AND also builds ibcore.ko carrying a DUPLICATE
- * register/unregister pair over its OWN &ibcore_verbs_ops.  A kldload ibcore on
- * such a kernel finds a provider already registered and gets EBUSY (its
- * &ibcore_verbs_ops never becomes the owner); a later kldunload must then NOT
- * tear down the in-kernel provider's live listener.  Owner-keying guarantees
- * exactly that: the module's unregister(&module_ibcore_verbs_ops) does not match
- * the in-kernel owner and returns without touching the global or the listener.
+ * unless that pointer is the one currently registered.  Registration is
+ * single-owner: a second svc_rdma_register_verbs() with a different table gets
+ * EBUSY.  Owner-keying makes unregister safe regardless of caller -- it only
+ * revokes the table that actually owns the global.
  */
 int	svc_rdma_register_verbs(const struct svc_rdma_verbs_ops *ops);
 void	svc_rdma_unregister_verbs(const struct svc_rdma_verbs_ops *ops);
