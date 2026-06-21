@@ -724,6 +724,8 @@ struct svc_rdma_recv {
 	struct ib_sge		 rr_sge;
 	struct ib_recv_wr	 rr_wr;
 	struct svc_rdma_read_state rr_rs;	/* durable inbound-read state */
+	uint32_t		 rr_early_len;	/* byte_len of a DEFERRED early recv (sc_lock) */
+	STAILQ_ENTRY(svc_rdma_recv) rr_early;	/* sc_early hold-list link (sc_lock) */
 };
 
 /*
@@ -855,6 +857,18 @@ struct svc_rdma_conn {
 	}			 sc_state;
 	int			 sc_reposts;	/* in-flight reposts (sc_lock) */
 	int			 sc_sends;	/* in-flight reply sends (sc_lock) */
+	/*
+	 * Early-recv hold list (TASK_003e-1 fix).  A peer's first inline call can
+	 * complete in the recv CQ BEFORE the ESTABLISHED handler has run sro_newconn
+	 * and published (SC_UP && sc_newconn_done).  Such a recv is NOT dropped -- an
+	 * RC client never retransmits a delivered call, so a dropped first RPC hangs
+	 * the mount forever -- it is held here, un-reposted, and DRAINED by the
+	 * ESTABLISHED handler once the gate is open.  Bounded by sc_nearly < sc_nrecv/2
+	 * so the RQ cannot deplete; a peer that floods past the cap before ESTABLISHED
+	 * is closed (it reconnects, and the deterministic window resolves).
+	 */
+	STAILQ_HEAD(, svc_rdma_recv) sc_early;	/* deferred early recvs (sc_lock) */
+	int			 sc_nearly;	/* count of held early recvs (sc_lock) */
 	/*
 	 * Outbound RDMA Write state registry (TASK_003f-4).  A reply-chunk write is
 	 * malloc'd on demand (it has no recv-buffer home) and threaded here under
@@ -1028,6 +1042,8 @@ static void svc_rdma_wc_rdma_read(struct ib_cq *cq, struct ib_wc *wc);
 static void svc_rdma_read_free(struct svc_rdma_conn *conn,
     struct svc_rdma_recv *rr);
 static void svc_rdma_repost(struct svc_rdma_conn *conn, struct svc_rdma_recv *rr);
+static void svc_rdma_dispatch_recv(struct svc_rdma_conn *conn,
+    struct svc_rdma_recv *rr, uint32_t len);
 static void svc_rdma_wc_rdma_write(struct ib_cq *cq, struct ib_wc *wc);
 static void svc_rdma_wc_write_sink(struct ib_cq *cq, struct ib_wc *wc);
 static void svc_rdma_write_free(struct svc_rdma_write_state *ws);
@@ -1122,9 +1138,14 @@ svc_rdma_cm_event_handler(struct rdma_cm_id *id, struct rdma_cm_event *event)
 			 * complete and reach svc_rdma_wc_recv() in the recv CQ
 			 * context BEFORE this event runs -- but that recv path does
 			 * NOT deliver newconn; it gates its sro_recv dispatch on
-			 * (SC_UP && sc_newconn_done) and simply drops+reposts an
-			 * early call until this handler has run.  Making ESTABLISHED
-			 * the single deliverer removes every two-deliverer race.
+			 * (SC_UP && sc_newconn_done) and, when not yet ready, HOLDS
+			 * the early call on sc_early (un-reposted) instead of dropping
+			 * it.  This handler DRAINS sc_early right after it publishes
+			 * sc_newconn_done below, replaying each held call.  (Dropping
+			 * was the old behavior and was a bug: an RC client never
+			 * retransmits a delivered call, so a dropped first RPC hung the
+			 * mount.)  Making ESTABLISHED the single deliverer AND the
+			 * single early-call drainer removes every two-deliverer race.
 			 *
 			 * Win the SC_CONNECTING -> SC_UP transition under sc_lock
 			 * (so we do not race a teardown a recv-error completion may
@@ -1164,6 +1185,47 @@ svc_rdma_cm_event_handler(struct rdma_cm_id *id, struct rdma_cm_event *event)
 					    conn);
 				mtx_lock(&conn->sc_lock);
 				conn->sc_newconn_done = true;
+				/*
+				 * Splice the early-recv hold list out under the
+				 * SAME lock that publishes sc_newconn_done: any recv
+				 * that enqueued while we were not ready is now ours
+				 * to drain, and any recv completing after this unlock
+				 * sees the open gate and dispatches itself.  We KEEP
+				 * our ESTABLISHED sc_upcalls reference held across the
+				 * drain (dropped only after it) so the teardown
+				 * barrier (sc_upcalls == 0) cannot free a held rr
+				 * while we replay it.
+				 */
+				{
+					STAILQ_HEAD(, svc_rdma_recv) early =
+					    STAILQ_HEAD_INITIALIZER(early);
+					struct svc_rdma_recv *erp;
+
+					STAILQ_CONCAT(&early, &conn->sc_early);
+					conn->sc_nearly = 0;
+					mtx_unlock(&conn->sc_lock);
+
+					/*
+					 * Replay each held early call now that the
+					 * gate is open and SC_UP is set.  Dropping a
+					 * first RPC is what hung the mount; replaying
+					 * it is the fix.  svc_rdma_dispatch_recv() does
+					 * its own per-call sc_upcalls accounting, so the
+					 * teardown still drains every replayed upcall.
+					 * Runs in the sleepable CM-handler context --
+					 * the same context that just ran sro_newconn,
+					 * strictly more permissive than the recv-
+					 * completion context sro_recv normally sees.
+					 */
+					while ((erp = STAILQ_FIRST(&early)) !=
+					    NULL) {
+						STAILQ_REMOVE_HEAD(&early,
+						    rr_early);
+						svc_rdma_dispatch_recv(conn,
+						    erp, erp->rr_early_len);
+					}
+				}
+				mtx_lock(&conn->sc_lock);
 				if (--conn->sc_upcalls == 0)
 					wakeup(&conn->sc_upcalls);
 				mtx_unlock(&conn->sc_lock);
@@ -1737,9 +1799,7 @@ svc_rdma_wc_recv(struct ib_cq *cq, struct ib_wc *wc)
 {
 	struct svc_rdma_recv *rr;
 	struct svc_rdma_conn *conn;
-	struct svc_rdma_msg msg;
 	uint32_t len;
-	int rc;
 	bool ready;
 
 	/*
@@ -1799,6 +1859,89 @@ svc_rdma_wc_recv(struct ib_cq *cq, struct ib_wc *wc)
 	len = wc->byte_len;
 	if (len > SVC_RDMA_INLINE)
 		len = SVC_RDMA_INLINE;
+
+	/*
+	 * DMA-API contract: a buffer the device wrote (DMA_FROM_DEVICE) must be
+	 * sync_for_cpu'd before the CPU reads it.  rr_buf is mapped once at accept
+	 * and never per-recv remapped, but ib_dma_map_single may bounce it, and on
+	 * a weakly-ordered CPU this POSTREAD sync also supplies the load barrier
+	 * against the recv completion -- so the just-landed bytes are only
+	 * guaranteed visible to the CPU afterwards.  Omitting it is a latent bug:
+	 * a no-op on a direct, strongly-ordered mapping (x86, where it stayed
+	 * hidden), but on the ppc64le DDW/busdma path svc_rdma_parse_header() reads
+	 * stale buffer contents and rejects every RPC-over-RDMA header, hanging
+	 * NFS/RDMA.  Inbound mirror of the read-sink sync (see svc_rdma_wc_rdma_read).
+	 */
+	ib_dma_sync_single_for_cpu(conn->sc_id->device, rr->rr_dma, len,
+	    DMA_FROM_DEVICE);
+
+	/*
+	 * Readiness/defer decision (TASK_003e-1 fix).  sro_newconn is delivered
+	 * SOLELY by the ESTABLISHED CM handler, which sets sc_newconn_done strictly
+	 * after it returns; recv buffers are posted before rdma_accept(), so this
+	 * completion can arrive BEFORE that handler has run.  The former code DROPPED
+	 * such an early call and reposted, assuming the client would retransmit -- but
+	 * RPC-over-RDMA runs over a reliable QP and never retransmits a delivered
+	 * call, so dropping the first RPC hangs the mount (latent on x86 where the
+	 * SC_UP->sc_newconn_done window is sub-microsecond; deterministic on ppc64le
+	 * where the FRWR self-test and higher CM latency widen it).
+	 *
+	 * So we DEFER instead of drop.  In one sc_lock section:
+	 *   - SC_CLOSING: a teardown owns this buffer and reclaims it after
+	 *     ib_drain_qp(); return without reposting (the repost gate would decline
+	 *     anyway), exactly the closing behavior of the parse-error path.
+	 *   - not ready (SC_CONNECTING, or SC_UP before sc_newconn_done): HOLD this
+	 *     recv on sc_early, un-reposted, and return.  The ESTABLISHED handler
+	 *     drains it once the gate opens.  Bounded by sc_nearly < sc_nrecv/2 so the
+	 *     RQ never depletes; past the cap we close (the client reconnects).
+	 *   - ready: dispatch now.  The held buffers carry no in-flight device WR, so
+	 *     they need no sc_reposts/sc_sends accounting -- the drained teardown
+	 *     frees sc_recv[] wholesale.
+	 */
+	mtx_lock(&conn->sc_lock);
+	if (conn->sc_state == SC_CLOSING) {
+		mtx_unlock(&conn->sc_lock);
+		return;
+	}
+	ready = (conn->sc_state == SC_UP && conn->sc_newconn_done);
+	if (!ready) {
+		/* Hold at most half the RQ depth (>=1) so the RQ never depletes. */
+		int cap = conn->sc_nrecv / 2;
+
+		if (cap < 1)
+			cap = 1;
+		if (conn->sc_nearly < cap) {
+			rr->rr_early_len = len;
+			STAILQ_INSERT_TAIL(&conn->sc_early, rr, rr_early);
+			conn->sc_nearly++;
+			mtx_unlock(&conn->sc_lock);
+			return;
+		}
+		mtx_unlock(&conn->sc_lock);
+		svc_rdma_conn_close(conn);
+		return;
+	}
+	mtx_unlock(&conn->sc_lock);
+	svc_rdma_dispatch_recv(conn, rr, len);
+}
+
+/*
+ * Parse and dispatch one received RPC-over-RDMA call (TASK_003e-1).  Split out of
+ * svc_rdma_wc_recv so the ESTABLISHED handler can replay an early call it held on
+ * sc_early once the readiness gate opens.  The caller has already DMA-synced
+ * rr_buf for the CPU and decided the connection is ready (recv path) or is the
+ * ESTABLISHED drainer (gate just opened, SC_UP set).  Behavior for a ready
+ * connection is byte-for-byte the former inline-after-parse logic; the inline
+ * readiness gate below is retained as defense in depth (state can flip to
+ * SC_CLOSING between the caller's check and here).
+ */
+static void
+svc_rdma_dispatch_recv(struct svc_rdma_conn *conn, struct svc_rdma_recv *rr,
+    uint32_t len)
+{
+	struct svc_rdma_msg msg;
+	int rc;
+	bool ready;
 
 	rc = svc_rdma_parse_header(rr->rr_buf, len, &msg);
 	if (rc != 0) {
@@ -1919,8 +2062,8 @@ svc_rdma_wc_recv(struct ib_cq *cq, struct ib_wc *wc)
 	 * Readiness gate + upcall barrier (TASK_003e-1).  sro_newconn is delivered
 	 * SOLELY by the ESTABLISHED CM handler, which sets sc_newconn_done strictly
 	 * AFTER sro_newconn returns and only on the SC_CONNECTING -> SC_UP win.  This
-	 * recv path never delivers newconn; it only DISPATCHES sro_recv, and must do
-	 * so only once the consumer is ready.  In ONE sc_lock section capture
+	 * dispatch path never delivers newconn; it only DISPATCHES sro_recv, and must
+	 * do so only once the consumer is ready.  In ONE sc_lock section capture
 	 *   ready == (sc_state == SC_UP && sc_newconn_done)
 	 * and, if ready, bump sc_upcalls (this sro_recv becomes an in-flight consumer
 	 * upcall that the teardown drains before sro_disconnect -- the send-side
@@ -1928,19 +2071,15 @@ svc_rdma_wc_recv(struct ib_cq *cq, struct ib_wc *wc)
 	 * sro_newconn has fully completed and (b) the conn is SC_UP, so a synchronous
 	 * svc_rdma_conn_send() from sro_recv does not hit the SC_UP gate's ENOTCONN.
 	 *
-	 * If not ready, skip the dispatch and fall through to the repost barrier.
-	 * Two cases reach !ready, both benign:
-	 *   - a rare recv that completed BEFORE the ESTABLISHED event (recv CQ and
-	 *     CM work queue are independent contexts): SC_CONNECTING / not-yet-set
-	 *     newconn -> drop this call and repost (the repost gate now admits
-	 *     SC_CONNECTING, so the RQ does not deplete); the RC client retransmits
-	 *     the RPC, and a later recv dispatches once ESTABLISHED has delivered
-	 *     newconn and published SC_UP.  No reply is fabricated for an
-	 *     undispatched call, so the client sees only a one-retransmit delay on
-	 *     its very first op, then success.
-	 *   - the conn is already SC_CLOSING (a disconnect/error raced this
-	 *     completion): the repost barrier below sees SC_CLOSING and declines
-	 *     the repost; the teardown reclaims the buffer.
+	 * Both callers reach here only when the gate was open: svc_rdma_wc_recv()
+	 * checks readiness and DEFERS an early call onto sc_early instead of
+	 * dispatching it (so a not-yet-ready call is never dropped), and the
+	 * ESTABLISHED drainer runs us only after publishing SC_UP && sc_newconn_done.
+	 * This re-check is therefore defense in depth against the one residual race --
+	 * a disconnect/error flipping the conn to SC_CLOSING between the caller's
+	 * sample and here.  On !ready (SC_CLOSING) we skip the dispatch and fall to the
+	 * repost barrier, which sees SC_CLOSING and declines; the teardown reclaims
+	 * the buffer.  No reply is fabricated for an undispatched call.
 	 */
 	mtx_lock(&conn->sc_lock);
 	ready = (conn->sc_state == SC_UP && conn->sc_newconn_done);
@@ -2010,12 +2149,13 @@ repost:
  * completion reposts it here after the assembled body is dispatched.  Behavior is
  * byte-for-byte the former inline repost block.
  *
- * The gate is SC_CLOSING-based, not SC_UP-based (TASK_003e-1 SHOULD-FIX): a peer
- * that sends an RPC before ESTABLISHED leaves the conn SC_CONNECTING, and the
- * recv path drops+reposts that early call -- if the repost required SC_UP it
- * would decline, depleting the RQ one buffer per early call until RNR.  Admitting
- * SC_CONNECTING recycles the buffer so the RQ stays full.  Post-after-drain
- * safety is UNCHANGED: svc_rdma_conn_close() publishes SC_CLOSING under sc_lock
+ * The gate is SC_CLOSING-based, not SC_UP-based (TASK_003e-1): with the early-call
+ * DEFER fix, an RPC that arrives before ESTABLISHED is HELD on sc_early (not
+ * reposted) and replayed by the ESTABLISHED drainer at SC_UP, so in practice every
+ * repost now runs at SC_UP.  Admitting SC_CONNECTING here is therefore defensive
+ * (harmless if a repost ever races the CONNECTING window) rather than load-bearing
+ * as it was under the old drop+repost behavior.  Post-after-drain safety is
+ * UNCHANGED: svc_rdma_conn_close() publishes SC_CLOSING under sc_lock
  * BEFORE enqueuing the teardown, so once teardown is pending NO new repost passes
  * the SC_CLOSING check; the task's barrier then waits only for already-counted
  * reposts to finish their ib_post_recv and decrement.  After the count hits 0
@@ -2045,9 +2185,16 @@ svc_rdma_repost(struct svc_rdma_conn *conn, struct svc_rdma_recv *rr)
 
 	/*
 	 * The DMA mapping and SGE are unchanged and still valid (the buffer is
-	 * DMA_FROM_DEVICE and was never unmapped), so re-post the prebuilt
-	 * rr_wr as-is.
+	 * DMA_FROM_DEVICE and was never unmapped), so re-post the prebuilt rr_wr
+	 * as-is -- but hand the buffer back to the device first.  The CPU just read
+	 * the previous receive out of rr_buf (svc_rdma_wc_recv's sync_for_cpu); the
+	 * DMA API requires a matching sync_for_device (PREREAD) before the NIC DMAs
+	 * the next receive into it, to re-arm the bounce mapping and order the
+	 * device's writes after the CPU's reads.  No-op on a direct, strongly-
+	 * ordered mapping (x86); mirrors the read-sink repost sync.
 	 */
+	ib_dma_sync_single_for_device(conn->sc_id->device, rr->rr_dma,
+	    SVC_RDMA_INLINE, DMA_FROM_DEVICE);
 	rc = ib_post_recv(conn->sc_id->qp, &rr->rr_wr, &bad_wr);
 
 	mtx_lock(&conn->sc_lock);
@@ -5273,6 +5420,7 @@ svc_rdma_accept(struct rdma_cm_id *id)
 	mtx_init(&conn->sc_lock, "nfsrdma_conn", NULL, MTX_DEF);
 	TASK_INIT(&conn->sc_teardown, 0, svc_rdma_conn_destroy, conn);
 	TAILQ_INIT(&conn->sc_writes);	/* in-flight RDMA Write registry (3f-4) */
+	STAILQ_INIT(&conn->sc_early);	/* deferred early-recv hold list (3e-1) */
 	conn->sc_write_sink_cqe.done = svc_rdma_wc_write_sink;	/* 3f-20 */
 	conn->sc_state = SC_CONNECTING;
 	conn->sc_id = id;
