@@ -218,6 +218,12 @@ MALLOC_DEFINE(M_NFSRDMA, "nfsrdma", "NFS over RDMA server");
 #define	SVC_RDMA_READBUF_POOL	16
 
 /*
+ * Pending CONNECT_REQUEST queue depth for the RDMA-CM listener.  Mirrors the
+ * listen(2) backlog; Linux knfsd uses 128.
+ */
+#define	SVC_RDMA_CM_BACKLOG	128
+
+/*
  * RFC 8166 (RPC-over-RDMA version 1) transport-header constants.
  *
  * The header is a sequence of big-endian 32-bit XDR words.  The FIXED prefix is
@@ -585,6 +591,8 @@ svc_rdma_read_extfree(struct mbuf *m)
  *              reply), malloc'd ws_srclen bytes, DMA-mapped DMA_TO_DEVICE.
  *   ws_srclen- the reply length (server-known, bounded <= SVC_RDMA_MAX_WRITE).
  *   ws_src_dma / ws_src_mapped - ws_src DMA map + its idempotency token (sc_lock).
+ *   ws_src_pooled - when true, write_free calls svc_rdma_sink_put (recycle #B1)
+ *     instead of free() on ws_src.
  *   ws_hdr   - the RDMA_NOMSG transport-header SEND buffer, malloc'd, DMA-mapped
  *              DMA_TO_DEVICE; carries the reply-chunk list with the actual length.
  *   ws_hdrlen- valid header bytes.
@@ -606,6 +614,7 @@ struct svc_rdma_write_state {
 	uint32_t		 ws_srclen;
 	u64			 ws_src_dma;
 	bool			 ws_src_mapped;
+	bool			 ws_src_pooled;	/* true = sink_put, not free (#B1) */
 	void			*ws_hdr;	/* RDMA_NOMSG header SEND buffer */
 	uint32_t		 ws_hdrlen;
 	u64			 ws_hdr_dma;
@@ -716,6 +725,11 @@ struct svc_rdma_send {
  * decrement wakes the sleeper, which re-evaluates the full predicate) and cannot
  * self-deadlock (the teardown runs on taskqueue_thread; the decrementers run on
  * the CQ workqueue / CM contexts and only ever hold sc_lock briefly).
+ *
+ * The lockless decrements of sc_reposts/sc_sends/sc_upcalls are safe because
+ * IB_POLL_WORKQUEUE delivers completions on a single per-CQ workqueue thread
+ * (see the ib_alloc_cq call below), so decrement and wakeup are serialized
+ * per-CQ -- no concurrent decrements race the teardown's re-evaluation.
  */
 struct svc_rdma_conn {
 	struct rdma_cm_id	*sc_id;		/* child cm_id; QP is sc_id->qp */
@@ -2872,7 +2886,10 @@ svc_rdma_write_free(struct svc_rdma_write_state *ws)
 		ws->ws_hdr_mapped = false;
 	}
 	if (ws->ws_src != NULL) {
-		free(ws->ws_src, M_NFSRDMA);
+		if (ws->ws_src_pooled)
+			svc_rdma_sink_put(ws->ws_src);	/* recycle, not free (#B1) */
+		else
+			free(ws->ws_src, M_NFSRDMA);
 		ws->ws_src = NULL;
 	}
 	if (ws->ws_hdr != NULL) {
@@ -2963,12 +2980,21 @@ svc_rdma_conn_reply_chunk(struct svc_rdma_conn *conn, uint32_t xid,
 	/*
 	 * Allocate the durable write state (it outlives this call -- the writes and the
 	 * header SEND complete async).  M_NOWAIT: xp_reply may run under the consumer's
-	 * leaf mutex, so do not block.  Zeroed so every token starts false/NULL.
+	 * leaf mutex, so do not block.  Fields initialized explicitly below.
 	 */
-	ws = malloc(sizeof(*ws), M_NFSRDMA, M_NOWAIT | M_ZERO);
+	ws = malloc(sizeof(*ws), M_NFSRDMA, M_NOWAIT);
 	if (ws == NULL)
 		return (ENOMEM);
 	ws->ws_conn = conn;
+	ws->ws_src = NULL;
+	ws->ws_src_mapped = false;
+	ws->ws_src_pooled = false;
+	ws->ws_hdr = NULL;
+	ws->ws_hdr_mapped = false;
+	ws->ws_active = false;
+	ws->ws_pages_mapped = false;
+	ws->ws_npgs = 0;
+	ws->ws_keepm = NULL;
 
 	/*
 	 * Copy the reply bytes into the DMA source buffer and map it DMA_TO_DEVICE (the
@@ -3354,7 +3380,8 @@ svc_rdma_wc_rdma_write(struct ib_cq *cq, struct ib_wc *wc)
 int
 svc_rdma_conn_write_list(struct svc_rdma_conn *conn, uint32_t xid,
     const struct svc_rdma_write_chunk *write, void *src,
-    uint32_t datalen, const void *reduced, uint32_t reducedlen)
+    uint32_t datalen, const void *reduced, uint32_t reducedlen,
+    bool src_pooled)
 {
 	struct svc_rdma_write_state *ws;
 	struct ib_device *dev = conn->sc_id->device;
@@ -3436,14 +3463,23 @@ svc_rdma_conn_write_list(struct svc_rdma_conn *conn, uint32_t xid,
 	/*
 	 * Allocate the durable write state (outlives this call -- the writes and
 	 * the SEND complete async).  M_NOWAIT (xp_reply runs under a leaf mutex);
-	 * zeroed so every token starts false/NULL.
+	 * fields initialized explicitly below.
 	 */
-	ws = malloc(sizeof(*ws), M_NFSRDMA, M_NOWAIT | M_ZERO);
+	ws = malloc(sizeof(*ws), M_NFSRDMA, M_NOWAIT);
 	if (ws == NULL) {
 		rc = ENOMEM;
 		goto badsrc;
 	}
 	ws->ws_conn = conn;
+	ws->ws_src = NULL;
+	ws->ws_src_mapped = false;
+	ws->ws_src_pooled = src_pooled;
+	ws->ws_hdr = NULL;
+	ws->ws_hdr_mapped = false;
+	ws->ws_active = false;
+	ws->ws_pages_mapped = false;
+	ws->ws_npgs = 0;
+	ws->ws_keepm = NULL;
 
 	/*
 	 * Take ownership of the caller-supplied DMA source buffer and map it
@@ -3461,8 +3497,9 @@ svc_rdma_conn_write_list(struct svc_rdma_conn *conn, uint32_t xid,
 	ws->ws_src_dma = ib_dma_map_single(dev, ws->ws_src, datalen,
 	    DMA_TO_DEVICE);
 	if (ib_dma_mapping_error(dev, ws->ws_src_dma)) {
-		free(ws->ws_src, M_NFSRDMA);
-		free(ws, M_NFSRDMA);
+		/* map failed (ws_src_mapped still false): write_free
+		 * releases ws_src pooled-aware (#B1) and frees ws. */
+		svc_rdma_write_free(ws);
 		return (EIO);
 	}
 	ws->ws_src_mapped = true;	/* mark the mapping live IMMEDIATELY */
@@ -3604,7 +3641,12 @@ svc_rdma_conn_write_list(struct svc_rdma_conn *conn, uint32_t xid,
 	 * must NOT reach this label.
 	 */
 badsrc:
-	free(src, M_NFSRDMA);
+	/* ws was never allocated, so it cannot own src; release src here.  A
+	 * pooled buffer (#B1) MUST go back to the recycle pool, not free(). */
+	if (src_pooled)
+		svc_rdma_sink_put(src);
+	else
+		free(src, M_NFSRDMA);
 	return (rc);
 }
 
@@ -3694,12 +3736,20 @@ svc_rdma_conn_write_list_pages(struct svc_rdma_conn *conn, uint32_t xid,
 	}
 	sendlen = hdrlen + reducedlen;
 
-	ws = malloc(sizeof(*ws), M_NFSRDMA, M_NOWAIT | M_ZERO);
+	ws = malloc(sizeof(*ws), M_NFSRDMA, M_NOWAIT);
 	if (ws == NULL) {
 		rc = ENOMEM;
 		goto badm;
 	}
 	ws->ws_conn = conn;
+	ws->ws_src = NULL;
+	ws->ws_src_mapped = false;
+	ws->ws_src_pooled = false;
+	ws->ws_hdr = NULL;
+	ws->ws_hdr_mapped = false;
+	ws->ws_active = false;
+	ws->ws_pages_mapped = false;
+	ws->ws_npgs = 0;
 	ws->ws_srclen = datalen;
 	/*
 	 * Ownership transfer point: ws owns mrep from here on, so EVERY post-alloc
@@ -5113,10 +5163,18 @@ svc_rdma_listen_start_ops(uint16_t port, const struct svc_rdma_ops *ops,
 	    &svc_rdma_listener, RDMA_PS_TCP, IB_QPT_RC);
 	if (IS_ERR(id)) {
 		rc = -PTR_ERR(id);
-		printf("nfsrdma: rdma_create_id failed: %d\n", rc);
+		if (bootverbose || ppsratecheck(&svc_rdma_log_last,
+		    &svc_rdma_log_pps, 1))
+			printf("nfsrdma: rdma_create_id failed: %d\n", rc);
 		return (rc != 0 ? rc : EINVAL);
 	}
 
+	/*
+	 * Bind AF_INET only (IPv4/IPoIB/RoCE wildcard).  IPv6/rdma6 dual-stack
+	 * listener support is a TODO: rdma_bind_addr would need an AF_INET6
+	 * sockaddr_in6 with IN6ADDR_ANY and a separate rdma_cm_id for the v6
+	 * endpoint, or a kernel that maps v4-mapped v6 addresses automatically.
+	 */
 	memset(&sin, 0, sizeof(sin));
 	sin.sin_family = AF_INET;
 	sin.sin_len = sizeof(sin);
@@ -5130,8 +5188,7 @@ svc_rdma_listen_start_ops(uint16_t port, const struct svc_rdma_ops *ops,
 		goto out_destroy;
 	}
 
-	/* Modest connection backlog for the RDMA-CM listener. */
-	rc = rdma_listen(id, 8);
+	rc = rdma_listen(id, SVC_RDMA_CM_BACKLOG);
 	if (rc != 0) {
 		printf("nfsrdma: rdma_listen(port %u) failed: %d\n", port, rc);
 		goto out_destroy;
@@ -5337,6 +5394,8 @@ static const struct svc_rdma_verbs_ops ibcore_verbs_ops = {
 	.svo_conn_peeraddr	= svc_rdma_conn_peeraddr,
 	.svo_conn_error		= svc_rdma_conn_error,
 	.svo_thread_setup	= svc_rdma_thread_setup,
+	.svo_sink_get		= svc_rdma_sink_get,
+	.svo_sink_put		= svc_rdma_sink_put,
 };
 
 /*

@@ -235,12 +235,12 @@ struct svc_rdma_msg {
  *
  *       Ordering vs. recv: receive buffers are posted before the connection is
  *       accepted, so the peer's first inline call can complete and reach the
- *       verbs layer BEFORE this ESTABLISHED event.  The verbs layer does NOT
- *       dispatch sro_recv for such an early call -- it drops it and reposts the
- *       buffer; the RC client retransmits the RPC, and a later recv is dispatched
- *       once this sro_newconn has completed and the connection is up.  So the
- *       consumer never sees an sro_recv before sro_newconn has returned; the only
- *       visible effect of the race is a one-retransmit delay on the very first op.
+ *       verbs layer BEFORE this ESTABLISHED event.  Early recvs that arrive
+ *       before (SC_UP && sc_newconn_done) are NOT dropped -- they are held on
+ *       sc_early STAILQ (capped MAX(1, sc_nrecv/2)) and replayed by the
+ *       ESTABLISHED handler after publishing sc_newconn_done.  An RC client
+ *       NEVER retransmits a delivered call; a drop would hang the mount forever.
+ *       So the consumer never sees an sro_recv before sro_newconn has returned.
  *
  *   sro_recv(ctx, conn, msg)  -> 0 to continue, nonzero to drop+close
  *       Called once per successfully-parsed inline RDMA_MSG call, from the recv
@@ -253,10 +253,10 @@ struct svc_rdma_msg {
  *       recv buffer is reposted to the QP as soon as sro_recv returns, so a
  *       consumer that needs the bytes past the call MUST copy them (e.g. into an
  *       mbuf chain) before returning.  The consumer MAY call svc_rdma_conn_send()
- *       synchronously from within sro_recv; that is supported in this context.
- *       Returning nonzero asks the verbs layer to close the
- *       connection (the consumer rejected the call); returning 0 lets the verbs
- *       layer repost and await the next call.
+ *       synchronously from within sro_recv; that is supported in this
+ *       context.  Returning nonzero asks the verbs layer to close the
+ *       connection (the consumer rejected the call); returning 0 lets the
+ *       verbs layer repost and await the next call.
  *
  *   sro_disconnect(ctx, conn)
  *       Delivered EXACTLY ONCE, and PAIRED with sro_newconn: it fires if and only
@@ -306,9 +306,10 @@ struct svc_rdma_ops {
  *
  * Returns 0 on success or a positive FreeBSD errno on failure (EINVAL for a
  * zero port or NULL ops, EBUSY if a listener is already up, or the normalized
- * errno from the rdma_*() bring-up).  ops MUST outlive the listener (it is a
- * function-pointer table the consumer owns; typically a static const in the
- * krpc module), as MUST ctx until svc_rdma_listen_stop() has returned.
+ * errno from the rdma_*() bring-up).  Binds AF_INET only (IPv4/IPoIB/RoCE
+ * wildcard); IPv6/rdma6 dual-stack is a TODO.  ops MUST outlive the listener
+ * (it is a function-pointer table the consumer owns; typically a static const
+ * in the krpc module), as MUST ctx until svc_rdma_listen_stop() has returned.
  */
 int	svc_rdma_listen_start_ops(uint16_t port, const struct svc_rdma_ops *ops,
 	    void *ctx);
@@ -458,7 +459,8 @@ int	svc_rdma_conn_reply_chunk(struct svc_rdma_conn *conn, uint32_t xid,
  */
 int	svc_rdma_conn_write_list(struct svc_rdma_conn *conn, uint32_t xid,
 	    const struct svc_rdma_write_chunk *write, void *src,
-	    uint32_t datalen, const void *reduced, uint32_t reducedlen);
+	    uint32_t datalen, const void *reduced, uint32_t reducedlen,
+	    bool src_pooled);
 
 /*
  * Zero-copy twin of svc_rdma_conn_write_list: RDMA-Write the READ
@@ -553,7 +555,8 @@ struct svc_rdma_verbs_ops {
 	 */
 	int	(*svo_conn_write_list)(struct svc_rdma_conn *conn, uint32_t xid,
 		    const struct svc_rdma_write_chunk *write, void *src,
-		    uint32_t datalen, const void *reduced, uint32_t reducedlen);
+		    uint32_t datalen, const void *reduced, uint32_t reducedlen,
+		    bool src_pooled);
 	/*
 	 * svo_conn_write_list_pages -> svc_rdma_conn_write_list_pages: the
 	 * zero-copy twin of svo_conn_write_list.  The source is the
@@ -599,6 +602,18 @@ struct svc_rdma_verbs_ops {
 	 * older ibcore (the warning, which is non-fatal, simply persists there).
 	 */
 	void	(*svo_thread_setup)(void);
+	/*
+	 * svo_sink_get / svo_sink_put -- OPTIONAL (NULL-checked at call site).
+	 * Route the write-list fallback buffer through the global recycle pool
+	 * (#B1) instead of per-op contigmalloc/free, eliminating the TLB
+	 * shootdown on the non-M_EXTPG path (same pool that #60 uses for the
+	 * read-sink and reply-chunk source).  When present, svc_rdma.c uses
+	 * svo_sink_get() instead of contigmalloc for the write-list src buffer
+	 * and signals svo_conn_write_list with src_pooled=true so write_free
+	 * calls svo_sink_put() instead of free().
+	 */
+	void	*(*svo_sink_get)(void);
+	void	(*svo_sink_put)(void *buf);
 };
 
 /*

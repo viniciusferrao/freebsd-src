@@ -160,9 +160,8 @@
  * Fallback flow-control credit for a reply's w2 rdma_credit (SF1).  The primary
  * value is the verbs layer's REAL granted depth, read per-reply through
  * svo_conn_credits() (== conn->sc_nrecv, clamped to the device QP recv cap); see
- * svc_rdma_xprt_reply().  This constant is used only as a defensive non-zero
- * floor if the accessor ever returns 0 (it should not).  It matches the verbs
- * layer's nominal SVC_RDMA_RECV_DEPTH (64).
+ * svc_rdma_xprt_reply().  This constant is used only as a conservative non-zero
+ * floor if the accessor ever returns 0 (it should not happen in practice).
  */
 #define	SVC_RDMA_CREDIT_GRANT	8
 
@@ -417,6 +416,10 @@ svc_rdma_reply_pend_insert(struct svc_rdma_xprt *xr, uint32_t xid,
 		p->rp_ddp_len = 0;
 	}
 	mtx_unlock(&xr->xr_lock);
+	if (free_slot < 0 &&
+	    ppsratecheck(&svc_rdma_log_last, &svc_rdma_log_pps, 5))
+		printf("svc_rdma: reply-pend table full (xid=0x%08x): "
+		    "reply chunk dropped, client may stall\n", xid);
 }
 
 /*
@@ -861,6 +864,7 @@ svc_rdma_xprt_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 			u_int reducedlen;
 			char *reduced;
 			void *src;
+			bool src_pooled;
 			struct svc_rdma_page *pgs;
 			int npg;
 
@@ -900,9 +904,18 @@ svc_rdma_xprt_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 					 * Fallback: copy the unpadded read data into a
 					 * contiguous DMA source OFF the lock and hand it
 					 * to the contig engine (which owns src).
+					 * Prefer the recycle pool (#B1) to avoid the
+					 * per-op contigmalloc/free TLB shootdown.
 					 */
-					src = contigmalloc(dlen, M_NFSRDMA, M_WAITOK,
-					    0, ~(vm_paddr_t)0, PAGE_SIZE, 0);
+					if (svc_rdma_verbs->svo_sink_get != NULL) {
+						src = svc_rdma_verbs->svo_sink_get();
+						src_pooled = true;
+					} else {
+						src = contigmalloc(dlen, M_NFSRDMA,
+						    M_WAITOK, 0, ~(vm_paddr_t)0,
+						    PAGE_SIZE, 0);
+						src_pooled = false;
+					}
 					m_copydata(mrep, doff, dlen, src);
 				} else
 					src = NULL;
@@ -911,8 +924,12 @@ svc_rdma_xprt_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 				conn = xr->xr_conn;
 				if (conn == NULL) {
 					rc = ENOTCONN;
-					if (npg == 0)
-						free(src, M_NFSRDMA);	/* never handed off */
+					if (npg == 0) {
+						if (src_pooled)
+							svc_rdma_verbs->svo_sink_put(src);
+						else
+							free(src, M_NFSRDMA);
+					}
 				} else if (npg > 0) {
 					rc = svc_rdma_verbs->svo_conn_write_list_pages(
 					    conn, msg->rm_xid, &pend.rp_writes, mrep,
@@ -930,7 +947,8 @@ svc_rdma_xprt_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 				} else {
 					rc = svc_rdma_verbs->svo_conn_write_list(
 					    conn, msg->rm_xid, &pend.rp_writes,
-					    src, dlen, reduced, reducedlen);
+					    src, dlen, reduced, reducedlen,
+					    src_pooled);
 					if (rc == 0)
 						seqval = ++xr->xr_seq;
 					/* svo_conn_write_list OWNS src on every return. */
