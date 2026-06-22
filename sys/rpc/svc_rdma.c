@@ -238,12 +238,12 @@ static volatile uint64_t	 svc_rdma_sockref_gen;
  *
  * svc_rdma_xprt is the per-connection SVCXPRT private state, hung off
  * xprt->xp_p1.  It owns:
- *   - sx_conn: the opaque verbs connection handle (valid newconn..disconnect).
+ *   - xr_conn: the opaque verbs connection handle (valid newconn..disconnect).
  *     Guarded by xr_lock; cleared to NULL by sro_disconnect so a pool thread
  *     racing in xp_reply after disconnect cannot post on a freed conn.
  *   - xr_mq:   the recv queue, an mbuf STAILQ of complete inline ONC RPC
  *     messages, each enqueued by sro_recv and dequeued by xp_recv.
- *   - xr_lock: a leaf mutex guarding xr_mq and sx_conn.  It is NEVER held across
+ *   - xr_lock: a leaf mutex guarding xr_mq and xr_conn.  It is NEVER held across
  *     a krpc call that can take a pool/group lock (xprt_active is called with it
  *     dropped) and is taken only for brief list/pointer manipulation, so it
  *     cannot form a lock-order cycle with the krpc locks.

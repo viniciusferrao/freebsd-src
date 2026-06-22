@@ -36,8 +36,9 @@
  * krpc/SVCXPRT/nfsd.  A consumer (the krpc SVCXPRT in
  * sys/rpc/svc_rdma.c) registers a struct svc_rdma_ops upcall table plus an
  * opaque ctx with svc_rdma_listen_start_ops(); the verbs layer then calls back
- * into the consumer at the three lifecycle points (newconn / recv / disconnect)
- * and exposes svc_rdma_conn_send() so the consumer can post a marshalled reply.
+ * into the consumer at its lifecycle upcalls -- newconn, recv (inline sro_recv
+ * or assembled-mbuf sro_recv_mbuf), and disconnect -- and exposes
+ * svc_rdma_conn_send() so the consumer can post a marshalled reply.
  *
  * Module layering (docs/16-svcxprt-rdma-integration.md "Module layering"): the
  * verbs live in the ibcore module; the SVCXPRT/xp_ops live in the krpc layer
@@ -208,7 +209,7 @@ struct svc_rdma_msg {
 	const void	*rpc;		/* inline RPC payload (buf + header) */
 	uint32_t	 rpc_len;	/* payload length */
 
-	uint32_t	 rd_nchunks;	/* valid entries in reads[] (<= cap) */
+	uint32_t	 rd_nchunks;	/* valid entries in reads[] */
 	uint32_t	 wr_nchunks;	/* valid entries in writes[] (<= cap) */
 	bool		 reply_present;	/* a reply chunk was encoded */
 	struct svc_rdma_read_chunk  reads[SVC_RDMA_MAX_READ_SEGS];
@@ -514,7 +515,9 @@ void	svc_rdma_thread_setup(void);
  * krpc refuses to create an RDMA transport (returns ENXIO) instead of chasing a
  * NULL or an unresolved symbol.
  *
- * struct svc_rdma_verbs_ops mirrors the verbs entry points one-for-one:
+ * struct svc_rdma_verbs_ops exposes the verbs entry points the consumer needs;
+ * the core entries map as (the optional data engines and pool ops are
+ * documented at their members below):
  *   svo_listen_start  -> svc_rdma_listen_start_ops
  *   svo_listen_stop   -> svc_rdma_listen_stop
  *   svo_conn_send     -> svc_rdma_conn_send

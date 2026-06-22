@@ -396,7 +396,7 @@ struct svc_rdma_read_state {
  * WRITE path: the zero-copy hand-off EVACUATES the slot and frees the buffer,
  * then the next read contigmalloc's a fresh one.
  *
- * Mirror what Linux svcrdma does (recycled rw/recv contexts): keep a global
+ * Keep a global
  * LIFO of fixed-size sink buffers and recycle them across RPCs and connections,
  * so the steady-state write path never returns memory to kmem and never shoots
  * down the TLB.  Buffers on the list are PLAIN, UNMAPPED, SVC_RDMA_MAX_READ-
@@ -2062,7 +2062,7 @@ svc_rdma_repost(struct svc_rdma_conn *conn, struct svc_rdma_recv *rr)
  *   - the server destination buffer + its DMA mapping live in the recv's DURABLE
  *     rr_rs and are freed/unmapped EXACTLY ONCE -- on the read completion, or by
  *     the teardown for a read still in flight at close (rs_active/rs_mapped
- *     idempotency, the sm_sg_mapped pattern);
+ *     idempotency, the rr_mapped / ss_mapped pattern);
  *   - svc_rdma_conn_close() publishes SC_CLOSING before enqueuing the teardown,
  *     so once teardown is pending no new read passes the SC_UP gate.
  * ===========================================================================
@@ -2423,7 +2423,7 @@ svc_rdma_read_sink_free_detached(void *buf)
  * Release the durable read state for a recv: unmap+free the server destination
  * buffer and free the inline-head copy, EXACTLY ONCE.  RECLAIM IS DRIVEN BY THE
  * idempotent rs_mapped (unmap) and rs_buf/rs_head != NULL (free) tokens -- the
- * sm_sg_mapped pattern -- NOT by rs_active (which is the completion one-shot
+ * rr_mapped / ss_mapped pattern -- NOT by rs_active (which is the completion one-shot
  * guard, a separate concern this routine merely clears defensively).  So the two
  * legitimate reclaimers -- the first read completion (success or assemble-alloc
  * drop), and the drained teardown (svc_rdma_conn_free_verbs) -- can each call this
@@ -2805,7 +2805,7 @@ svc_rdma_wc_rdma_read(struct ib_cq *cq, struct ib_wc *wc)
  *     svc_rdma_write_state threaded on conn->sc_writes and is freed/unmapped
  *     EXACTLY ONCE -- on the (tail-SEND) completion, or by the teardown for a write
  *     still in flight at close (ws_active one-shot + ws_*_mapped idempotency, the
- *     sm_sg_mapped pattern);
+ *     rr_mapped / ss_mapped pattern);
  *   - svc_rdma_conn_close() publishes SC_CLOSING before enqueuing the teardown, so
  *     once teardown is pending no new write passes the SC_UP gate.
  *
@@ -5267,7 +5267,7 @@ out_destroy:
  *      unload path, where those callbacks live in ibcore text about to be freed.
  * After the drain the registry is empty.  The sweep runs unconditionally (even
  * when sl_id was already NULL): a connection established before an explicit
- * vfs.nfsrdma.listen=0 outlives the listener id, so unload must still reclaim it.
+ * svc_rdma_listen_stop() outlives the listener id, so unload must still reclaim it.
  */
 void
 svc_rdma_listen_stop(void)
