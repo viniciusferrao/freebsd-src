@@ -113,7 +113,7 @@
 #include <rpc/rpc_com.h>
 #include <rpc/krpc.h>		/* clnt_bck_svccall + clnt_bck_rdma_send hook */
 
-#include <rdma/svc_rdma.h>	/* the shared cross-module contract */
+#include <rpc/svc_rdma.h>	/* the shared cross-module contract */
 
 /*
  * SVC_RDMA_INLINE matches the verbs layer's receive-buffer size
@@ -166,6 +166,9 @@
 #define	SVC_RDMA_CREDIT_GRANT	8
 
 MALLOC_DEFINE(M_SVCRDMA, "svcrdma", "NFS over RDMA server SVCXPRT");
+/* M_NFSRDMA is defined here (base kernel / krpc) so both svc_rdma.c and the
+ * ibcore module (svc_verbs.c) share the tag without a KLD→base linker dep. */
+MALLOC_DEFINE(M_NFSRDMA, "nfsrdma", "NFS over RDMA server");
 
 /* Forward declarations (definitions follow the consumer ops). */
 static void	svc_rdma_conn_set_ctx_wrap(struct svc_rdma_conn *, void *);
@@ -214,6 +217,41 @@ static int			 svc_rdma_verbs_inflight;
 static bool			 svc_rdma_verbs_stopping;
 
 MTX_SYSINIT(svc_rdma_verbs_lock, &svc_rdma_verbs_lock, "svcrdma_verbs", MTX_DEF);
+
+/*
+ * Hold/release the verbs table across a call that drops svc_rdma_verbs_lock and
+ * calls through the ops table (the reply and backchannel paths).  Hold snapshots
+ * the table and arms svc_rdma_verbs_inflight; svc_rdma_unregister_verbs sets
+ * svc_rdma_verbs_stopping, drains inflight to zero, and only THEN clears the
+ * table and lets ibcore's text be freed -- so a held caller cannot have the
+ * module pulled out from under it (the modular-build UAF guard).  Returns NULL
+ * when nothing is registered (or unregister is stopping); the caller must then
+ * not dereference the table, and must NOT call unhold.
+ */
+static const struct svc_rdma_verbs_ops *
+svc_rdma_verbs_hold(void)
+{
+	const struct svc_rdma_verbs_ops *ops;
+
+	mtx_lock(&svc_rdma_verbs_lock);
+	ops = svc_rdma_verbs;
+	if (ops == NULL || svc_rdma_verbs_stopping) {
+		mtx_unlock(&svc_rdma_verbs_lock);
+		return (NULL);
+	}
+	svc_rdma_verbs_inflight++;
+	mtx_unlock(&svc_rdma_verbs_lock);
+	return (ops);
+}
+
+static void
+svc_rdma_verbs_unhold(void)
+{
+	mtx_lock(&svc_rdma_verbs_lock);
+	if (--svc_rdma_verbs_inflight == 0)
+		wakeup(&svc_rdma_verbs_inflight);
+	mtx_unlock(&svc_rdma_verbs_lock);
+}
 
 /* Rate limiter for peer-driven (remotely-triggerable) log lines. */
 static struct timeval		 svc_rdma_log_last;
@@ -702,9 +740,34 @@ svc_rdma_collect_extpg(struct mbuf *m, u_int doff, u_int dlen,
 	return (npd);
 }
 
+static bool_t svc_rdma_do_reply(SVCXPRT *, struct rpc_msg *,
+    struct sockaddr *, struct mbuf *, uint32_t *,
+    const struct svc_rdma_verbs_ops *);
+
 static bool_t
 svc_rdma_xprt_reply(SVCXPRT *xprt, struct rpc_msg *msg,
     struct sockaddr *addr, struct mbuf *m, uint32_t *seq)
+{
+	const struct svc_rdma_verbs_ops *vops;
+	bool_t stat;
+
+	/*
+	 * Hold the verbs table across the whole reply: svc_rdma_do_reply calls
+	 * through it (svo_thread_setup, the write-list/reply-chunk engines,
+	 * svo_conn_send) with xr_lock dropped, and on the modular build a
+	 * concurrent kldunload ibcore must not free that text mid-reply.
+	 */
+	vops = svc_rdma_verbs_hold();
+	stat = svc_rdma_do_reply(xprt, msg, addr, m, seq, vops);
+	if (vops != NULL)
+		svc_rdma_verbs_unhold();
+	return (stat);
+}
+
+static bool_t
+svc_rdma_do_reply(SVCXPRT *xprt, struct rpc_msg *msg,
+    struct sockaddr *addr, struct mbuf *m, uint32_t *seq,
+    const struct svc_rdma_verbs_ops *vops)
 {
 	struct svc_rdma_xprt *xr = (struct svc_rdma_xprt *)xprt->xp_p1;
 	struct svc_rdma_conn *conn;
@@ -725,16 +788,12 @@ svc_rdma_xprt_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 	 * before any of the post sites below run ib_post_send under xr_lock: the
 	 * first mlx5_ib_post_send on a fresh krpc thread would otherwise do that
 	 * M_WAITOK alloc while holding the leaf mutex (WITNESS warns).  Optional op,
-	 * NULL on an older ibcore.  Snapshot svc_rdma_verbs into a local so the
-	 * NULL-check and the call use the SAME pointer (no TOCTOU on the global, and
-	 * the snapshot targets the never-freed registered table).
+	 * NULL on an older ibcore.  vops is the caller-held verbs snapshot (see
+	 * svc_rdma_xprt_reply): non-NULL means svc_rdma_verbs_inflight is armed, so
+	 * the table (ibcore text) stays valid across this whole reply.
 	 */
-	{
-		const struct svc_rdma_verbs_ops *vops = svc_rdma_verbs;
-
-		if (vops != NULL && vops->svo_thread_setup != NULL)
-			vops->svo_thread_setup();
-	}
+	if (vops != NULL && vops->svo_thread_setup != NULL)
+		vops->svo_thread_setup();
 
 	/*
 	 * Build the ONC RPC reply into a fresh pkthdr mbuf, mirroring
@@ -824,9 +883,9 @@ svc_rdma_xprt_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 			m_freem(mrep);
 			mtx_lock(&xr->xr_lock);
 			conn = xr->xr_conn;
-			if (conn != NULL && svc_rdma_verbs != NULL &&
-			    svc_rdma_verbs->svo_conn_error != NULL)
-				(void)svc_rdma_verbs->svo_conn_error(conn,
+			if (conn != NULL && vops != NULL &&
+			    vops->svo_conn_error != NULL)
+				(void)vops->svo_conn_error(conn,
 				    msg->rm_xid, RDMA_ERR_CHUNK);
 			mtx_unlock(&xr->xr_lock);
 			if (ppsratecheck(&svc_rdma_log_last,
@@ -855,8 +914,8 @@ svc_rdma_xprt_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 		 * reply chunk.
 		 */
 		if (have_pend && pend.rp_has_writes && pend.rp_nwrites == 1 &&
-		    pend.rp_has_ddp && pend.rp_ddp_len > 0 && svc_rdma_verbs != NULL &&
-		    svc_rdma_verbs->svo_conn_write_list != NULL) {
+		    pend.rp_has_ddp && pend.rp_ddp_len > 0 && vops != NULL &&
+		    vops->svo_conn_write_list != NULL) {
 			u_int hdrbytes = rlen - nfsreply_len;
 			u_int doff = hdrbytes + pend.rp_ddp_off;
 			u_int dlen = pend.rp_ddp_len;
@@ -896,7 +955,7 @@ svc_rdma_xprt_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 				 */
 				pgs = malloc(SVC_RDMA_RD_MAXPGS * sizeof(*pgs),
 				    M_SVCRDMA, M_WAITOK);
-				npg = (svc_rdma_verbs->svo_conn_write_list_pages !=
+				npg = (vops->svo_conn_write_list_pages !=
 				    NULL) ? svc_rdma_collect_extpg(mrep, doff, dlen,
 				    pgs, SVC_RDMA_RD_MAXPGS) : 0;
 				if (npg == 0) {
@@ -907,8 +966,8 @@ svc_rdma_xprt_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 					 * Prefer the recycle pool (#B1) to avoid the
 					 * per-op contigmalloc/free TLB shootdown.
 					 */
-					if (svc_rdma_verbs->svo_sink_get != NULL) {
-						src = svc_rdma_verbs->svo_sink_get();
+					if (vops->svo_sink_get != NULL) {
+						src = vops->svo_sink_get();
 						src_pooled = true;
 					} else {
 						src = contigmalloc(dlen, M_NFSRDMA,
@@ -926,12 +985,12 @@ svc_rdma_xprt_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 					rc = ENOTCONN;
 					if (npg == 0) {
 						if (src_pooled)
-							svc_rdma_verbs->svo_sink_put(src);
+							vops->svo_sink_put(src);
 						else
 							free(src, M_NFSRDMA);
 					}
 				} else if (npg > 0) {
-					rc = svc_rdma_verbs->svo_conn_write_list_pages(
+					rc = vops->svo_conn_write_list_pages(
 					    conn, msg->rm_xid, &pend.rp_writes, mrep,
 					    pgs, npg, dlen, reduced, reducedlen);
 					/*
@@ -945,7 +1004,7 @@ svc_rdma_xprt_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 					if (rc == 0)
 						seqval = ++xr->xr_seq;
 				} else {
-					rc = svc_rdma_verbs->svo_conn_write_list(
+					rc = vops->svo_conn_write_list(
 					    conn, msg->rm_xid, &pend.rp_writes,
 					    src, dlen, reduced, reducedlen,
 					    src_pooled);
@@ -994,9 +1053,9 @@ svc_rdma_xprt_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 
 			mtx_lock(&xr->xr_lock);
 			conn = xr->xr_conn;
-			if (conn != NULL && svc_rdma_verbs != NULL &&
-			    svc_rdma_verbs->svo_conn_reply_chunk != NULL) {
-				rc = svc_rdma_verbs->svo_conn_reply_chunk(conn,
+			if (conn != NULL && vops != NULL &&
+			    vops->svo_conn_reply_chunk != NULL) {
+				rc = vops->svo_conn_reply_chunk(conn,
 				    msg->rm_xid, &pend.rp_reply, buf, rlen);
 				if (rc == 0)
 					seqval = ++xr->xr_seq;
@@ -1036,9 +1095,9 @@ svc_rdma_xprt_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 		 */
 		mtx_lock(&xr->xr_lock);
 		conn = xr->xr_conn;
-		if (conn != NULL && svc_rdma_verbs != NULL &&
-		    svc_rdma_verbs->svo_conn_error != NULL)
-			(void)svc_rdma_verbs->svo_conn_error(conn, msg->rm_xid,
+		if (conn != NULL && vops != NULL &&
+		    vops->svo_conn_error != NULL)
+			(void)vops->svo_conn_error(conn, msg->rm_xid,
 			    RDMA_ERR_CHUNK);
 		mtx_unlock(&xr->xr_lock);
 		if (ppsratecheck(&svc_rdma_log_last, &svc_rdma_log_pps, 5))
@@ -1081,13 +1140,13 @@ svc_rdma_xprt_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 	 */
 	mtx_lock(&xr->xr_lock);
 	conn = xr->xr_conn;
-	if (conn != NULL && svc_rdma_verbs != NULL) {
-		uint32_t credit = svc_rdma_verbs->svo_conn_credits(conn);
+	if (conn != NULL && vops != NULL) {
+		uint32_t credit = vops->svo_conn_credits(conn);
 
 		if (credit == 0)		/* defensive: never advertise 0 */
 			credit = SVC_RDMA_CREDIT_GRANT;
 		be32enc(buf + 8, credit);	/* w2 rdma_credit: real depth */
-		rc = svc_rdma_verbs->svo_conn_send(conn, buf, total);
+		rc = vops->svo_conn_send(conn, buf, total);
 		if (rc == 0)
 			seqval = ++xr->xr_seq;
 	} else
@@ -1132,8 +1191,31 @@ svc_rdma_xprt_reply(SVCXPRT *xprt, struct rpc_msg *msg,
  * it before the send block), so no new lock order is introduced.  Returns 0, or
  * ENOTCONN/EBUSY/EINVAL which clnt_bck_call maps to RPC_CANTSEND.
  */
+static int svc_rdma_do_bck_send(SVCXPRT *, struct mbuf *,
+    const struct svc_rdma_verbs_ops *);
+
 static int
 svc_rdma_bck_send(SVCXPRT *xprt, struct mbuf *mreq)
+{
+	const struct svc_rdma_verbs_ops *vops;
+	int rc;
+
+	/*
+	 * Hold the verbs table across the backchannel send: svc_rdma_do_bck_send
+	 * calls through it (svo_thread_setup, svo_conn_credits, svo_conn_send) with
+	 * xr_lock dropped, so a concurrent kldunload ibcore must not free that text
+	 * mid-call on the modular build.
+	 */
+	vops = svc_rdma_verbs_hold();
+	rc = svc_rdma_do_bck_send(xprt, mreq, vops);
+	if (vops != NULL)
+		svc_rdma_verbs_unhold();
+	return (rc);
+}
+
+static int
+svc_rdma_do_bck_send(SVCXPRT *xprt, struct mbuf *mreq,
+    const struct svc_rdma_verbs_ops *vops)
 {
 	struct svc_rdma_xprt *xr = (struct svc_rdma_xprt *)xprt->xp_p1;
 	struct svc_rdma_conn *conn;
@@ -1144,13 +1226,9 @@ svc_rdma_bck_send(SVCXPRT *xprt, struct mbuf *mreq)
 	int rc;
 
 	/* Pre-warm the linuxkpi `current` shadow off-lock before the post (#59);
-	 * snapshot the global so the NULL-check and call use one pointer. */
-	{
-		const struct svc_rdma_verbs_ops *vops = svc_rdma_verbs;
-
-		if (vops != NULL && vops->svo_thread_setup != NULL)
-			vops->svo_thread_setup();
-	}
+	 * vops is the caller-held verbs snapshot (see svc_rdma_bck_send). */
+	if (vops != NULL && vops->svo_thread_setup != NULL)
+		vops->svo_thread_setup();
 
 	rlen = m_length(mreq, NULL);
 	total = RPCRDMA_HDR_MIN + rlen;
@@ -1176,13 +1254,13 @@ svc_rdma_bck_send(SVCXPRT *xprt, struct mbuf *mreq)
 
 	mtx_lock(&xr->xr_lock);
 	conn = xr->xr_conn;
-	if (conn != NULL && svc_rdma_verbs != NULL) {
-		uint32_t credit = svc_rdma_verbs->svo_conn_credits(conn);
+	if (conn != NULL && vops != NULL) {
+		uint32_t credit = vops->svo_conn_credits(conn);
 
 		if (credit == 0)		/* defensive: never advertise 0 */
 			credit = SVC_RDMA_CREDIT_GRANT;
 		be32enc(buf + 8, credit);	/* w2 rdma_credit: real depth */
-		rc = svc_rdma_verbs->svo_conn_send(conn, buf, total);
+		rc = vops->svo_conn_send(conn, buf, total);
 	} else
 		rc = ENOTCONN;
 	mtx_unlock(&xr->xr_lock);

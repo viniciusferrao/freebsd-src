@@ -20,6 +20,7 @@ SRCS=	auth_none.c \
 	svc_auth_unix.c \
 	svc_dg.c \
 	svc_generic.c \
+	svc_rdma.c \
 	svc_vc.c
 
 SRCS+=	rpctls_impl.c auth_tls.c

@@ -4836,8 +4836,6 @@ ofed/drivers/infiniband/core/ib_uverbs_uapi.c		optional ofed	\
 	compile-with "${OFED_C}"
 ofed/drivers/infiniband/core/ib_verbs.c			optional ofed	\
 	compile-with "${OFED_C}"
-ofed/drivers/infiniband/core/svc_verbs.c		optional ofed	\
-	compile-with "${OFED_C}"
 
 ofed/drivers/infiniband/ulp/ipoib/ipoib_cm.c	optional ipoib		\
 	compile-with "${OFED_C} -I$S/ofed/drivers/infiniband/ulp/ipoib/"
@@ -5228,8 +5226,7 @@ rpc/svc_auth.c			optional krpc | nfslockd | nfscl | nfsd
 rpc/svc_auth_unix.c		optional krpc | nfslockd | nfscl | nfsd
 rpc/svc_dg.c			optional krpc | nfslockd | nfscl | nfsd
 rpc/svc_generic.c		optional krpc | nfslockd | nfscl | nfsd
-rpc/svc_rdma.c			optional ofed					\
-	compile-with		"${CC} -c ${CFLAGS} -I$S/ofed/include ${WERROR} ${.IMPSRC}"
+rpc/svc_rdma.c			optional krpc | nfslockd | nfscl | nfsd
 rpc/svc_vc.c			optional krpc | nfslockd | nfscl | nfsd
 #
 # Kernel RPC-over-TLS

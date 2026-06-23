@@ -54,12 +54,13 @@
 #include <linux/sched.h>	/* linux_set_current for the krpc post threads (#59) */
 #include <rdma/rdma_cm.h>
 #include <rdma/ib_verbs.h>
-#include <rdma/svc_rdma.h>	/* consumer upcall interface */
+#include <rpc/svc_rdma.h>	/* consumer upcall interface */
 
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/endian.h>		/* be32dec: endian- and alignment-safe word decode */
 #include <sys/kernel.h>		/* SYSUNINIT, bootverbose */
+#include <sys/module.h>		/* DECLARE_MODULE, MODULE_DEPEND, MODULE_VERSION */
 #include <sys/eventhandler.h>	/* vm_lowmem reclaim of the sink cache (#60) */
 #include <sys/lock.h>
 #include <sys/malloc.h>		/* malloc/free, MALLOC_DEFINE */
@@ -114,7 +115,10 @@ static struct svc_rdma_listener svc_rdma_listener = {
 	.sl_ctx = NULL,
 };
 
-MALLOC_DEFINE(M_NFSRDMA, "nfsrdma", "NFS over RDMA server");
+/* M_NFSRDMA is MALLOC_DEFINE'd in sys/rpc/svc_rdma.c (base kernel) so that
+ * both svc_rdma.c and this module share the same malloc tag without a
+ * KLD-to-base symbol dependency.  MALLOC_DECLARE in svc_rdma.h provides the
+ * extern declaration consumed here. */
 
 /*
  * Per-accepted-connection sizing.
@@ -5401,6 +5405,12 @@ static const struct svc_rdma_verbs_ops ibcore_verbs_ops = {
 /*
  * Register the verbs-ops with krpc at module load.
  *
+ * NOTE: this is now the standalone nfsrdma.ko (an IB ULP), with a hard
+ * MODULE_DEPEND on ibcore, so the ibcore/CM core is fully up BEFORE this
+ * module loads -- the load order, not the SI_ORDER below, is what guarantees
+ * "register after cma_init".  The SI_ORDER FIFTH/SIXTH levels below now only
+ * sequence THIS module's own register vs its listener teardown.
+ *
  * Ordering is load-bearing (the mirror image of svc_rdma_uninit's argument).
  * SYSINITs run in ASCENDING SI_ORDER, and the CM core comes up at
  *	module_init_order(cma_init, SI_ORDER_FOURTH)	(ib_cma.c:4701)
@@ -5477,3 +5487,32 @@ svc_rdma_verbs_unregister(void *arg __unused)
 }
 SYSUNINIT(svc_rdma_verbs_unregister, SI_SUB_OFED_MODINIT, SI_ORDER_SIXTH,
     svc_rdma_verbs_unregister, NULL);
+
+/*
+ * Module identity and dependencies.  This file is the NFS-over-RDMA server verbs
+ * layer, shipped as the loadable nfsrdma.ko (sys/modules/nfsrdma) -- an InfiniBand
+ * upper-layer protocol, like ipoib.  The actual load/unload work is the
+ * SYSINIT/SYSUNINIT pair above (register/unregister of the verbs-ops table); the
+ * evhand is a no-op that just carries the module name (the ipoib pattern).
+ * Dependencies:
+ *   ibcore   -- the IB verbs / RDMA-CM core this code drives (imported symbols);
+ *   krpc     -- the base svc_rdma.c SVCXPRT layer we register with
+ *               (svc_rdma_register_verbs, M_NFSRDMA), built in whenever nfsd is;
+ *   linuxkpi -- the compat layer this OFED code is written against.
+ */
+static int
+nfsrdma_evhand(module_t mod __unused, int event __unused, void *arg __unused)
+{
+	return (0);
+}
+
+static moduledata_t nfsrdma_mod = {
+	.name = "nfsrdma",
+	.evhand = nfsrdma_evhand,
+};
+
+DECLARE_MODULE(nfsrdma, nfsrdma_mod, SI_SUB_OFED_MODINIT, SI_ORDER_ANY);
+MODULE_VERSION(nfsrdma, 1);
+MODULE_DEPEND(nfsrdma, ibcore, 1, 1, 1);
+MODULE_DEPEND(nfsrdma, krpc, 1, 1, 1);
+MODULE_DEPEND(nfsrdma, linuxkpi, 1, 1, 1);

@@ -121,20 +121,18 @@ VNET_DEFINE(struct nfsv4lock, nfsd_suspend_lock);
 
 VNET_DEFINE_STATIC(bool, nfsrvd_inited) = false;
 
-#ifdef OFED
 /*
- * NFS-over-RDMA listen hook.  svc_rdma_nfsd_listen() is a built-
- * in kernel symbol exported by the krpc RDMA transport (sys/rpc/svc_rdma.c,
- * "optional ofed").  It starts/stops the RDMA-CM listener bound to THIS nfsd's
+ * NFS-over-RDMA listen hook.  svc_rdma_nfsd_listen() is a base kernel symbol
+ * exported by the krpc RDMA transport (sys/rpc/svc_rdma.c, built whenever the
+ * krpc server stack is).  It starts/stops the RDMA-CM listener bound to THIS nfsd's
  * SVCPOOL (VNET(nfsrvd_pool)), so accepted RDMA connections register as SVCXPRTs
  * in the nfsd pool and the existing nfsd dispatch serves them -- the FreeBSD
  * analogue of Linux's `echo "rdma 20049" > /proc/fs/nfsd/portlist`.
  *
- * vfs.nfsd.rdma_listen: write a nonzero port to start, 0 to stop.  Compiled only
- * when options OFED is configured (the krpc symbol exists only then); on a non-
- * OFED kernel the sysctl is absent.  This is the bring-up control; a netconfig-
- * driven path (rdma/rdma6 netids) is the clean end state.  The prototype is
- * declared in <rpc/svc.h> (pulled in via <rpc/rpc.h>).
+ * vfs.nfsd.rdma_listen: write a nonzero port to start, 0 to stop.  The sysctl is
+ * always present; the handler returns ENXIO until ibcore (the verbs module that
+ * registers the RDMA transport) is kldloaded.  This is the bring-up control; a
+ * netconfig-driven path (rdma/rdma6 netids) is the clean end state.
  */
 
 /* Last started RDMA port for read-back; 0 means the listener is down. */
@@ -170,7 +168,6 @@ SYSCTL_PROC(_vfs_nfsd, OID_AUTO, rdma_listen,
     sysctl_nfsd_rdma_listen, "I",
     "Nonzero port starts the NFS-over-RDMA listener on the nfsd pool, 0 stops "
     "it; ENXIO if ibcore is not loaded or nfsd has not started");
-#endif /* OFED */
 
 /*
  * NFS server system calls
@@ -747,7 +744,6 @@ nfsrvd_init(int terminating)
 	if (terminating) {
 		VNET(nfsd_master_proc) = NULL;
 		NFSD_UNLOCK();
-#ifdef OFED
 		/*
 		 * Stop the NFS-over-RDMA listener before closing the pool, so no
 		 * newly-accepted RDMA connection can xprt_register into a pool
@@ -757,7 +753,6 @@ nfsrvd_init(int terminating)
 		 */
 		(void)svc_rdma_nfsd_listen(VNET(nfsrvd_pool), 0);
 		VNET(nfsrvd_rdma_port) = 0;
-#endif
 		nfsrv_freealllayoutsanddevids();
 		nfsrv_freeallbackchannel_xprts();
 		svcpool_close(VNET(nfsrvd_pool));
