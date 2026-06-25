@@ -37,7 +37,6 @@
 #include "opt_inet6.h"
 #include "opt_kgssapi.h"
 #include "opt_kern_tls.h"
-#include "opt_ofed.h"
 
 #include <fs/nfs/nfsport.h>
 
@@ -130,7 +129,7 @@ VNET_DEFINE_STATIC(bool, nfsrvd_inited) = false;
  * analogue of Linux's `echo "rdma 20049" > /proc/fs/nfsd/portlist`.
  *
  * vfs.nfsd.rdma_listen: write a nonzero port to start, 0 to stop.  The sysctl is
- * always present; the handler returns ENXIO until ibcore (the verbs module that
+ * always present; the handler returns ENXIO until nfsrdma (the verbs module that
  * registers the RDMA transport) is kldloaded.  This is the bring-up control; a
  * netconfig-driven path (rdma/rdma6 netids) is the clean end state.
  */
@@ -167,7 +166,7 @@ SYSCTL_PROC(_vfs_nfsd, OID_AUTO, rdma_listen,
     CTLTYPE_INT | CTLFLAG_VNET | CTLFLAG_MPSAFE | CTLFLAG_RW, NULL, 0,
     sysctl_nfsd_rdma_listen, "I",
     "Nonzero port starts the NFS-over-RDMA listener on the nfsd pool, 0 stops "
-    "it; ENXIO if ibcore is not loaded or nfsd has not started");
+    "it; ENXIO if nfsrdma is not loaded or nfsd has not started");
 
 /*
  * NFS server system calls
@@ -749,7 +748,7 @@ nfsrvd_init(int terminating)
 		 * newly-accepted RDMA connection can xprt_register into a pool
 		 * that is being torn down.  svc_rdma_nfsd_listen(_, 0) only needs
 		 * the verbs table (it ignores the pool argument on stop) and is a
-		 * no-op if no listener is up or ibcore is not loaded.
+		 * no-op if no listener is up or nfsrdma is not loaded.
 		 */
 		(void)svc_rdma_nfsd_listen(VNET(nfsrvd_pool), 0);
 		VNET(nfsrvd_rdma_port) = 0;

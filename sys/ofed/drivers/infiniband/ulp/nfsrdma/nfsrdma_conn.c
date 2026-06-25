@@ -40,8 +40,8 @@ struct mtx svc_rdma_conns_lock;
 
 /*
  * Initialize/destroy sl_lock and svc_rdma_conns_lock at module load/unload via
- * MTX_SYSINIT.  This file is linked into the ibcore KLD, so it has no module
- * event of its own; SYSINIT machinery is how an ibcore-internal source unit gets
+ * MTX_SYSINIT.  This file is linked into the nfsrdma KLD, so it has no module
+ * event of its own; SYSINIT machinery is how an nfsrdma-internal source unit gets
  * init/teardown hooks.
  */
 MTX_SYSINIT(svc_rdma_listener_lock, &svc_rdma_listener.sl_lock,
@@ -700,7 +700,7 @@ svc_rdma_send_error(struct svc_rdma_conn *conn, uint32_t xid, uint32_t errcode)
  * knowledge of the wire header; it does NOT close the connection (ERR_CHUNK is a
  * per-request error and the connection stays UP).  Declared extern in
  * <rdma/svc_rdma.h>; OPTIONAL (krpc NULL-checks it at the call site and
- * svc_rdma_register_verbs does not require it, so an older ibcore still loads and
+ * svc_rdma_register_verbs does not require it, so an older nfsrdma still loads and
  * over-inline drops keep their prior behavior).
  */
 int
@@ -1689,7 +1689,7 @@ out_destroy:
  *      &conn->sc_teardown would be dangling by the time we waited on it.  When
  *      drain_all returns, no sc_teardown task and no posted-WR completion
  *      callback (rr_cqe.done / ss_cqe.done) can run anymore -- critical on the
- *      unload path, where those callbacks live in ibcore text about to be freed.
+ *      unload path, where those callbacks live in nfsrdma text about to be freed.
  * After the drain the registry is empty.  The sweep runs unconditionally (even
  * when sl_id was already NULL): a connection established before an explicit
  * svc_rdma_listen_stop() outlives the listener id, so unload must still reclaim it.

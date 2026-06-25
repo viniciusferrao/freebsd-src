@@ -701,7 +701,7 @@ struct svc_rdma_conn {
  * listener-stop / module-unload time: svc_rdma_listen_stop() destroyed only the
  * listening cm_id, leaving every accepted conn's QP/CQ/PD and posted recv
  * buffers alive -- and, fatally on unload, leaving its rr_cqe.done callbacks and
- * its queued sc_teardown task pointing into ibcore text that is about to be
+ * its queued sc_teardown task pointing into nfsrdma text that is about to be
  * freed (one more flush/frame -> panic or arbitrary kernel execution), plus an
  * unbounded resource leak for idle conns.  The registry lets stop/unload sweep
  * and drain every live conn before returning.

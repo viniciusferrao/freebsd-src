@@ -29,7 +29,7 @@
 /*
  * svc_rdma.c -- krpc-side (built into the kernel) NFS-over-RDMA SERVER
  * transport.  It turns each accepted RDMA connection (owned by the verbs layer
- * svc_verbs.c, in the ibcore module) into a krpc SVCXPRT so the EXISTING nfsd
+ * svc_verbs.c, in the nfsrdma module) into a krpc SVCXPRT so the EXISTING nfsd
  * serves NFS over RDMA.  It provides the SVCXPRT and the nfsd-pool wiring, and
  * is the RDMA analogue of sys/rpc/svc_vc.c (the TCP server transport), which it
  * mirrors closely.
@@ -46,14 +46,14 @@
  * Module layering (docs/16-svcxprt-rdma-integration.md "Module layering").  The
  * verbs entry points (svc_rdma_listen_start_ops / svc_rdma_conn_send /
  * svc_rdma_conn_set_ctx / svc_rdma_conn_get_ctx, plus the private
- * svc_rdma_listen_stop) are DEFINED in the ibcore MODULE.  This file is built
- * INTO the kernel (rpc/svc_rdma.c is "optional ofed", and options OFED is in
- * GENERIC-OFED, so it is part of the kernel image whenever the verbs stack is
- * configured).  A kernel built-in cannot hard-link a loadable module's symbols,
+ * svc_rdma_listen_stop) are DEFINED in the nfsrdma module.  This file is built
+ * INTO the kernel (rpc/svc_rdma.c is "optional krpc | nfslockd | nfscl | nfsd",
+ * like svc_vc.c, so it is part of the kernel image whenever nfsd is).  A kernel
+ * built-in cannot hard-link a loadable module's symbols,
  * so we never call the verbs entry points directly: this file EXPORTS the
- * built-in symbols svc_rdma_register_verbs()/svc_rdma_unregister_verbs(), ibcore
+ * built-in symbols svc_rdma_register_verbs()/svc_rdma_unregister_verbs(), nfsrdma
  * registers a function-pointer table at module load, and we reach the verbs only
- * through that table (svc_rdma_verbs).  With nothing registered (ibcore not
+ * through that table (svc_rdma_verbs).  With nothing registered (nfsrdma not
  * loaded) the listen hook returns ENXIO instead of dereferencing a NULL table.
  *
  * Lifecycle, mirroring svc_vc:
@@ -167,7 +167,7 @@
 
 MALLOC_DEFINE(M_SVCRDMA, "svcrdma", "NFS over RDMA server SVCXPRT");
 /* M_NFSRDMA is defined here (base kernel / krpc) so both svc_rdma.c and the
- * ibcore module (svc_verbs.c) share the tag without a KLD→base linker dep. */
+ * nfsrdma module (svc_verbs.c) share the tag without a KLD→base linker dep. */
 MALLOC_DEFINE(M_NFSRDMA, "nfsrdma", "NFS over RDMA server");
 
 /* Forward declarations (definitions follow the consumer ops). */
@@ -185,9 +185,9 @@ static int	svc_rdma_krpc_listen_port;	/* last started port; 0 == down */
 
 /*
  * ===========================================================================
- * Cross-module verbs-ops registration.
+ * Cross-module verbs ops registration.
  *
- * The registered ibcore verbs-ops table, or NULL when ibcore is not loaded.
+ * The registered nfsrdma verbs ops table, or NULL when nfsrdma is not loaded.
  * svc_rdma_verbs_lock serializes register/unregister against the listen-hook
  * reader so the hook never samples a half-published table and a verbs call is
  * never issued against a table unregister is concurrently clearing.  It is a
@@ -197,7 +197,7 @@ static int	svc_rdma_krpc_listen_port;	/* last started port; 0 == down */
  * svc_rdma_verbs_inflight counts threads that have snapshotted a non-NULL
  * svc_rdma_verbs and are about to call (or are calling) through it with the lock
  * DROPPED.  svc_rdma_unregister_verbs() waits for it to reach 0 before it lets
- * the table pointer go away, so when a truly modular ibcore.ko is unloaded no
+ * the table pointer go away, so when the nfsrdma module is unloaded no
  * listen-hook thread is still executing inside the ops it is about to revoke.
  *
  * svc_rdma_verbs_stopping (BLOCKER B2) gates NEW in-flight arms during unregister.
@@ -223,7 +223,7 @@ MTX_SYSINIT(svc_rdma_verbs_lock, &svc_rdma_verbs_lock, "svcrdma_verbs", MTX_DEF)
  * calls through the ops table (the reply and backchannel paths).  Hold snapshots
  * the table and arms svc_rdma_verbs_inflight; svc_rdma_unregister_verbs sets
  * svc_rdma_verbs_stopping, drains inflight to zero, and only THEN clears the
- * table and lets ibcore's text be freed -- so a held caller cannot have the
+ * table and lets the nfsrdma module's text be freed -- so a held caller cannot have the
  * module pulled out from under it (the modular-build UAF guard).  Returns NULL
  * when nothing is registered (or unregister is stopping); the caller must then
  * not dereference the table, and must NOT call unhold.
@@ -755,7 +755,7 @@ svc_rdma_xprt_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 	 * Hold the verbs table across the whole reply: svc_rdma_do_reply calls
 	 * through it (svo_thread_setup, the write-list/reply-chunk engines,
 	 * svo_conn_send) with xr_lock dropped, and on the modular build a
-	 * concurrent kldunload ibcore must not free that text mid-reply.
+	 * concurrent kldunload nfsrdma must not free that text mid-reply.
 	 */
 	vops = svc_rdma_verbs_hold();
 	stat = svc_rdma_do_reply(xprt, msg, addr, m, seq, vops);
@@ -788,9 +788,9 @@ svc_rdma_do_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 	 * before any of the post sites below run ib_post_send under xr_lock: the
 	 * first mlx5_ib_post_send on a fresh krpc thread would otherwise do that
 	 * M_WAITOK alloc while holding the leaf mutex (WITNESS warns).  Optional op,
-	 * NULL on an older ibcore.  vops is the caller-held verbs snapshot (see
+	 * NULL on an older nfsrdma.  vops is the caller-held verbs snapshot (see
 	 * svc_rdma_xprt_reply): non-NULL means svc_rdma_verbs_inflight is armed, so
-	 * the table (ibcore text) stays valid across this whole reply.
+	 * the table (nfsrdma text) stays valid across this whole reply.
 	 */
 	if (vops != NULL && vops->svo_thread_setup != NULL)
 		vops->svo_thread_setup();
@@ -1089,7 +1089,7 @@ svc_rdma_do_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 		 * connection STAYS UP (a per-request error).  Post under xr_lock so we
 		 * observe a stable live xr_conn (the same SF1/SF2 window as the inline
 		 * and reply-chunk paths above), and only when the verbs layer supplies
-		 * the OPTIONAL svo_conn_error (an older ibcore without it falls back to
+		 * the OPTIONAL svo_conn_error (an older nfsrdma without it falls back to
 		 * the plain drop).  mrep was freed above and is not touched here.  We
 		 * still return FALSE: no inline reply was sent.
 		 */
@@ -1203,7 +1203,7 @@ svc_rdma_bck_send(SVCXPRT *xprt, struct mbuf *mreq)
 	/*
 	 * Hold the verbs table across the backchannel send: svc_rdma_do_bck_send
 	 * calls through it (svo_thread_setup, svo_conn_credits, svo_conn_send) with
-	 * xr_lock dropped, so a concurrent kldunload ibcore must not free that text
+	 * xr_lock dropped, so a concurrent kldunload nfsrdma must not free that text
 	 * mid-call on the modular build.
 	 */
 	vops = svc_rdma_verbs_hold();
@@ -1727,7 +1727,7 @@ svc_rdma_conn_get_ctx_wrap(struct svc_rdma_conn *conn)
 
 /*
  * ===========================================================================
- * Cross-module verbs-ops registration (called from ibcore at load/unload).
+ * Cross-module verbs ops registration (called from the nfsrdma module at load/unload).
  * Owner-keyed, with the modular-build UAF guard; the unregister path now runs
  * svo_listen_stop() with the table still valid (BLOCKER B2, see below).
  */
@@ -1770,7 +1770,7 @@ svc_rdma_unregister_verbs(const struct svc_rdma_verbs_ops *ops)
 	mtx_lock(&svc_rdma_verbs_lock);
 
 	/* Owner-keyed: only the registration that owns the global may revoke
-	 * it (so an EBUSY'd duplicate ibcore.ko unload is a strict no-op). */
+	 * it (so a non-owner unregister is a strict no-op). */
 	if (ops == NULL || svc_rdma_verbs != ops) {
 		mtx_unlock(&svc_rdma_verbs_lock);
 		return;
@@ -1784,7 +1784,7 @@ svc_rdma_unregister_verbs(const struct svc_rdma_verbs_ops *ops)
 	 * svc_rdma_conn_get_ctx_wrap / svc_rdma_conn_set_ctx_wrap dereference
 	 * svc_rdma_verbs.  If we NULLed the table first those wrappers
 	 * would hit a NULL function-pointer table -- a deterministic panic on
-	 * kldunload ibcore (or GENERIC-OFED shutdown) with a live NFS-over-RDMA
+	 * kldunload nfsrdma with a live NFS-over-RDMA
 	 * connection.  So:
 	 *   1. mark stopping so no NEW in-flight arm enters the ops (the arm sites
 	 *      check svc_rdma_verbs != NULL && !svc_rdma_verbs_stopping);
@@ -1793,7 +1793,7 @@ svc_rdma_unregister_verbs(const struct svc_rdma_verbs_ops *ops)
 	 *      the live, owner table, so every sro_disconnect upcall it drives
 	 *      resolves through it correctly;
 	 *   4. retake the lock and only NOW clear svc_rdma_verbs.
-	 * msleep here is legal: unregister runs in ibcore's SYSUNINIT/unload
+	 * msleep here is legal: unregister runs in the nfsrdma module's SYSUNINIT/unload
 	 * context, which is sleepable.
 	 */
 	svc_rdma_verbs_stopping = true;
@@ -1834,7 +1834,7 @@ svc_rdma_unregister_verbs(const struct svc_rdma_verbs_ops *ops)
  * and drive the registered verbs' svo_listen_start() with our SVCXPRT consumer
  * ops, so accepted connections svc_xprt_alloc + xprt_register into nfsd's pool.
  *
- * port != 0 starts; port == 0 stops.  Returns 0 on success, ENXIO if ibcore is
+ * port != 0 starts; port == 0 stops.  Returns 0 on success, ENXIO if nfsrdma is
  * not loaded (no verbs registered), EBUSY if a listener is already up, EINVAL
  * for a bad port, or the verbs bring-up errno.
  *
@@ -1859,7 +1859,7 @@ svc_rdma_nfsd_listen(SVCPOOL *pool, int port)
 	 * lock (the modular-build UAF guard, identical to the bring-up sysctl), then
 	 * issue the blocking verbs call with the lock dropped.  Refuse to arm
 	 * while unregister is stopping the table (B2): treat an in-progress
-	 * unregister as "ibcore going away" and return ENXIO.
+	 * unregister as "nfsrdma going away" and return ENXIO.
 	 */
 	mtx_lock(&svc_rdma_verbs_lock);
 	ops = svc_rdma_verbs;

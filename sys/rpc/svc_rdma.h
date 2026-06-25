@@ -28,7 +28,7 @@
 
 /*
  * svc_rdma.h -- consumer upcall interface for the NFS-over-RDMA server verbs
- * layer (svc_verbs.c, in the ibcore module).
+ * layer (svc_verbs.c, in the nfsrdma module).
  *
  * The verbs layer is decoupled from the RPC policy.  svc_verbs.c
  * owns the RDMA-CM listener, the per-connection QP/CQ/PD, the recv/send buffer
@@ -41,10 +41,10 @@
  * svc_rdma_conn_send() so the consumer can post a marshalled reply.
  *
  * Module layering (docs/16-svcxprt-rdma-integration.md "Module layering"): the
- * verbs live in the ibcore module; the SVCXPRT/xp_ops live in the krpc layer
+ * verbs live in the nfsrdma module; the SVCXPRT/xp_ops live in the krpc layer
  * built into the kernel.  A kernel built-in cannot hard-link a loadable module's
  * symbols, so the consumer does NOT call these entry points directly at link
- * time -- ibcore registers this ops surface with krpc at module load and krpc
+ * time -- the nfsrdma module registers this ops surface with krpc at module load and krpc
  * invokes it through function pointers.  This header is the shared contract for
  * that registration; it declares only what a consumer needs and keeps every
  * verbs-internal detail (recv/send descriptors, the registry, the barriers)
@@ -380,7 +380,7 @@ int	svc_rdma_conn_send(struct svc_rdma_conn *conn, const void *buf,
  * (hold a reference keeping conn alive across the call).
  *
  * OPTIONAL verbs op (svo_conn_error): the consumer NULL-checks it at the call
- * site, so an older ibcore that predates it simply falls back to dropping the
+ * site, so an older nfsrdma that predates it simply falls back to dropping the
  * unplaceable reply.
  */
 int	svc_rdma_conn_error(struct svc_rdma_conn *conn, uint32_t xid,
@@ -503,15 +503,15 @@ void	svc_rdma_thread_setup(void);
  *
  * Module layering (docs/16-svcxprt-rdma-integration.md "Module layering"): the
  * verbs entry points above (svc_rdma_listen_start_ops / svc_rdma_conn_send /
- * svc_rdma_conn_set_ctx / svc_rdma_conn_get_ctx) are DEFINED in the ibcore
+ * svc_rdma_conn_set_ctx / svc_rdma_conn_get_ctx) are DEFINED in the nfsrdma
  * module (svc_verbs.c).  The SVCXPRT/krpc consumer (sys/rpc/svc_rdma.c) is built
  * INTO the kernel, and a kernel built-in cannot hard-link a loadable module's
  * symbols.  So the call direction is inverted at link time: the krpc layer
  * EXPORTS the two registration entry points below as built-in kernel symbols,
- * and ibcore -- which CAN resolve a built-in kernel symbol -- calls
+ * and nfsrdma -- which CAN resolve a built-in kernel symbol -- calls
  * svc_rdma_register_verbs() at module load to hand krpc a table of the verbs
  * entry points (svc_rdma_verbs_ops).  krpc thereafter reaches the verbs only
- * through that registered table; with no table registered (ibcore not loaded)
+ * through that registered table; with no table registered (nfsrdma not loaded)
  * krpc refuses to create an RDMA transport (returns ENXIO) instead of chasing a
  * NULL or an unresolved symbol.
  *
@@ -532,12 +532,12 @@ void	svc_rdma_thread_setup(void);
  * only through svo_listen_stop.  The signature here matches it.)
  *
  * The ops table the caller passes MUST outlive every call krpc can make through
- * it: ibcore passes a static const table and must svc_rdma_unregister_verbs()
+ * it: nfsrdma passes a static const table and must svc_rdma_unregister_verbs()
  * before that table (its module text) can go away.  Registration is single-
  * provider: a second svc_rdma_register_verbs() while one is registered is
  * rejected.  The CORE entries are required (krpc rejects a table missing one
  * with EINVAL); svo_conn_write_list, svo_conn_peeraddr and svo_conn_error are
- * OPTIONAL (NULL-checked at each call site) so an older ibcore predating them
+ * OPTIONAL (NULL-checked at each call site) so an older nfsrdma predating them
  * still registers.
  */
 struct svc_rdma_verbs_ops {
@@ -553,7 +553,7 @@ struct svc_rdma_verbs_ops {
 	 * svo_conn_write_list -> svc_rdma_conn_write_list (write-list READ
 	 * engine).  OPTIONAL: krpc NULL-checks it at the call site (like
 	 * svo_conn_peeraddr) and svc_rdma_register_verbs does NOT require it, so
-	 * an older ibcore predating the engine still registers and over-inline
+	 * an older nfsrdma predating the engine still registers and over-inline
 	 * READs simply fall back to the existing drop.
 	 */
 	int	(*svo_conn_write_list)(struct svc_rdma_conn *conn, uint32_t xid,
@@ -567,7 +567,7 @@ struct svc_rdma_verbs_ops {
 	 * contigmalloc'd copy.  The engine OWNS mrep on EVERY return (0 or errno) and
 	 * m_freem()s it at completion, at drain on a committed partial post, or
 	 * immediately on an early error; the caller must NOT touch mrep afterward.
-	 * OPTIONAL (NULL-checked at the call site): an older ibcore without it leaves
+	 * OPTIONAL (NULL-checked at the call site): an older nfsrdma without it leaves
 	 * the krpc consumer on the contigmalloc fallback.
 	 */
 	int	(*svo_conn_write_list_pages)(struct svc_rdma_conn *conn, uint32_t xid,
@@ -587,7 +587,7 @@ struct svc_rdma_verbs_ops {
 	 * (a per-request error; rdma_err is one of the RFC 8166 4.4 codes,
 	 * ERR_CHUNK == 2).  OPTIONAL: krpc NULL-checks it at the call site (like
 	 * svo_conn_write_list / svo_conn_peeraddr) and svc_rdma_register_verbs does
-	 * NOT require it, so an older ibcore predating it still registers and
+	 * NOT require it, so an older nfsrdma predating it still registers and
 	 * over-inline replies with no reply chunk simply fall back to the existing
 	 * silent drop.
 	 */
@@ -602,7 +602,7 @@ struct svc_rdma_verbs_ops {
 	 * mutex (WITNESS warns).  The consumer calls this OFF-LOCK at the top of a
 	 * reply, where M_WAITOK is legal, to pre-allocate that shadow so the
 	 * under-lock post never allocates.  OPTIONAL (NULL-checked); a no-op on an
-	 * older ibcore (the warning, which is non-fatal, simply persists there).
+	 * older nfsrdma (the warning, which is non-fatal, simply persists there).
 	 */
 	void	(*svo_thread_setup)(void);
 	/*
@@ -620,24 +620,19 @@ struct svc_rdma_verbs_ops {
 };
 
 /*
- * Register / unregister the ibcore verbs-ops table with the krpc layer.  These
+ * Register / unregister the nfsrdma verbs-ops table with the krpc layer.  These
  * are DEFINED in sys/rpc/svc_rdma.c (built into the kernel) and CALLED from
- * ibcore (svc_verbs.c) at module load / unload.  register returns 0 on success
+ * the nfsrdma module (svc_verbs.c) at module load / unload.  register returns 0 on success
  * or EBUSY if a table is already registered (or EINVAL for a NULL/incomplete
  * table); unregister is idempotent.  ops MUST outlive the registration window
  * (register .. unregister).
  *
  * Registration is OWNER-KEYED.  svc_rdma_unregister_verbs() takes the SAME ops
  * pointer that the matching svc_rdma_register_verbs() recorded, and is a no-op
- * unless that pointer is the one currently registered.  This is load-bearing in
- * the shipping GENERIC-OFED config: options OFED compiles the provider IN-KERNEL
- * (which registers at boot) AND also builds ibcore.ko carrying a DUPLICATE
- * register/unregister pair over its OWN &ibcore_verbs_ops.  A kldload ibcore on
- * such a kernel finds a provider already registered and gets EBUSY (its
- * &ibcore_verbs_ops never becomes the owner); a later kldunload must then NOT
- * tear down the in-kernel provider's live listener.  Owner-keying guarantees
- * exactly that: the module's unregister(&module_ibcore_verbs_ops) does not match
- * the in-kernel owner and returns without touching the global or the listener.
+ * unless that pointer is the one currently registered.  Registration is
+ * single-owner: a second svc_rdma_register_verbs() with a different table gets
+ * EBUSY.  Owner-keying makes unregister safe regardless of caller -- it only
+ * revokes the table that actually owns the global.
  */
 int	svc_rdma_register_verbs(const struct svc_rdma_verbs_ops *ops);
 void	svc_rdma_unregister_verbs(const struct svc_rdma_verbs_ops *ops);
