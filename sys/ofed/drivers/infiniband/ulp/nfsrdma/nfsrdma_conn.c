@@ -616,14 +616,18 @@ svc_rdma_conn_peeraddr(struct svc_rdma_conn *conn, struct sockaddr_storage *ss)
 		return;
 	sa = (struct sockaddr *)&conn->sc_id->route.addr.dst_addr;
 	switch (sa->sa_family) {
+#ifdef INET
 	case AF_INET:
 		memcpy(ss, sa, sizeof(struct sockaddr_in));
 		ss->ss_len = sizeof(struct sockaddr_in);
 		break;
+#endif
+#ifdef INET6
 	case AF_INET6:
 		memcpy(ss, sa, sizeof(struct sockaddr_in6));
 		ss->ss_len = sizeof(struct sockaddr_in6);
 		break;
+#endif
 	default:
 		break;
 	}
@@ -1601,7 +1605,9 @@ int
 svc_rdma_listen_start_ops(uint16_t port, const struct svc_rdma_ops *ops,
     void *ctx)
 {
+#ifdef INET
 	struct sockaddr_in sin;
+#endif
 	struct rdma_cm_id *id;
 	int rc;
 
@@ -1636,6 +1642,7 @@ svc_rdma_listen_start_ops(uint16_t port, const struct svc_rdma_ops *ops,
 	 * sockaddr_in6 with IN6ADDR_ANY and a separate rdma_cm_id for the v6
 	 * endpoint, or a kernel that maps v4-mapped v6 addresses automatically.
 	 */
+#ifdef INET
 	memset(&sin, 0, sizeof(sin));
 	sin.sin_family = AF_INET;
 	sin.sin_len = sizeof(sin);
@@ -1648,6 +1655,10 @@ svc_rdma_listen_start_ops(uint16_t port, const struct svc_rdma_ops *ops,
 		    port, rc);
 		goto out_destroy;
 	}
+#else
+	rc = EAFNOSUPPORT;
+	goto out_destroy;
+#endif
 
 	rc = rdma_listen(id, SVC_RDMA_CM_BACKLOG);
 	if (rc != 0) {
