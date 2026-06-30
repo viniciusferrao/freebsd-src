@@ -966,14 +966,24 @@ svc_rdma_do_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 					 * Prefer the recycle pool (#B1) to avoid the
 					 * per-op contigmalloc/free TLB shootdown.
 					 */
+					src = NULL;
 					if (vops->svo_sink_get != NULL) {
 						src = vops->svo_sink_get();
 						src_pooled = true;
-					} else {
+					}
+					/* sink_get may fail; use WAITOK */
+					if (src == NULL) {
 						src = contigmalloc(dlen, M_NFSRDMA,
 						    M_WAITOK, 0, ~(vm_paddr_t)0,
 						    PAGE_SIZE, 0);
 						src_pooled = false;
+					}
+					if (src == NULL) {
+						/* contig WAITOK can fail */
+						free(pgs, M_SVCRDMA);
+						free(reduced, M_SVCRDMA);
+						m_freem(mrep);
+						return (FALSE);
 					}
 					m_copydata(mrep, doff, dlen, src);
 				} else
