@@ -1532,15 +1532,36 @@ svc_rdma_accept(struct rdma_cm_id *id)
 
 	{
 		struct sockaddr_storage pss;
-		uint32_t a = 0;
+		const char *astr = "unknown";
+#if defined(INET) || defined(INET6)
+		char abuf[INET6_ADDRSTRLEN];
+#endif
 
 		svc_rdma_conn_peeraddr(conn, &pss);
-		if (pss.ss_family == AF_INET)
-			a = ((struct sockaddr_in *)&pss)->sin_addr.s_addr;
-		if (bootverbose && ppsratecheck(&svc_rdma_log_last, &svc_rdma_log_pps, 5))
-			printf("nfsrdma: accept: recv_depth=%d send_depth=%d "
-			    "peer_af=%d peer_be=0x%08x\n", conn->sc_nrecv,
-			    conn->sc_nsend, pss.ss_family, a);
+#if defined(INET) || defined(INET6)
+		switch (pss.ss_family) {
+#ifdef INET
+		case AF_INET:
+			astr = inet_ntop(AF_INET,
+			    &((struct sockaddr_in *)&pss)->sin_addr,
+			    abuf, sizeof(abuf));
+			break;
+#endif
+#ifdef INET6
+		case AF_INET6:
+			astr = inet_ntop(AF_INET6,
+			    &((struct sockaddr_in6 *)&pss)->sin6_addr,
+			    abuf, sizeof(abuf));
+			break;
+#endif
+		}
+#endif
+		if (bootverbose && ppsratecheck(&svc_rdma_log_last,
+		    &svc_rdma_log_pps, 5))
+			printf("nfsrdma: accept: recv_depth=%d "
+			    "send_depth=%d peer_af=%d peer=%s\n",
+			    conn->sc_nrecv, conn->sc_nsend,
+			    pss.ss_family, astr);
 	}
 
 	return (0);
