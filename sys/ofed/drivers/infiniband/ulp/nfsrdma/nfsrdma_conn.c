@@ -110,7 +110,12 @@ svc_rdma_cm_event_handler(struct rdma_cm_id *id, struct rdma_cm_event *event)
 {
 	struct svc_rdma_conn *conn;
 	const struct sockaddr *sa;
+#ifdef INET
 	const struct sockaddr_in *sin;
+#endif
+#ifdef INET6
+	const struct sockaddr_in6 *sin6;
+#endif
 	bool owned, deliver;
 
 	/*
@@ -294,27 +299,37 @@ svc_rdma_cm_event_handler(struct rdma_cm_id *id, struct rdma_cm_event *event)
 		sa = (const struct sockaddr *)&id->route.addr.dst_addr;
 		if (bootverbose &&
 		    ppsratecheck(&svc_rdma_log_last, &svc_rdma_log_pps, 5)) {
-			if (sa->sa_family == AF_INET) {
-				uint32_t a;
+			char *buf;
 
+			buf = malloc(INET6_ADDRSTRLEN, M_TEMP, M_WAITOK);
+			switch (sa->sa_family) {
+#ifdef INET
+			case AF_INET:
 				sin = (const struct sockaddr_in *)sa;
-				/*
-				 * Format the dotted quad by hand: native
-				 * printf(9)/kvprintf() does NOT implement the
-				 * LinuxKPI-only %pI4 extension.  s_addr is in
-				 * network byte order; ntohl() gives host order
-				 * so the high octet prints first.
-				 */
-				a = ntohl(sin->sin_addr.s_addr);
 				printf("nfsrdma: CONNECT_REQUEST from "
-				    "%u.%u.%u.%u:%u\n",
-				    (a >> 24) & 0xff, (a >> 16) & 0xff,
-				    (a >> 8) & 0xff, a & 0xff,
+				    "%s:%u\n",
+				    inet_ntop(sin->sin_family,
+				    &sin->sin_addr.s_addr, buf,
+				    INET6_ADDRSTRLEN),
 				    ntohs(sin->sin_port));
-			} else {
+				break;
+#endif
+#ifdef INET6
+			case AF_INET6:
+				sin6 = (const struct sockaddr_in6 *)sa;
+				printf("nfsrdma: CONNECT_REQUEST from "
+				    "%s:%u\n",
+				    inet_ntop(sin6->sin6_family,
+				    &sin6->sin6_addr, buf,
+				    INET6_ADDRSTRLEN),
+				    ntohs(sin6->sin6_port));
+				break;
+#endif
+			default:
 				printf("nfsrdma: CONNECT_REQUEST (af %u)\n",
 				    sa->sa_family);
 			}
+			free(buf, M_TEMP);
 		}
 
 		return (svc_rdma_accept(id));

@@ -49,6 +49,9 @@
  * fast registration (FRWR) in the data path.
  */
 
+#include "opt_inet.h"
+#include "opt_inet6.h"
+
 #include <linux/errno.h>
 #include <linux/kernel.h>
 #include <linux/module.h>	/* SI_SUB_OFED_MODINIT */
