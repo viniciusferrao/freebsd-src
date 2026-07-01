@@ -1028,13 +1028,16 @@ nfsrvd_read(struct nfsrv_descript *nd, __unused int isdgram,
 	if (cnt > 0) {
 		/*
 		 * If cnt > MCLBYTES and the reply will not be saved, use
-		 * ext_pgs mbufs for TLS.
+		 * ext_pgs mbufs for TLS of if enabled via
+		 * vfs.nfsd.enable_mextpg.
 		 * For NFSv4.0, we do not know for sure if the reply will
 		 * be saved, so do not use ext_pgs mbufs for NFSv4.0.
 		 * Always use ext_pgs mbufs if ND_EXTPG is set.
 		 */
 		if ((nd->nd_flag & ND_EXTPG) != 0 || (cnt > MCLBYTES &&
-		    (nd->nd_flag & (ND_TLS | ND_SAVEREPLY)) == ND_TLS &&
+		    ((nd->nd_flag & (ND_TLS | ND_SAVEREPLY)) == ND_TLS ||
+		     (nd->nd_flag & (ND_CANEXTPG | ND_SAVEREPLY)) ==
+		      ND_CANEXTPG) &&
 		    (nd->nd_flag & (ND_NFSV4 | ND_NFSV41)) != ND_NFSV4))
 			nd->nd_repstat = nfsvno_read(vp, off, cnt, nd->nd_cred,
 			    nd->nd_maxextsiz, p, &m3, &m2);
@@ -1073,6 +1076,29 @@ nfsrvd_read(struct nfsrv_descript *nd, __unused int isdgram,
 	}
 	*tl = txdr_unsigned(cnt);
 	if (m3) {
+		/*
+		 * Tell the transport WHERE the DDP-eligible read data sits in
+		 * the NFS reply before we splice m3 in (NFS-over-RDMA write-list
+		 * READ engine).  rd_off is the number of reply-body bytes built
+		 * SO FAR (everything before m3) == m_length(nd_mreq); rd_len is
+		 * the actual data length cnt.  An RDMA transport stores
+		 * {xid,off,len} keyed by xid and, at reply time, RDMA-Writes
+		 * those cnt bytes into the client's write list and SENDs a
+		 * reduced RDMA_MSG.  TCP/UDP xp_control returns FALSE -> a
+		 * harmless transport-agnostic no-op.  Skipped for GSS
+		 * integrity/privacy: SVCAUTH_WRAP later prepends a token and/or
+		 * encrypts the body, so the recorded offset would no longer
+		 * locate the plaintext read data (data-corruption class).
+		 */
+		if (cnt > 0 && nd->nd_xprt != NULL &&
+		    (nd->nd_flag & (ND_GSSINTEGRITY | ND_GSSPRIVACY)) == 0) {
+			struct svcxprt_readddp rddp;
+
+			rddp.rd_xid = nd->nd_retxid;
+			rddp.rd_off = (uint32_t)m_length(nd->nd_mreq, NULL);
+			rddp.rd_len = (uint32_t)cnt;
+			(void)SVC_CONTROL(nd->nd_xprt, SVCSET_READDDP, &rddp);
+		}
 		nd->nd_mb->m_next = m3;
 		nd->nd_mb = m2;
 		if ((m2->m_flags & M_EXTPG) != 0) {

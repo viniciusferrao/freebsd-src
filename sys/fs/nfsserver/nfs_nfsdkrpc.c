@@ -97,6 +97,10 @@ SYSCTL_INT(_vfs_nfsd, OID_AUTO, server_max_nfsvers,
     CTLFLAG_VNET | CTLFLAG_RWTUN, &VNET_NAME(nfs_maxvers), 0,
     "The highest version of NFS handled by the server");
 
+static bool nfsrv_mextpg = true;
+SYSCTL_BOOL(_vfs_nfsd, OID_AUTO, enable_mextpg, CTLFLAG_RW,
+    &nfsrv_mextpg, 0, "Enable use of M_EXTPG mbufs");
+
 static int nfs_proc(struct nfsrv_descript *, u_int32_t, SVCXPRT *xprt,
     struct nfsrvcache **);
 
@@ -115,6 +119,54 @@ VNET_DEFINE(int, nfsrv_numnfsd) = 0;
 VNET_DEFINE(struct nfsv4lock, nfsd_suspend_lock);
 
 VNET_DEFINE_STATIC(bool, nfsrvd_inited) = false;
+
+/*
+ * NFS-over-RDMA listen hook.  svc_rdma_nfsd_listen() is a base kernel symbol
+ * exported by the krpc RDMA transport (sys/rpc/svc_rdma.c, built whenever the
+ * krpc server stack is).  It starts/stops the RDMA-CM listener bound to THIS nfsd's
+ * SVCPOOL (VNET(nfsrvd_pool)), so accepted RDMA connections register as SVCXPRTs
+ * in the nfsd pool and the existing nfsd dispatch serves them -- the FreeBSD
+ * analogue of Linux's `echo "rdma 20049" > /proc/fs/nfsd/portlist`.
+ *
+ * vfs.nfsd.rdma_listen: write a nonzero port to start, 0 to stop.  The sysctl is
+ * always present; the handler returns ENXIO until nfsrdma (the verbs module that
+ * registers the RDMA transport) is kldloaded.  This is the bring-up control; a
+ * netconfig-driven path (rdma/rdma6 netids) is the clean end state.
+ */
+
+/* Last started RDMA port for read-back; 0 means the listener is down. */
+VNET_DEFINE_STATIC(int, nfsrvd_rdma_port) = 0;
+
+static int
+sysctl_nfsd_rdma_listen(SYSCTL_HANDLER_ARGS)
+{
+	int error, port;
+
+	port = VNET(nfsrvd_rdma_port);
+	error = sysctl_handle_int(oidp, &port, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (port < 0 || port > 65535)
+		return (EINVAL);
+
+	/*
+	 * The nfsd pool must exist (nfsd has been initialized) before we can
+	 * register RDMA transports into it.  nfsrvd_init() creates it; a NULL
+	 * pool means the server has not started.
+	 */
+	if (port != 0 && VNET(nfsrvd_pool) == NULL)
+		return (ENXIO);
+
+	error = svc_rdma_nfsd_listen(VNET(nfsrvd_pool), port);
+	if (error == 0)
+		VNET(nfsrvd_rdma_port) = port;
+	return (error);
+}
+SYSCTL_PROC(_vfs_nfsd, OID_AUTO, rdma_listen,
+    CTLTYPE_INT | CTLFLAG_VNET | CTLFLAG_MPSAFE | CTLFLAG_RW, NULL, 0,
+    sysctl_nfsd_rdma_listen, "I",
+    "Nonzero port starts the NFS-over-RDMA listener on the nfsd pool, 0 stops "
+    "it; ENXIO if nfsrdma is not loaded or nfsd has not started");
 
 /*
  * NFS server system calls
@@ -315,7 +367,19 @@ nfssvc_program(struct svc_req *rqst, SVCXPRT *xprt)
 			if ((xprt->xp_tls & RPCTLS_FLAGS_CERTUSER) != 0)
 				nd.nd_flag |= ND_TLSCERTUSER;
 		}
-		nd.nd_maxextsiz = 16384;
+		nd.nd_maxextsiz = MBUF_PEXT_MAX_PGS * PAGE_SIZE;
+		/*
+		 * If the NIC can handle M_EXTPG mbufs, they can be used
+		 * only if the reply will not be copied into the DRC.
+		 * This implies NFSv3 over TCP and NFSv4.n, but not NFSv4.0.
+		 * (NFSv4.n will set ND_SAVEREPLY if the reply is going
+		 *  to be copied into the session slot.)
+		 * Check for TCP transport (UDP uses the DRC) and a direct
+		 * map.
+		 */
+		if (nfsrv_mextpg && xprt->xp_extpg && nd.nd_nam2 == NULL &&
+		    PMAP_HAS_DMAP != 0)
+			nd.nd_flag |= ND_CANEXTPG;
 #ifdef MAC
 		mac_cred_associate_nfsd(nd.nd_cred);
 #endif
@@ -679,6 +743,15 @@ nfsrvd_init(int terminating)
 	if (terminating) {
 		VNET(nfsd_master_proc) = NULL;
 		NFSD_UNLOCK();
+		/*
+		 * Stop the NFS-over-RDMA listener before closing the pool, so no
+		 * newly-accepted RDMA connection can xprt_register into a pool
+		 * that is being torn down.  svc_rdma_nfsd_listen(_, 0) only needs
+		 * the verbs table (it ignores the pool argument on stop) and is a
+		 * no-op if no listener is up or nfsrdma is not loaded.
+		 */
+		(void)svc_rdma_nfsd_listen(VNET(nfsrvd_pool), 0);
+		VNET(nfsrvd_rdma_port) = 0;
 		nfsrv_freealllayoutsanddevids();
 		nfsrv_freeallbackchannel_xprts();
 		svcpool_close(VNET(nfsrvd_pool));

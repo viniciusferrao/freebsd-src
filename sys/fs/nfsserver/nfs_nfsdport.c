@@ -220,6 +220,18 @@ static bool nfsrv_recalldeleg = false;
 SYSCTL_BOOL(_vfs_nfsd, OID_AUTO, recalldeleg, CTLFLAG_RW,
     &nfsrv_recalldeleg, 0,
     "When set remove/rename recalls delegations for same client");
+static int nfsrv_filesync_via_fsync = 1;
+SYSCTL_INT(_vfs_nfsd, OID_AUTO, filesync_via_fsync, CTLFLAG_RW,
+    &nfsrv_filesync_via_fsync, 0,
+    "For a FILE_SYNC/DATA_SYNC WRITE, do one async write plus one ranged "
+    "fsync of the written range (as NFS COMMIT does) instead of a "
+    "synchronous per-block write (IO_SYNC); preserves durability");
+static int nfsrv_fsync_pipelined = 1;
+SYSCTL_INT(_vfs_nfsd, OID_AUTO, fsync_pipelined, CTLFLAG_RW,
+    &nfsrv_fsync_pipelined, 0,
+    "In nfsvno_fsync()'s ranged flush, issue the dirty buffers in the range "
+    "asynchronously (bawrite) and wait once for them to complete, instead of "
+    "a serial synchronous bwrite() per buffer; same buffers, same durability");
 
 /*
  * nfsrv_dsdirsize can only be increased and only when the nfsd threads are
@@ -1272,7 +1284,7 @@ nfsvno_write(struct vnode *vp, off_t off, int retlen, int *stable,
     struct mbuf *mp, char *cp, struct ucred *cred, struct thread *p)
 {
 	struct iovec *iv;
-	int cnt, ioflags, error;
+	int cnt, ioflags, error, dofsync;
 	struct uio io, *uiop = &io;
 	struct nfsheur *nh;
 
@@ -1287,9 +1299,34 @@ nfsvno_write(struct vnode *vp, off_t off, int retlen, int *stable,
 		return (error);
 	}
 
+	/*
+	 * A FILE_SYNC/DATA_SYNC WRITE must be durable before we reply.  The
+	 * traditional way is IO_SYNC, which makes ffs_write() do a synchronous
+	 * bwrite()+bufwait() for every file-system block -- e.g. 32 serial
+	 * device round-trips for a single 1MB write, which off-CPU profiling
+	 * showed dominates WRITE latency (~8ms/op) and caps O_DIRECT throughput
+	 * far below the backing store.  Instead, when nfsrv_filesync_via_fsync
+	 * is set, issue one async (delayed) write and then make the written
+	 * range durable with a single ranged fsync -- the exact work the NFS
+	 * COMMIT path (nfsvno_fsync) already performs.  This is durability-
+	 * equivalent to "UNSTABLE write immediately followed by COMMIT of the
+	 * same range", composed of two already-tested primitives; we report
+	 * success only after the fsync returns.  The vnode lock is held across
+	 * both, so no operation interleaves between the write and its flush.
+	 *
+	 * Only do this when the write fits the ranged-fsync fast path
+	 * (retlen <= MAX_COMMIT_COUNT); above that, nfsvno_fsync() falls back
+	 * to a whole-file VOP_FSYNC, which per-write would be O(file size).
+	 * For those (rare, only if srvmaxio is raised past MAX_COMMIT_COUNT)
+	 * keep the traditional synchronous per-block write.
+	 */
+	dofsync = 0;
 	if (*stable == NFSWRITE_UNSTABLE)
 		ioflags = IO_NODELOCKED;
-	else
+	else if (nfsrv_filesync_via_fsync && retlen <= MAX_COMMIT_COUNT) {
+		ioflags = IO_NODELOCKED;
+		dofsync = 1;
+	} else
 		ioflags = (IO_SYNC | IO_NODELOCKED);
 	error = nfsrv_createiovecw(retlen, mp, cp, &iv, &cnt);
 	if (error != 0)
@@ -1309,6 +1346,15 @@ nfsvno_write(struct vnode *vp, off_t off, int retlen, int *stable,
 	if (error == 0)
 		nh->nh_nextoff = uiop->uio_offset;
 	free(iv, M_TEMP);
+	/*
+	 * Durably commit just the written range for a stable write.  vp is
+	 * held LK_EXCLUSIVE here, the same lock state nfsvno_fsync expects on
+	 * the COMMIT path.  A failure here is reported as a write error (the
+	 * data is in the cache and the client will retry idempotently), which
+	 * is safer than acking a write we could not make durable.
+	 */
+	if (error == 0 && dofsync)
+		error = nfsvno_fsync(vp, off, retlen, cred, p);
 
 	NFSEXITCODE(error);
 	return (error);
@@ -1976,6 +2022,7 @@ nfsvno_fsync(struct vnode *vp, u_int64_t off, int cnt, struct ucred *cred,
 		 */
 		int iosize = vp->v_mount->mnt_stat.f_iosize;
 		int iomask = iosize - 1;
+		int pipelined = nfsrv_fsync_pipelined;
 		struct bufobj *bo;
 		daddr_t lblkno;
 
@@ -2023,8 +2070,13 @@ nfsvno_fsync(struct vnode *vp, u_int64_t off, int cnt, struct ucred *cred,
 			    	if ((bp->b_flags & (B_DELWRI|B_INVAL)) ==
 				    B_DELWRI) {
 					bremfree(bp);
-					bp->b_flags &= ~B_ASYNC;
-					bwrite(bp);
+					/* async; one wait below collects them */
+					if (pipelined) {
+						bawrite(bp);
+					} else {
+						bp->b_flags &= ~B_ASYNC;
+						bwrite(bp);
+					}
 					++nfs_commit_miss;
 				} else
 					BUF_UNLOCK(bp);
@@ -2036,6 +2088,18 @@ nfsvno_fsync(struct vnode *vp, u_int64_t off, int cnt, struct ucred *cred,
 			cnt -= iosize;
 			++lblkno;
 		}
+		/*
+		 * Wait once for the async writes issued above to reach the
+		 * disk before returning, so a stable write/COMMIT is still
+		 * durable.  bufobj_wwait() waits for all of the vnode's
+		 * outstanding output (a superset of this range): durability-
+		 * safe -- we never reply before the requested bytes are on
+		 * disk -- at worst a small over-wait on unrelated in-flight
+		 * writes to the same file.  BO_LOCK is held; bufobj_wwait()
+		 * drops and reacquires it while sleeping.
+		 */
+		if (pipelined)
+			(void)bufobj_wwait(bo, 0, 0);
 		BO_UNLOCK(bo);
 	}
 	NFSEXITCODE(error);
@@ -3018,12 +3082,13 @@ again:
 
 	/*
 	 * If cnt > MCLBYTES and the reply will not be saved, use
-	 * ext_pgs mbufs for TLS.
+	 * ext_pgs mbufs for TLS or if enabled via vfs.nfsd.enable_mextpg.
 	 * For NFSv4.0, we do not know for sure if the reply will
 	 * be saved, so do not use ext_pgs mbufs for NFSv4.0.
 	 */
 	if (cnt > MCLBYTES && siz > MCLBYTES &&
-	    (nd->nd_flag & (ND_TLS | ND_EXTPG | ND_SAVEREPLY)) == ND_TLS &&
+	    ((nd->nd_flag & (ND_TLS | ND_SAVEREPLY)) == ND_TLS ||
+	     (nd->nd_flag & (ND_CANEXTPG | ND_SAVEREPLY)) == ND_CANEXTPG) &&
 	    (nd->nd_flag & (ND_NFSV4 | ND_NFSV41)) != ND_NFSV4)
 		nd->nd_flag |= ND_EXTPG;
 
@@ -3364,7 +3429,8 @@ ateof:
 
 	/*
 	 * If the reply is likely to exceed MCLBYTES and the reply will
-	 * not be saved, use ext_pgs mbufs for TLS.
+	 * not be saved, use ext_pgs mbufs for TLS or if enabled via
+	 * vfs.nfsd.enable_mextpg.
 	 * It is difficult to predict how large each entry will be and
 	 * how many entries have been read, so just assume the directory
 	 * entries grow by a factor of 4 when attributes are included.
@@ -3372,7 +3438,8 @@ ateof:
 	 * be saved, so do not use ext_pgs mbufs for NFSv4.0.
 	 */
 	if (cnt > MCLBYTES && siz > MCLBYTES / 4 &&
-	    (nd->nd_flag & (ND_TLS | ND_EXTPG | ND_SAVEREPLY)) == ND_TLS &&
+	    ((nd->nd_flag & (ND_TLS | ND_SAVEREPLY)) == ND_TLS ||
+	     (nd->nd_flag & (ND_CANEXTPG | ND_SAVEREPLY)) == ND_CANEXTPG) &&
 	    (nd->nd_flag & (ND_NFSV4 | ND_NFSV41)) != ND_NFSV4)
 		nd->nd_flag |= ND_EXTPG;
 
@@ -8213,13 +8280,14 @@ nfsvno_getxattr(struct vnode *vp, char *name, uint32_t maxresp,
 	if (tlen > 0) {
 		/*
 		 * If cnt > MCLBYTES and the reply will not be saved, use
-		 * ext_pgs mbufs for TLS.
+		 * ext_pgs mbufs for TLS or enabled via vfs.nfsd.enable_mextpg.
 		 * For NFSv4.0, we do not know for sure if the reply will
 		 * be saved, so do not use ext_pgs mbufs for NFSv4.0.
 		 * Always use ext_pgs mbufs if ND_EXTPG is set.
 		 */
 		if ((flag & ND_EXTPG) != 0 || (tlen > MCLBYTES &&
-		    (flag & (ND_TLS | ND_SAVEREPLY)) == ND_TLS &&
+		    ((flag & (ND_TLS | ND_SAVEREPLY)) == ND_TLS ||
+		     (flag & (ND_CANEXTPG | ND_SAVEREPLY)) == ND_CANEXTPG) &&
 		    (flag & (ND_NFSV4 | ND_NFSV41)) != ND_NFSV4))
 			uiop->uio_iovcnt = nfsrv_createiovec_extpgs(tlen,
 			    maxextsiz, &m, &m2, &iv);

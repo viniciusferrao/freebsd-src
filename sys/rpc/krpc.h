@@ -43,6 +43,19 @@ enum clnt_stat clnt_bck_call(CLIENT *, struct rpc_callextra *, rpcproc_t,
 struct mbuf *_rpc_copym_into_ext_pgs(struct mbuf *, int);
 
 /*
+ * Link-safe indirect hook for sending an NFSv4.1 backchannel CB RPC CALL over
+ * an RDMA transport (one whose xp_socket == NULL).  DEFINED (initialized NULL)
+ * in rpc/clnt_bck.c, which conf/files compiles into every NFS kernel
+ * ("optional krpc | nfslockd | nfscl | nfsd"); SET by rpc/svc_rdma.c (built
+ * only "optional ofed") at verbs registration and CLEARED at unregistration.
+ * clnt_bck_call() invokes it ONLY for a socket-less backchannel xprt and ONLY
+ * when it is non-NULL, so clnt_bck.c never references any svc_rdma/ofed symbol
+ * and links on a non-OFED kernel.  Returns 0 on success, or an errno
+ * (ENOTCONN/EBUSY/EINVAL) the caller maps to RPC_CANTSEND.  Consumes mreq.
+ */
+extern int (*clnt_bck_rdma_send)(SVCXPRT *, struct mbuf *);
+
+/*
  * A pending RPC request which awaits a reply. Requests which have
  * received their reply will have cr_xid set to zero and cr_mrep to
  * the mbuf chain of the reply.
