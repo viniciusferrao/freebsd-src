@@ -919,7 +919,7 @@ svc_rdma_do_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 			u_int hdrbytes = rlen - nfsreply_len;
 			u_int doff = hdrbytes + pend.rp_ddp_off;
 			u_int dlen = pend.rp_ddp_len;
-			u_int padded = (dlen + 3u) & ~3u;
+			u_int padded = roundup2(dlen, 4);
 			u_int reducedlen;
 			char *reduced;
 			void *src;
