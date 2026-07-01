@@ -30,6 +30,7 @@
 
 struct svc_rdma_listener svc_rdma_listener = {
 	.sl_id = NULL,
+	.sl_id6 = NULL,
 	.sl_ops = NULL,
 	.sl_ctx = NULL,
 };
@@ -48,6 +49,18 @@ MTX_SYSINIT(svc_rdma_listener_lock, &svc_rdma_listener.sl_lock,
     "nfsrdma_listener", MTX_DEF);
 MTX_SYSINIT(svc_rdma_conns_lock, &svc_rdma_conns_lock,
     "nfsrdma_conns", MTX_DEF);
+
+/*
+ * Serialize listener bring-up (svc_rdma_listen_start_ops) against tear-down
+ * (svc_rdma_listen_stop).  start_ops publishes ops/ctx as a reservation before
+ * any cm_id goes live -- this sleepable lock keeps a concurrent stop from
+ * clearing that reservation mid-bring-up (which would leave a live listener
+ * with NULL consumer ops).  It is DISTINCT from sl_lock, the mtx the CM
+ * callback path takes: callbacks never take this lock, so there is no cycle.
+ * Lock order: sl_cfg_lock (sx) -> sl_lock (mtx).
+ */
+static struct sx svc_rdma_listen_cfg_lock;
+SX_SYSINIT(svc_rdma_listen_cfg, &svc_rdma_listen_cfg_lock, "nfsrdma_listencfg");
 
 struct timeval svc_rdma_log_last;
 int svc_rdma_log_pps;
@@ -366,13 +379,23 @@ svc_rdma_cm_event_handler(struct rdma_cm_id *id, struct rdma_cm_event *event)
 		 * reentrant destroy of the passed-in id).
 		 */
 		mtx_lock(&svc_rdma_listener.sl_lock);
-		owned = (id == svc_rdma_listener.sl_id);
+		owned = (id == svc_rdma_listener.sl_id ||
+		    id == svc_rdma_listener.sl_id6);
 		if (owned) {
-			svc_rdma_listener.sl_id = NULL;
-			/* Clear the consumer binding with sl_id (see listen_stop). */
-			svc_rdma_listener.sl_ops = NULL;
-			svc_rdma_listener.sl_ctx = NULL;
-			svc_rdma_listen_port = 0;
+			if (id == svc_rdma_listener.sl_id)
+				svc_rdma_listener.sl_id = NULL;
+			else
+				svc_rdma_listener.sl_id6 = NULL;
+			/*
+			 * Clear the consumer binding only once BOTH
+			 * listener ids are gone (see listen_stop).
+			 */
+			if (svc_rdma_listener.sl_id == NULL &&
+			    svc_rdma_listener.sl_id6 == NULL) {
+				svc_rdma_listener.sl_ops = NULL;
+				svc_rdma_listener.sl_ctx = NULL;
+				svc_rdma_listen_port = 0;
+			}
 		}
 		mtx_unlock(&svc_rdma_listener.sl_lock);
 		if (owned) {
@@ -1601,104 +1624,158 @@ fail:
  * positive so callers (the sysctl below, and the SVCXPRT wiring) get a
  * conventional FreeBSD errno.  Declared in <rdma/svc_rdma.h>.
  */
-int
-svc_rdma_listen_start_ops(uint16_t port, const struct svc_rdma_ops *ops,
-    void *ctx)
+/*
+ * Create one wildcard listening cm_id for a single address family (AF_INET or
+ * AF_INET6) on the given host-order port, bound to the module listener context
+ * so a CONNECT_REQUEST on it routes through svc_rdma_cm_event_handler.  On
+ * success *idp holds a listening id; on failure it is left NULL and a positive
+ * errno is returned.  The FreeBSD rdma_*() helpers return NEGATIVE errnos;
+ * we normalize to positive.
+ */
+static int
+svc_rdma_bind_listener(sa_family_t af, uint16_t port, struct rdma_cm_id **idp)
 {
-#ifdef INET
-	struct sockaddr_in sin;
-#endif
+	struct sockaddr_storage ss;
 	struct rdma_cm_id *id;
 	int rc;
 
-	if (port == 0 || ops == NULL)
-		return (EINVAL);
-
-	mtx_lock(&svc_rdma_listener.sl_lock);
-	if (svc_rdma_listener.sl_id != NULL) {
-		mtx_unlock(&svc_rdma_listener.sl_lock);
-		return (EBUSY);
-	}
-	mtx_unlock(&svc_rdma_listener.sl_lock);
-
-	/*
-	 * &init_net is the default vnet (vnet0); the in-tree server-side users
-	 * (e.g. sdp_main.c) pass it to rdma_create_id().  RDMA_PS_TCP / IB_QPT_RC
-	 * match the iWARP/RoCE/IB RC transport NFS-over-RDMA uses.
-	 */
+	*idp = NULL;
 	id = rdma_create_id(&init_net, svc_rdma_cm_event_handler,
 	    &svc_rdma_listener, RDMA_PS_TCP, IB_QPT_RC);
 	if (IS_ERR(id)) {
 		rc = -PTR_ERR(id);
-		if (bootverbose || ppsratecheck(&svc_rdma_log_last,
-		    &svc_rdma_log_pps, 1))
-			printf("nfsrdma: rdma_create_id failed: %d\n", rc);
 		return (rc != 0 ? rc : EINVAL);
 	}
 
-	/*
-	 * Bind AF_INET only (IPv4/IPoIB/RoCE wildcard).  IPv6/rdma6 dual-stack
-	 * listener support is a TODO: rdma_bind_addr would need an AF_INET6
-	 * sockaddr_in6 with IN6ADDR_ANY and a separate rdma_cm_id for the v6
-	 * endpoint, or a kernel that maps v4-mapped v6 addresses automatically.
-	 */
+	memset(&ss, 0, sizeof(ss));
+	switch (af) {
 #ifdef INET
-	memset(&sin, 0, sizeof(sin));
-	sin.sin_family = AF_INET;
-	sin.sin_len = sizeof(sin);
-	sin.sin_addr.s_addr = htonl(INADDR_ANY);
-	sin.sin_port = htons(port);
+	case AF_INET: {
+		struct sockaddr_in *sin = (struct sockaddr_in *)&ss;
 
-	rc = rdma_bind_addr(id, (struct sockaddr *)&sin);
-	if (rc != 0) {
-		printf("nfsrdma: rdma_bind_addr(port %u) failed: %d\n",
-		    port, rc);
-		goto out_destroy;
+		sin->sin_family = AF_INET;
+		sin->sin_len = sizeof(*sin);
+		sin->sin_addr.s_addr = htonl(INADDR_ANY);
+		sin->sin_port = htons(port);
+		break;
 	}
-#else
-	rc = EAFNOSUPPORT;
-	goto out_destroy;
 #endif
+#ifdef INET6
+	case AF_INET6: {
+		struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&ss;
 
-	rc = rdma_listen(id, SVC_RDMA_CM_BACKLOG);
+		sin6->sin6_family = AF_INET6;
+		sin6->sin6_len = sizeof(*sin6);
+		sin6->sin6_addr = in6addr_any;
+		sin6->sin6_port = htons(port);
+		break;
+	}
+#endif
+	default:
+		rdma_destroy_id(id);
+		return (EAFNOSUPPORT);
+	}
+
+	rc = rdma_bind_addr(id, (struct sockaddr *)&ss);
+	if (rc == 0)
+		rc = rdma_listen(id, SVC_RDMA_CM_BACKLOG);
 	if (rc != 0) {
-		printf("nfsrdma: rdma_listen(port %u) failed: %d\n", port, rc);
-		goto out_destroy;
+		rdma_destroy_id(id);
+		return (rc < 0 ? -rc : rc);
 	}
+	*idp = id;
+	return (0);
+}
 
-	mtx_lock(&svc_rdma_listener.sl_lock);
-	if (svc_rdma_listener.sl_id != NULL) {
-		/* Lost a start race; drop ours rather than overwrite/leak. */
-		mtx_unlock(&svc_rdma_listener.sl_lock);
-		rc = EBUSY;
-		goto out_destroy;
-	}
+int
+svc_rdma_listen_start_ops(uint16_t port, const struct svc_rdma_ops *ops,
+    void *ctx)
+{
+	struct rdma_cm_id *id4 = NULL, *id6 = NULL;
+	int rc4, rc6;
+
+	if (port == 0 || ops == NULL)
+		return (EINVAL);
+
 	/*
-	 * Publish (id, ops, ctx) atomically under sl_lock so the accept path's
-	 * snapshot is always consistent: no CONNECT_REQUEST can see sl_id set with
-	 * a stale/NULL ops.  sl_ops/sl_ctx are cleared again in
-	 * svc_rdma_listen_stop() alongside sl_id.
+	 * Hold the config lock across the whole bring-up so a concurrent
+	 * svc_rdma_listen_stop() cannot cancel our reservation between the
+	 * publish below and the per-id assignments that follow.
 	 */
-	svc_rdma_listener.sl_id = id;
+	sx_xlock(&svc_rdma_listen_cfg_lock);
+
+	/*
+	 * Reserve the listener and PUBLISH ops/ctx before bringing any cm_id
+	 * live.  A CONNECT_REQUEST can only fire after rdma_listen() (below)
+	 * makes an id live, by which point the accept path snapshots a valid
+	 * sl_ops/sl_ctx -- closing the window where a connection could land on
+	 * a listening id whose consumer binding was not yet visible.  sl_ops
+	 * doubles as the busy token, so a repeat start (no intervening stop)
+	 * sees EBUSY here.
+	 */
+	mtx_lock(&svc_rdma_listener.sl_lock);
+	if (svc_rdma_listener.sl_id != NULL ||
+	    svc_rdma_listener.sl_id6 != NULL ||
+	    svc_rdma_listener.sl_ops != NULL) {
+		mtx_unlock(&svc_rdma_listener.sl_lock);
+		sx_xunlock(&svc_rdma_listen_cfg_lock);
+		return (EBUSY);
+	}
 	svc_rdma_listener.sl_ops = ops;
 	svc_rdma_listener.sl_ctx = ctx;
-	/* Publish the port under the same lock that guards sl_id. */
 	svc_rdma_listen_port = port;
 	mtx_unlock(&svc_rdma_listener.sl_lock);
 
-	if (bootverbose)
-		printf("nfsrdma: listening on port %u\n", port);
-	return (0);
-
-out_destroy:
 	/*
-	 * No cm_id is stored yet on this path, so this cannot double-free.
-	 * Normalize the (possibly negative LinuxKPI) errno to positive; never
-	 * return 0 from a failure path.
+	 * Bind+listen one wildcard cm_id per compiled-in family, registering
+	 * each as an owned listener id the instant it goes live.  A family
+	 * compiled but unavailable at runtime (IPv6 disabled) fails its own
+	 * bind without sinking the other -- we serve on whatever bound.
+	 *
+	 * The window between rdma_listen() and the sl_id/sl_id6 store below
+	 * cannot be closed (sl_lock is not held across the sleepable
+	 * rdma_listen()); it matches the pre-IPv6 code and is only reachable
+	 * by a device removal racing listener bring-up.
 	 */
-	rdma_destroy_id(id);
-	rc = (rc < 0) ? -rc : rc;
-	return (rc != 0 ? rc : EINVAL);
+	rc4 = rc6 = EAFNOSUPPORT;
+#ifdef INET
+	rc4 = svc_rdma_bind_listener(AF_INET, port, &id4);
+	if (rc4 == 0) {
+		mtx_lock(&svc_rdma_listener.sl_lock);
+		svc_rdma_listener.sl_id = id4;
+		mtx_unlock(&svc_rdma_listener.sl_lock);
+	} else
+		printf("nfsrdma: IPv4 listener on port %u failed: %d\n",
+		    port, rc4);
+#endif
+#ifdef INET6
+	rc6 = svc_rdma_bind_listener(AF_INET6, port, &id6);
+	if (rc6 == 0) {
+		mtx_lock(&svc_rdma_listener.sl_lock);
+		svc_rdma_listener.sl_id6 = id6;
+		mtx_unlock(&svc_rdma_listener.sl_lock);
+	} else
+		printf("nfsrdma: IPv6 listener on port %u failed: %d\n",
+		    port, rc6);
+#endif
+	if (id4 == NULL && id6 == NULL) {
+		/* Nothing bound; release the reservation. */
+		mtx_lock(&svc_rdma_listener.sl_lock);
+		svc_rdma_listener.sl_ops = NULL;
+		svc_rdma_listener.sl_ctx = NULL;
+		svc_rdma_listen_port = 0;
+		mtx_unlock(&svc_rdma_listener.sl_lock);
+		sx_xunlock(&svc_rdma_listen_cfg_lock);
+		return (rc4 != 0 ? rc4 : (rc6 != 0 ? rc6 : EAFNOSUPPORT));
+	}
+
+	if (bootverbose)
+		printf("nfsrdma: listening on port %u (%s%s%s)\n", port,
+		    id4 != NULL ? "IPv4" : "",
+		    (id4 != NULL && id6 != NULL) ? "+" : "",
+		    id6 != NULL ? "IPv6" : "");
+	sx_xunlock(&svc_rdma_listen_cfg_lock);
+	return (0);
 }
 
 /*
@@ -1744,12 +1821,17 @@ out_destroy:
 void
 svc_rdma_listen_stop(void)
 {
-	struct rdma_cm_id *id;
+	struct rdma_cm_id *id, *id6;
 	struct svc_rdma_conn *conn;
+
+	/* Serialize against svc_rdma_listen_start_ops() (see sl_cfg_lock). */
+	sx_xlock(&svc_rdma_listen_cfg_lock);
 
 	mtx_lock(&svc_rdma_listener.sl_lock);
 	id = svc_rdma_listener.sl_id;
+	id6 = svc_rdma_listener.sl_id6;
 	svc_rdma_listener.sl_id = NULL;
+	svc_rdma_listener.sl_id6 = NULL;
 	/*
 	 * Clear the consumer binding alongside sl_id so a later start begins
 	 * fresh.  This does NOT disturb live connections: each already carries an
@@ -1762,11 +1844,12 @@ svc_rdma_listen_stop(void)
 	svc_rdma_listen_port = 0;	/* keep read-back in sync */
 	mtx_unlock(&svc_rdma_listener.sl_lock);
 
-	if (id != NULL) {
+	if (id != NULL)
 		rdma_destroy_id(id);
-		if (bootverbose)
-			printf("nfsrdma: listener stopped\n");
-	}
+	if (id6 != NULL)
+		rdma_destroy_id(id6);
+	if ((id != NULL || id6 != NULL) && bootverbose)
+		printf("nfsrdma: listener stopped\n");
 
 	/*
 	 * Reclaim every live connection.  conns_lock is the outer lock; conn_close
@@ -1783,4 +1866,6 @@ svc_rdma_listen_stop(void)
 	 * task pointer -- the task frees the conn.
 	 */
 	taskqueue_drain_all(taskqueue_thread);
+
+	sx_xunlock(&svc_rdma_listen_cfg_lock);
 }

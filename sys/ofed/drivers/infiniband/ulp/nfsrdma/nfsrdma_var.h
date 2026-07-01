@@ -74,6 +74,7 @@
 #include <sys/mutex.h>
 #include <sys/queue.h>		/* TAILQ: per-listener connection registry */
 #include <sys/socket.h>
+#include <sys/sx.h>		/* serialize listener bring-up vs tear-down */
 #include <sys/sysctl.h>
 #include <sys/taskqueue.h>	/* deferred (sleepable) connection teardown */
 #include <sys/time.h>		/* ppsratecheck */
@@ -110,7 +111,8 @@
  */
 struct svc_rdma_listener {
 	struct mtx		 sl_lock;
-	struct rdma_cm_id	*sl_id;
+	struct rdma_cm_id	*sl_id;		/* AF_INET listener */
+	struct rdma_cm_id	*sl_id6;	/* AF_INET6 listener */
 	const struct svc_rdma_ops *sl_ops;
 	void			*sl_ctx;
 };
