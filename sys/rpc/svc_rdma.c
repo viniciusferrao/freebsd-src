@@ -725,8 +725,8 @@ svc_rdma_collect_extpg(struct mbuf *m, u_int doff, u_int dlen,
 		for (pg = 0; pg < m->m_epg_npgs && need > 0; pg++) {
 			u_int plen = m_epg_pagelen(m, pg, 0);
 
-			if (plen > need)
-				plen = need;	/* trim the final (padded) page to dlen */
+			/* trim the final (padded) page to dlen */
+			plen = MIN(plen, need);
 			if (npd >= maxpd)
 				return (0);	/* more pages than the engine can take */
 			pd[npd].pg_pa = m->m_epg_pa[pg];
