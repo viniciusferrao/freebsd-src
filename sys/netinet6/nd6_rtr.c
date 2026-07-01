@@ -171,7 +171,7 @@ nd6_rs_input(struct mbuf *m, int off, int icmp6len)
 	union nd_opts ndopts;
 	char ip6bufs[INET6_ADDRSTRLEN], ip6bufd[INET6_ADDRSTRLEN];
 	char *lladdr;
-	int lladdrlen;
+	int lladdr_pad, lladdrlen;
 
 	ifp = m->m_pkthdr.rcvif;
 
@@ -226,16 +226,18 @@ nd6_rs_input(struct mbuf *m, int off, int icmp6len)
 
 	lladdr = NULL;
 	lladdrlen = 0;
+	lladdr_pad = nd6_lladdr_opt_pad(ifp);
 	if (ndopts.nd_opts_src_lladdr) {
-		lladdr = (char *)(ndopts.nd_opts_src_lladdr + 1);
+		lladdr = (char *)(ndopts.nd_opts_src_lladdr + 1) + lladdr_pad;
 		lladdrlen = ndopts.nd_opts_src_lladdr->nd_opt_len << 3;
 	}
 
-	if (lladdr && ((ifp->if_addrlen + 2 + 7) & ~7) != lladdrlen) {
+	if (lladdr && ((ifp->if_addrlen + lladdr_pad + 2 + 7) & ~7) !=
+	    lladdrlen) {
 		nd6log((LOG_INFO,
 		    "%s: lladdrlen mismatch for %s (if %d, RS packet %d)\n",
 		    __func__, ip6_sprintf(ip6bufs, &saddr6),
-		    ifp->if_addrlen, lladdrlen - 2));
+		    ifp->if_addrlen, lladdrlen - 2 - lladdr_pad));
 		goto bad;
 	}
 
@@ -467,18 +469,20 @@ nd6_ra_opt_src_lladdr(struct nd_opt_hdr *opthdr, struct ifnet *ifp,
 {
 	char ip6bufs[INET6_ADDRSTRLEN];
 	char *lladdr = NULL;
+	int lladdr_pad = nd6_lladdr_opt_pad(ifp);
 	int lladdrlen = 0;
 
 	if (opthdr != NULL) {
-		lladdr = (char *)(opthdr + 1);
+		lladdr = (char *)(opthdr + 1) + lladdr_pad;
 		lladdrlen = opthdr->nd_opt_len << 3;
 	}
 
-	if (lladdr && ((ifp->if_addrlen + 2 + 7) & ~7) != lladdrlen) {
+	if (lladdr && ((ifp->if_addrlen + lladdr_pad + 2 + 7) & ~7) !=
+	    lladdrlen) {
 		nd6log((LOG_INFO,
 		    "%s: lladdrlen mismatch for %s (if %d, RA packet %d)\n",
 		    __func__, ip6_sprintf(ip6bufs, &saddr6),
-		    ifp->if_addrlen, lladdrlen - 2));
+		    ifp->if_addrlen, lladdrlen - 2 - lladdr_pad));
 		return (-1);
 	}
 
