@@ -213,10 +213,8 @@ svc_rdma_wc_recv(struct ib_cq *cq, struct ib_wc *wc)
 	ready = (conn->sc_state == SC_UP && conn->sc_newconn_done);
 	if (!ready) {
 		/* Hold at most half the RQ depth (>=1) so the RQ never depletes. */
-		int cap = conn->sc_nrecv / 2;
+		int cap = max_t(int, conn->sc_nrecv / 2, 1);
 
-		if (cap < 1)
-			cap = 1;
 		if (conn->sc_nearly < cap) {
 			rr->rr_early_len = len;
 			STAILQ_INSERT_TAIL(&conn->sc_early, rr, rr_early);
@@ -599,10 +597,8 @@ svc_rdma_read_start(struct svc_rdma_conn *conn, struct svc_rdma_recv *rr,
 	 * count and the buffer size so a malformed rpc_len can never drive a copy
 	 * past the bytes that actually landed in rr_buf.
 	 */
-	if (rs->rs_headlen > len)
-		rs->rs_headlen = len;
-	if (rs->rs_headlen > SVC_RDMA_INLINE)
-		rs->rs_headlen = SVC_RDMA_INLINE;
+	rs->rs_headlen = min_t(uint32_t, rs->rs_headlen, len);
+	rs->rs_headlen = min_t(uint32_t, rs->rs_headlen, SVC_RDMA_INLINE);
 	rs->rs_head = malloc(SVC_RDMA_INLINE, M_NFSRDMA, M_NOWAIT);
 	if (rs->rs_head == NULL)
 		return (ENOMEM);
@@ -1049,8 +1045,7 @@ svc_rdma_wc_rdma_read(struct ib_cq *cq, struct ib_wc *wc)
 	 * overflow uint32.
 	 */
 	pos = rs->rs_msg.reads[0].rc_position;
-	if (pos > rs->rs_headlen)
-		pos = rs->rs_headlen;
+	pos = min_t(uint32_t, pos, rs->rs_headlen);
 	bodylen = rs->rs_headlen + rs->rs_total;
 
 	/*
@@ -1515,7 +1510,7 @@ svc_rdma_conn_reply_chunk(struct svc_rdma_conn *conn, uint32_t xid,
 	remaining = len;
 	for (i = 0; i < n; i++) {
 		uint32_t slen = reply->wc_segs[i].rs_length;
-		uint32_t wlen = (remaining < slen) ? remaining : slen;
+		uint32_t wlen = min_t(uint32_t, remaining, slen);
 
 		be32enc(h + off + 0, reply->wc_segs[i].rs_handle);
 		be32enc(h + off + 4, wlen);		/* bytes written into this seg */
@@ -1552,7 +1547,7 @@ svc_rdma_conn_reply_chunk(struct svc_rdma_conn *conn, uint32_t xid,
 	ws->ws_nwr = 0;
 	for (i = 0; i < n && remaining > 0; i++) {
 		uint32_t slen = reply->wc_segs[i].rs_length;
-		uint32_t wlen = (remaining < slen) ? remaining : slen;
+		uint32_t wlen = min_t(uint32_t, remaining, slen);
 		int k = ws->ws_nwr;
 
 		ws->ws_sge[k].addr = ws->ws_src_dma + off;
@@ -1986,7 +1981,7 @@ svc_rdma_conn_write_list(struct svc_rdma_conn *conn, uint32_t xid,
 	remaining = datalen;
 	for (i = 0; i < n; i++) {
 		uint32_t slen = write->wc_segs[i].rs_length;
-		uint32_t wlen = (remaining < slen) ? remaining : slen;
+		uint32_t wlen = min_t(uint32_t, remaining, slen);
 
 		be32enc(h + off + 0, write->wc_segs[i].rs_handle);
 		be32enc(h + off + 4, wlen);		/* bytes written into this seg */
@@ -2020,7 +2015,7 @@ svc_rdma_conn_write_list(struct svc_rdma_conn *conn, uint32_t xid,
 	ws->ws_nwr = 0;
 	for (i = 0; i < n && remaining > 0; i++) {
 		uint32_t slen = write->wc_segs[i].rs_length;
-		uint32_t wlen = (remaining < slen) ? remaining : slen;
+		uint32_t wlen = min_t(uint32_t, remaining, slen);
 		int k = ws->ws_nwr;
 
 		ws->ws_sge[k].addr = ws->ws_src_dma + off;
@@ -2259,7 +2254,7 @@ svc_rdma_conn_write_list_pages(struct svc_rdma_conn *conn, uint32_t xid,
 	remaining = datalen;
 	for (i = 0; i < n; i++) {
 		uint32_t slen = write->wc_segs[i].rs_length;
-		uint32_t wlen = (remaining < slen) ? remaining : slen;
+		uint32_t wlen = min_t(uint32_t, remaining, slen);
 
 		be32enc(h + off + 0, write->wc_segs[i].rs_handle);
 		be32enc(h + off + 4, wlen);
@@ -2297,7 +2292,7 @@ svc_rdma_conn_write_list_pages(struct svc_rdma_conn *conn, uint32_t xid,
 	ws->ws_nwr = 0;
 	for (i = 0; i < n && remaining > 0; i++) {
 		uint32_t slen = write->wc_segs[i].rs_length;
-		uint32_t wlen = (remaining < slen) ? remaining : slen;
+		uint32_t wlen = min_t(uint32_t, remaining, slen);
 		uint64_t raddr = write->wc_segs[i].rs_offset;
 		uint32_t seg_left = wlen;
 
@@ -2314,7 +2309,8 @@ svc_rdma_conn_write_list_pages(struct svc_rdma_conn *conn, uint32_t xid,
 			while (seg_left > 0 && nsge < (int)conn->sc_max_send_sge &&
 			    p < npages && nsge_total < SVC_RDMA_MAX_WRITE_SGE) {
 				uint32_t pavail = ws->ws_pg_len[p] - pgoff;
-				uint32_t take = (seg_left < pavail) ? seg_left : pavail;
+				uint32_t take = min_t(uint32_t,
+				    seg_left, pavail);
 
 				sg[nsge].addr = ws->ws_pg_dma[p] + pgoff;
 				sg[nsge].length = take;
