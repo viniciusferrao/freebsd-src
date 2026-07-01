@@ -775,7 +775,6 @@ svc_rdma_do_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 	struct mbuf *mrep;
 	char *buf;
 	XDR xdrs;
-	uint32_t hdr[7];
 	uint32_t seqval = 0;
 	u_int rlen, total;
 	u_int nfsreply_len = 0;
@@ -1124,16 +1123,14 @@ svc_rdma_do_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 	 * the verbs layer's real posted recv depth and is filled inside the lock
 	 * below, once we have confirmed a live conn to read it from (SF1).
 	 */
-	hdr[0] = htonl(msg->rm_xid);		/* w0 rdma_xid */
-	hdr[1] = htonl(RPCRDMA_VERSION);	/* w1 rdma_vers */
-	hdr[2] = htonl(SVC_RDMA_CREDIT_GRANT);	/* w2 rdma_credit (fallback) */
-	hdr[3] = htonl(RDMA_MSG);		/* w3 rdma_proc */
-	hdr[4] = 0;				/* w4 read_list (empty) */
-	hdr[5] = 0;				/* w5 write_list (empty) */
-	hdr[6] = 0;				/* w6 reply_chunk (empty) */
-
 	buf = malloc(total, M_SVCRDMA, M_WAITOK);
-	memcpy(buf, hdr, RPCRDMA_HDR_MIN);
+	be32enc(buf + 0, msg->rm_xid); /* w0 rdma_xid */
+	be32enc(buf + 4, RPCRDMA_VERSION); /* w1 rdma_vers */
+	be32enc(buf + 8, SVC_RDMA_CREDIT_GRANT); /* w2 rdma_credit */
+	be32enc(buf + 12, RDMA_MSG); /* w3 rdma_proc */
+	be32enc(buf + 16, 0); /* w4 read_list */
+	be32enc(buf + 20, 0); /* w5 write_list */
+	be32enc(buf + 24, 0); /* w6 reply_chunk */
 	m_copydata(mrep, 0, rlen, buf + RPCRDMA_HDR_MIN);
 	m_freem(mrep);
 
@@ -1229,7 +1226,6 @@ svc_rdma_do_bck_send(SVCXPRT *xprt, struct mbuf *mreq,
 {
 	struct svc_rdma_xprt *xr = (struct svc_rdma_xprt *)xprt->xp_p1;
 	struct svc_rdma_conn *conn;
-	uint32_t hdr[7];
 	uint32_t netxid;
 	char *buf;
 	u_int rlen, total;
@@ -1249,16 +1245,14 @@ svc_rdma_do_bck_send(SVCXPRT *xprt, struct mbuf *mreq,
 
 	/* The ONC xid is word0 of mreq, already in network byte order. */
 	m_copydata(mreq, 0, sizeof(netxid), (caddr_t)&netxid);
-	hdr[0] = netxid;			/* w0 rdma_xid (echo, net order) */
-	hdr[1] = htonl(RPCRDMA_VERSION);	/* w1 rdma_vers */
-	hdr[2] = htonl(SVC_RDMA_CREDIT_GRANT);	/* w2 rdma_credit (fallback) */
-	hdr[3] = htonl(RDMA_MSG);		/* w3 rdma_proc */
-	hdr[4] = 0;				/* w4 read_list (empty) */
-	hdr[5] = 0;				/* w5 write_list (empty) */
-	hdr[6] = 0;				/* w6 reply_chunk (empty) */
-
 	buf = malloc(total, M_SVCRDMA, M_WAITOK);
-	memcpy(buf, hdr, RPCRDMA_HDR_MIN);
+	be32enc(buf + 0, ntohl(netxid)); /* w0 rdma_xid (echo) */
+	be32enc(buf + 4, RPCRDMA_VERSION); /* w1 rdma_vers */
+	be32enc(buf + 8, SVC_RDMA_CREDIT_GRANT); /* w2 rdma_credit */
+	be32enc(buf + 12, RDMA_MSG); /* w3 rdma_proc */
+	be32enc(buf + 16, 0); /* w4 read_list */
+	be32enc(buf + 20, 0); /* w5 write_list */
+	be32enc(buf + 24, 0); /* w6 reply_chunk */
 	m_copydata(mreq, 0, rlen, buf + RPCRDMA_HDR_MIN);
 	m_freem(mreq);
 
