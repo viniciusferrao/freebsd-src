@@ -151,7 +151,7 @@ nd6_ns_input(struct mbuf *m, int off, int icmp6len)
 	union nd_opts ndopts;
 	char ip6bufs[INET6_ADDRSTRLEN], ip6bufd[INET6_ADDRSTRLEN];
 	char *lladdr;
-	int lladdrlen, rflag, tentative, tlladdr;
+	int lladdr_pad, lladdrlen, rflag, tentative, tlladdr;
 	uint32_t dflags;
 
 	ifa = NULL;
@@ -240,8 +240,9 @@ nd6_ns_input(struct mbuf *m, int off, int icmp6len)
 
 	lladdr = NULL;
 	lladdrlen = 0;
+	lladdr_pad = nd6_lladdr_opt_pad(ifp);
 	if (ndopts.nd_opts_src_lladdr) {
-		lladdr = (char *)(ndopts.nd_opts_src_lladdr + 1);
+		lladdr = (char *)(ndopts.nd_opts_src_lladdr + 1) + lladdr_pad;
 		lladdrlen = ndopts.nd_opts_src_lladdr->nd_opt_len << 3;
 	}
 
@@ -300,11 +301,12 @@ nd6_ns_input(struct mbuf *m, int off, int icmp6len)
 	if (((struct in6_ifaddr *)ifa)->ia6_flags & IN6_IFF_DUPLICATED)
 		goto freeit;
 
-	if (lladdr && ((ifp->if_addrlen + 2 + 7) & ~7) != lladdrlen) {
+	if (lladdr && ((ifp->if_addrlen + lladdr_pad + 2 + 7) & ~7) !=
+	    lladdrlen) {
 		nd6log((LOG_INFO, "nd6_ns_input: lladdrlen mismatch for %s "
 		    "(if %d, NS packet %d)\n",
 		    ip6_sprintf(ip6bufs, &taddr6),
-		    ifp->if_addrlen, lladdrlen - 2));
+		    ifp->if_addrlen, lladdrlen - 2 - lladdr_pad));
 		goto bad;
 	}
 
@@ -449,7 +451,8 @@ nd6_ns_output_fib(struct ifnet *ifp, const struct in6_addr *saddr6,
 
 	/* estimate the size of message */
 	maxlen = sizeof(*ip6) + sizeof(*nd_ns);
-	maxlen += (sizeof(struct nd_opt_hdr) + ifp->if_addrlen + 7) & ~7;
+	maxlen += (sizeof(struct nd_opt_hdr) + nd6_lladdr_opt_pad(ifp) +
+	    ifp->if_addrlen + 7) & ~7;
 	KASSERT(max_linkhdr + maxlen <= MCLBYTES, (
 	    "%s: max_linkhdr + maxlen > MCLBYTES (%d + %d > %d)",
 	    __func__, max_linkhdr, maxlen, MCLBYTES));
@@ -581,7 +584,7 @@ nd6_ns_output_fib(struct ifnet *ifp, const struct in6_addr *saddr6,
 	if (nonce == NULL) {
 		struct nd_opt_hdr *nd_opt;
 		char *mac;
-		int optlen;
+		int optlen, pad;
 
 		mac = NULL;
 		if (ifp->if_carp)
@@ -591,7 +594,9 @@ nd6_ns_output_fib(struct ifnet *ifp, const struct in6_addr *saddr6,
 
 		if (mac != NULL) {
 			nd_opt = (struct nd_opt_hdr *)(nd_ns + 1);
-			optlen = sizeof(struct nd_opt_hdr) + ifp->if_addrlen;
+			pad = nd6_lladdr_opt_pad(ifp);
+			optlen = sizeof(struct nd_opt_hdr) + pad +
+			    ifp->if_addrlen;
 			/* 8 byte alignments... */
 			optlen = (optlen + 7) & ~7;
 			m->m_pkthdr.len += optlen;
@@ -600,7 +605,8 @@ nd6_ns_output_fib(struct ifnet *ifp, const struct in6_addr *saddr6,
 			bzero(nd_opt, optlen);
 			nd_opt->nd_opt_type = ND_OPT_SOURCE_LINKADDR;
 			nd_opt->nd_opt_len = optlen >> 3;
-			bcopy(mac, nd_opt + 1, ifp->if_addrlen);
+			bcopy(mac, (caddr_t)(nd_opt + 1) + pad,
+			    ifp->if_addrlen);
 		}
 	}
 	/*
@@ -680,7 +686,7 @@ nd6_na_input(struct mbuf *m, int off, int icmp6len)
 	char *lladdr;
 	size_t linkhdrsize;
 	int flags, is_override, is_router, is_solicited;
-	int lladdr_off, lladdrlen, checklink;
+	int lladdr_off, lladdr_pad, lladdrlen, checklink;
 	bool flush_holdchain = false;
 
 	NET_EPOCH_ASSERT();
@@ -749,8 +755,9 @@ nd6_na_input(struct mbuf *m, int off, int icmp6len)
 
 	lladdr = NULL;
 	lladdrlen = 0;
+	lladdr_pad = nd6_lladdr_opt_pad(ifp);
 	if (ndopts.nd_opts_tgt_lladdr) {
-		lladdr = (char *)(ndopts.nd_opts_tgt_lladdr + 1);
+		lladdr = (char *)(ndopts.nd_opts_tgt_lladdr + 1) + lladdr_pad;
 		lladdrlen = ndopts.nd_opts_tgt_lladdr->nd_opt_len << 3;
 	}
 
@@ -793,10 +800,11 @@ nd6_na_input(struct mbuf *m, int off, int icmp6len)
 		goto freeit;
 	}
 
-	if (lladdr && ((ifp->if_addrlen + 2 + 7) & ~7) != lladdrlen) {
+	if (lladdr && ((ifp->if_addrlen + lladdr_pad + 2 + 7) & ~7) !=
+	    lladdrlen) {
 		nd6log((LOG_INFO, "nd6_na_input: lladdrlen mismatch for %s "
 		    "(if %d, NA packet %d)\n", ip6_sprintf(ip6bufs, &taddr6),
-		    ifp->if_addrlen, lladdrlen - 2));
+		    ifp->if_addrlen, lladdrlen - 2 - lladdr_pad));
 		goto bad;
 	}
 
@@ -1003,7 +1011,8 @@ nd6_na_output_fib(struct ifnet *ifp, const struct in6_addr *daddr6_0,
 
 	/* estimate the size of message */
 	maxlen = sizeof(*ip6) + sizeof(*nd_na);
-	maxlen += (sizeof(struct nd_opt_hdr) + ifp->if_addrlen + 7) & ~7;
+	maxlen += (sizeof(struct nd_opt_hdr) + nd6_lladdr_opt_pad(ifp) +
+	    ifp->if_addrlen + 7) & ~7;
 	KASSERT(max_linkhdr + maxlen <= MCLBYTES, (
 	    "%s: max_linkhdr + maxlen > MCLBYTES (%d + %d > %d)",
 	    __func__, max_linkhdr, maxlen, MCLBYTES));
@@ -1087,7 +1096,9 @@ nd6_na_output_fib(struct ifnet *ifp, const struct in6_addr *daddr6_0,
 		}
 	}
 	if ((tlladdr & ND6_NA_OPT_LLA) && mac != NULL) {
-		int optlen = sizeof(struct nd_opt_hdr) + ifp->if_addrlen;
+		int pad = nd6_lladdr_opt_pad(ifp);
+		int optlen = sizeof(struct nd_opt_hdr) + pad +
+		    ifp->if_addrlen;
 		struct nd_opt_hdr *nd_opt = (struct nd_opt_hdr *)(nd_na + 1);
 
 		/* roundup to 8 bytes alignment! */
@@ -1099,7 +1110,7 @@ nd6_na_output_fib(struct ifnet *ifp, const struct in6_addr *daddr6_0,
 		bzero((caddr_t)nd_opt, optlen);
 		nd_opt->nd_opt_type = ND_OPT_TARGET_LINKADDR;
 		nd_opt->nd_opt_len = optlen >> 3;
-		bcopy(mac, (caddr_t)(nd_opt + 1), ifp->if_addrlen);
+		bcopy(mac, (caddr_t)(nd_opt + 1) + pad, ifp->if_addrlen);
 	} else
 		flags &= ~ND_NA_FLAG_OVERRIDE;
 
@@ -1153,6 +1164,25 @@ nd6_ifptomac(struct ifnet *ifp)
 		return IF_LLADDR(ifp);
 	default:
 		return NULL;
+	}
+}
+
+/*
+ * Number of reserved octets between the header of an ND link-layer
+ * address option and the link-layer address itself.  On IPoIB links
+ * two zero octets are prepended to the 20-octet link-layer address
+ * to fill the 24-octet option (RFC 4391, section 9.3); on all other
+ * link types the address immediately follows the option header.
+ */
+int
+nd6_lladdr_opt_pad(struct ifnet *ifp)
+{
+	switch (ifp->if_type) {
+	case IFT_INFINIBAND:
+	case IFT_INFINIBANDLAG:
+		return (2);
+	default:
+		return (0);
 	}
 }
 
