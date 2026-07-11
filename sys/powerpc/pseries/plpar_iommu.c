@@ -664,7 +664,6 @@ phyp_iommu_unmap(device_t dev, bus_dma_segment_t *segs, int nsegs, void *cookie)
 	bus_addr_t pageround;
 	bus_size_t roundedsize;
 	int i;
-	bus_addr_t j;
 
 	for (i = 0; i < nsegs; i++) {
 		/*
@@ -679,14 +678,17 @@ phyp_iommu_unmap(device_t dev, bus_dma_segment_t *segs, int nsegs, void *cookie)
 		roundedsize = round_page(segs[i].ds_len +
 		    (segs[i].ds_addr & PAGE_MASK));
 
-		if (papr_supports_stuff_tce) {
-			phyp_hcall(H_STUFF_TCE, window->map->iobn, pageround, 0,
-			    roundedsize/PAGE_SIZE);
-		} else {
-			for (j = 0; j < roundedsize; j += PAGE_SIZE)
-				phyp_hcall(H_PUT_TCE, window->map->iobn,
-				    pageround + j, 0);
-		}
+		/*
+		 * A TCE that cannot be cleared stays live until the next
+		 * mapping overwrites it; report it rather than pretend the
+		 * unmap was complete.  The I/O space is freed either way so
+		 * a reuse replaces the stale entry.
+		 */
+		if (!phyp_tce_clear(window->map->iobn, pageround,
+		    roundedsize, PAGE_SHIFT))
+			printf("phyp_iommu: failed to clear TCEs at %#jx "
+			    "(%ju bytes)\n", (uintmax_t)pageround,
+			    (uintmax_t)roundedsize);
 
 		vmem_xfree(window->map->vmem, pageround, roundedsize);
 	}
