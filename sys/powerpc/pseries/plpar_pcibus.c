@@ -50,6 +50,8 @@
 
 static int		plpar_pcibus_probe(device_t);
 static bus_dma_tag_t	plpar_pcibus_get_dma_tag(device_t dev, device_t child);
+static void		plpar_pcibus_enable_msix(device_t dev, device_t child,
+			    u_int index, uint64_t address, uint32_t data);
 
 /*
  * Driver methods.
@@ -57,6 +59,9 @@ static bus_dma_tag_t	plpar_pcibus_get_dma_tag(device_t dev, device_t child);
 static device_method_t	plpar_pcibus_methods[] = {
 	/* Device interface */
 	DEVMETHOD(device_probe,		plpar_pcibus_probe),
+
+	/* PCI interface */
+	DEVMETHOD(pci_enable_msix,	plpar_pcibus_enable_msix),
 
 	/* IOMMU functions */
 	DEVMETHOD(bus_get_dma_tag,	plpar_pcibus_get_dma_tag),
@@ -107,4 +112,37 @@ plpar_pcibus_get_dma_tag(device_t dev, device_t child)
 	phyp_iommu_set_dma_tag(dev, child, dinfo->opd_dma_tag);
 
 	return (dinfo->opd_dma_tag);
+}
+
+/*
+ * Program a child's MSI-X message into the device.
+ *
+ * Under PAPR the hypervisor owns the device's MSI/MSI-X message: it programs
+ * the (address, data) pair as part of ibm,change-msi (rtaspci_alloc_msix).
+ * The generic PCI code, however, also writes the FreeBSD-side message --
+ * the per-PHB sPAPR MSI window address plus the XICS source number -- into
+ * the device's MSI-X table BAR via MMIO.  For an emulated device QEMU traps
+ * that table and the write is harmless, but for a VFIO PCI passthrough
+ * device (e.g. mlx5) the write reaches the real adapter's MSI-X table and
+ * overwrites the host-programmed interrupt address with the guest window
+ * address.  When the adapter firmware then raises an interrupt it DMA-writes
+ * the MSI message to an address that is no longer the host-programmed one,
+ * the adapter firmware wedges, and its MMIO reads return all-0xff.
+ * (Observed on mlx5: the host PE itself does not freeze and there is no
+ * host EEH event -- the fault is on the adapter side.)  Linux's pseries MSI
+ * code likewise never writes the device MSI-X table.  Suppress the write
+ * here; the generic code still unmasks the vector (pci_unmask_msix)
+ * separately, so interrupt delivery set up by the hypervisor is unaffected.
+ *
+ * Consequence: because the device table is never written by the guest, the
+ * hypervisor's index->source mapping fixed at ibm,change-msi is authoritative,
+ * and pci_remap_msix() (which would reprogram table entries to rebalance
+ * vectors) is NOT honored on this path.  No in-tree driver on this platform
+ * remaps; a general implementation would need a pseries-specific remap policy
+ * (or to reject a non-identity remap).
+ */
+static void
+plpar_pcibus_enable_msix(device_t dev __unused, device_t child __unused,
+    u_int index __unused, uint64_t address __unused, uint32_t data __unused)
+{
 }
