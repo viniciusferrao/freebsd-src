@@ -53,7 +53,19 @@ cell_t rtas_token_lookup(const char *method);
 #define	RTAS_STATE_CHANGE		-7
 #define	RTAS_VENDOR_BEGIN		9000
 #define	RTAS_EXTENDED_DELAY		9900
+#define	RTAS_EXTENDED_DELAY_MAX		9905
 #define	RTAS_ISOLATION_ERROR		-9000
 #define	RTAS_VENDOR_ERROR_BEGIN		-9004
+
+/*
+ * True if an RTAS status code asks the caller to retry: hard busy, or an
+ * extended delay 9900..9905 (a suggested wait of 10^(status - 9900) ms).
+ */
+static __inline bool
+rtas_status_busy(cell_t status)
+{
+	return (status == RTAS_BUSY || (status >= RTAS_EXTENDED_DELAY &&
+	    status <= RTAS_EXTENDED_DELAY_MAX));
+}
 
 #endif /* _MACHINE_RTAS_H_ */
