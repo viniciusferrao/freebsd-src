@@ -1599,7 +1599,32 @@ linux_dma_trie_free(struct pctrie *ptree, void *node)
 PCTRIE_DEFINE(LINUX_DMA, linux_dma_obj, dma_addr, linux_dma_trie_alloc,
     linux_dma_trie_free);
 
-#if defined(__i386__) || defined(__amd64__) || defined(__aarch64__)
+/*
+ * Finalize a low-level _bus_dmamap_load_phys() into the bus address the
+ * caller will use.  On powerpc the IOMMU (PAPR TCE / DDW) translation is
+ * applied by the busdma map_complete callback rather than by load_phys; the
+ * public bus_dmamap_load(9) API always calls complete, so mirror that here
+ * after the raw load so passthrough devices (e.g. mlx5) see the IOMMU-mapped
+ * address.  On other architectures load_phys already returns the final
+ * address, so this is a no-op.  Centralizing it keeps the one arch-specific
+ * step in a single place.
+ */
+static inline void
+lkpi_dma_finalize(bus_dma_tag_t dmat, bus_dmamap_t map, bus_dma_segment_t *segs,
+    int nseg)
+{
+#if defined(__powerpc__)
+	(void)_bus_dmamap_complete(dmat, map, segs, nseg, 0);
+#else
+	(void)dmat;
+	(void)map;
+	(void)segs;
+	(void)nseg;
+#endif
+}
+
+#if defined(__i386__) || defined(__amd64__) || defined(__aarch64__) || \
+    defined(__powerpc__)
 static dma_addr_t
 linux_dma_map_phys_common(struct device *dev, vm_paddr_t phys, size_t len,
     bus_dma_tag_t dmat)
@@ -1637,6 +1662,8 @@ linux_dma_map_phys_common(struct device *dev, vm_paddr_t phys, size_t len,
 	error = _bus_dmamap_load_phys(obj->dmat, obj->dmamap, phys, len,
 	    BUS_DMA_NOWAIT, &seg, &nseg);
 	if (error != 0) {
+		/* A partial load may hold bounce pages. */
+		bus_dmamap_unload(obj->dmat, obj->dmamap);
 		bus_dmamap_destroy(obj->dmat, obj->dmamap);
 		DMA_PRIV_UNLOCK(priv);
 		uma_zfree(linux_dma_obj_zone, obj);
@@ -1649,6 +1676,8 @@ linux_dma_map_phys_common(struct device *dev, vm_paddr_t phys, size_t len,
 		}
 		return (0);
 	}
+
+	lkpi_dma_finalize(obj->dmat, obj->dmamap, &seg, nseg + 1);
 
 	KASSERT(++nseg == 1, ("More than one segment (nseg=%d)", nseg));
 	obj->dma_addr = seg.ds_addr;
@@ -1698,7 +1727,8 @@ linux_dma_map_phys(struct device *dev, vm_paddr_t phys, size_t len)
 	return (lkpi_dma_map_phys(dev, phys, len, DMA_NONE, 0));
 }
 
-#if defined(__i386__) || defined(__amd64__) || defined(__aarch64__)
+#if defined(__i386__) || defined(__amd64__) || defined(__aarch64__) || \
+    defined(__powerpc__)
 void
 lkpi_dma_unmap(struct device *dev, dma_addr_t dma_addr, size_t len,
     enum dma_data_direction direction, unsigned long attrs)
@@ -1901,91 +1931,116 @@ linux_dma_map_sg_attrs(struct device *dev, struct scatterlist *sgl, int nents,
 {
 	struct linux_dma_priv *priv;
 	struct scatterlist *sg;
-	int i, nseg;
+	int i, j, nseg;
 	bus_dma_segment_t seg;
 
 	priv = dev->dma_priv;
 
 	DMA_PRIV_LOCK(priv);
 
-	/* create common DMA map in the first S/G entry */
-	if (bus_dmamap_create(priv->dmat, 0, &sgl->dma_map) != 0) {
-		DMA_PRIV_UNLOCK(priv);
-		return (0);
-	}
-
-	/* load all S/G list entries */
+	/*
+	 * Give each S/G entry its own DMA map and load it individually.
+	 * A bus_dmamap holds a single live load, and on platforms where
+	 * the IOMMU translation is set up by _bus_dmamap_complete() (e.g.
+	 * powerpc TCE windows) each completed load records per-map state
+	 * that the final unload releases.  Loading every entry through one
+	 * shared map would leak the IOMMU mappings of all but the last
+	 * entry.  On platforms without bounce or IOMMU state the created
+	 * maps are NULL and this costs nothing.
+	 */
 	for_each_sg(sgl, sg, nents, i) {
+		if (bus_dmamap_create(priv->dmat, 0, &sg->dma_map) != 0)
+			goto err;
 		nseg = -1;
-		if (_bus_dmamap_load_phys(priv->dmat, sgl->dma_map,
+		if (_bus_dmamap_load_phys(priv->dmat, sg->dma_map,
 		    sg_phys(sg), sg->length, BUS_DMA_NOWAIT,
 		    &seg, &nseg) != 0) {
-			bus_dmamap_unload(priv->dmat, sgl->dma_map);
-			bus_dmamap_destroy(priv->dmat, sgl->dma_map);
-			DMA_PRIV_UNLOCK(priv);
-			return (0);
+			/* A partial load may hold bounce pages. */
+			bus_dmamap_unload(priv->dmat, sg->dma_map);
+			bus_dmamap_destroy(priv->dmat, sg->dma_map);
+			goto err;
 		}
 		KASSERT(nseg == 0,
 		    ("More than one segment (nseg=%d)", nseg + 1));
+
+		lkpi_dma_finalize(priv->dmat, sg->dma_map, &seg, nseg + 1);
 
 		sg_dma_address(sg) = seg.ds_addr;
 	}
 
 	if ((attrs & DMA_ATTR_SKIP_CPU_SYNC) != 0)
-		goto skip_sync;
+		goto out;
 
-	switch (direction) {
-	case DMA_BIDIRECTIONAL:
-		bus_dmamap_sync(priv->dmat, sgl->dma_map, BUS_DMASYNC_PREWRITE);
-		break;
-	case DMA_TO_DEVICE:
-		bus_dmamap_sync(priv->dmat, sgl->dma_map, BUS_DMASYNC_PREREAD);
-		break;
-	case DMA_FROM_DEVICE:
-		bus_dmamap_sync(priv->dmat, sgl->dma_map, BUS_DMASYNC_PREWRITE);
-		break;
-	default:
-		break;
+	for_each_sg(sgl, sg, nents, i) {
+		switch (direction) {
+		case DMA_BIDIRECTIONAL:
+			bus_dmamap_sync(priv->dmat, sg->dma_map,
+			    BUS_DMASYNC_PREREAD | BUS_DMASYNC_PREWRITE);
+			break;
+		case DMA_TO_DEVICE:
+			/* Memory-to-device: flush CPU data (bounce copy). */
+			bus_dmamap_sync(priv->dmat, sg->dma_map,
+			    BUS_DMASYNC_PREWRITE);
+			break;
+		case DMA_FROM_DEVICE:
+			bus_dmamap_sync(priv->dmat, sg->dma_map,
+			    BUS_DMASYNC_PREREAD);
+			break;
+		default:
+			break;
+		}
 	}
-skip_sync:
-
+out:
 	DMA_PRIV_UNLOCK(priv);
 
 	return (nents);
+
+err:
+	/* Unwind the entries already mapped. */
+	for_each_sg(sgl, sg, i, j) {
+		bus_dmamap_unload(priv->dmat, sg->dma_map);
+		bus_dmamap_destroy(priv->dmat, sg->dma_map);
+	}
+	DMA_PRIV_UNLOCK(priv);
+	return (0);
 }
 
 void
 linux_dma_unmap_sg_attrs(struct device *dev, struct scatterlist *sgl,
-    int nents __unused, enum dma_data_direction direction,
-    unsigned long attrs)
+    int nents, enum dma_data_direction direction, unsigned long attrs)
 {
 	struct linux_dma_priv *priv;
+	struct scatterlist *sg;
+	int i;
 
 	priv = dev->dma_priv;
 
 	DMA_PRIV_LOCK(priv);
 
-	if ((attrs & DMA_ATTR_SKIP_CPU_SYNC) != 0)
-		goto skip_sync;
-
-	switch (direction) {
-	case DMA_BIDIRECTIONAL:
-		bus_dmamap_sync(priv->dmat, sgl->dma_map, BUS_DMASYNC_POSTREAD);
-		bus_dmamap_sync(priv->dmat, sgl->dma_map, BUS_DMASYNC_PREREAD);
-		break;
-	case DMA_TO_DEVICE:
-		bus_dmamap_sync(priv->dmat, sgl->dma_map, BUS_DMASYNC_POSTWRITE);
-		break;
-	case DMA_FROM_DEVICE:
-		bus_dmamap_sync(priv->dmat, sgl->dma_map, BUS_DMASYNC_POSTREAD);
-		break;
-	default:
-		break;
+	for_each_sg(sgl, sg, nents, i) {
+		if ((attrs & DMA_ATTR_SKIP_CPU_SYNC) == 0) {
+			switch (direction) {
+			case DMA_BIDIRECTIONAL:
+				bus_dmamap_sync(priv->dmat, sg->dma_map,
+				    BUS_DMASYNC_POSTREAD);
+				bus_dmamap_sync(priv->dmat, sg->dma_map,
+				    BUS_DMASYNC_PREREAD);
+				break;
+			case DMA_TO_DEVICE:
+				bus_dmamap_sync(priv->dmat, sg->dma_map,
+				    BUS_DMASYNC_POSTWRITE);
+				break;
+			case DMA_FROM_DEVICE:
+				bus_dmamap_sync(priv->dmat, sg->dma_map,
+				    BUS_DMASYNC_POSTREAD);
+				break;
+			default:
+				break;
+			}
+		}
+		bus_dmamap_unload(priv->dmat, sg->dma_map);
+		bus_dmamap_destroy(priv->dmat, sg->dma_map);
 	}
-skip_sync:
-
-	bus_dmamap_unload(priv->dmat, sgl->dma_map);
-	bus_dmamap_destroy(priv->dmat, sgl->dma_map);
 	DMA_PRIV_UNLOCK(priv);
 }
 
@@ -2014,6 +2069,8 @@ dma_pool_obj_ctor(void *mem, int size, void *arg, int flags)
 	error = _bus_dmamap_load_phys(pool->pool_dmat, obj->dmamap,
 	    vtophys(obj->vaddr), pool->pool_entry_size, BUS_DMA_NOWAIT,
 	    &seg, &nseg);
+	if (error == 0)
+		lkpi_dma_finalize(pool->pool_dmat, obj->dmamap, &seg, nseg + 1);
 	DMA_POOL_UNLOCK(pool);
 	if (error != 0) {
 		return (error);
