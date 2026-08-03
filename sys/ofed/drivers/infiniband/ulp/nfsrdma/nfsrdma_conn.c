@@ -40,17 +40,6 @@ struct svc_rdma_conn_list svc_rdma_conns =
 struct mtx svc_rdma_conns_lock;
 
 /*
- * Initialize/destroy sl_lock and svc_rdma_conns_lock at module load/unload via
- * MTX_SYSINIT.  This file is linked into the nfsrdma KLD, so it has no module
- * event of its own; SYSINIT machinery is how an nfsrdma-internal source unit gets
- * init/teardown hooks.
- */
-MTX_SYSINIT(svc_rdma_listener_lock, &svc_rdma_listener.sl_lock,
-    "nfsrdma_listener", MTX_DEF);
-MTX_SYSINIT(svc_rdma_conns_lock, &svc_rdma_conns_lock,
-    "nfsrdma_conns", MTX_DEF);
-
-/*
  * Serialize listener bring-up (svc_rdma_listen_start_ops) against tear-down
  * (svc_rdma_listen_stop).  start_ops publishes ops/ctx as a reservation before
  * any cm_id goes live -- this sleepable lock keeps a concurrent stop from
@@ -59,8 +48,7 @@ MTX_SYSINIT(svc_rdma_conns_lock, &svc_rdma_conns_lock,
  * callback path takes: callbacks never take this lock, so there is no cycle.
  * Lock order: sl_cfg_lock (sx) -> sl_lock (mtx).
  */
-static struct sx svc_rdma_listen_cfg_lock;
-SX_SYSINIT(svc_rdma_listen_cfg, &svc_rdma_listen_cfg_lock, "nfsrdma_listencfg");
+struct sx svc_rdma_listen_cfg_lock;
 
 struct timeval svc_rdma_log_last;
 int svc_rdma_log_pps;
@@ -599,7 +587,7 @@ svc_rdma_conn_credits(struct svc_rdma_conn *conn)
 }
 
 /*
- * Pre-allocate the calling thread's linuxkpi `current` shadow (#59).  The krpc
+ * Pre-allocate the calling thread's linuxkpi `current` shadow.  The krpc
  * reply paths call ib_post_send while holding the xr_lock leaf mutex, trusting
  * that the post does not sleep.  That holds EXCEPT the first time a given krpc
  * pool thread enters mlx5_ib_post_send: it dereferences `current`, and linuxkpi
@@ -979,7 +967,7 @@ svc_rdma_conn_free_verbs(struct svc_rdma_conn *conn)
 				ib_dma_unmap_single(dev, rb->rb_dma,
 				    SVC_RDMA_MAX_READ, DMA_FROM_DEVICE);
 			if (rb->rb_buf != NULL)
-				svc_rdma_sink_put(rb->rb_buf);	/* recycle (#60) */
+				svc_rdma_sink_put(rb->rb_buf);	/* recycle */
 		}
 		free(conn->sc_rbpool, M_NFSRDMA);
 		conn->sc_rbpool = NULL;
@@ -1501,7 +1489,7 @@ svc_rdma_accept(struct rdma_cm_id *id)
 		for (rbk = 0; rbk < conn->sc_nrbpool; rbk++) {
 			struct svc_rdma_readbuf *rb = &conn->sc_rbpool[rbk];
 
-			rb->rb_buf = svc_rdma_sink_get();	/* recycle list (#60) */
+			rb->rb_buf = svc_rdma_sink_get(); /* recycle list */
 			if (rb->rb_buf == NULL) {
 				conn->sc_nrbpool = rbk;	/* short pool */
 				break;

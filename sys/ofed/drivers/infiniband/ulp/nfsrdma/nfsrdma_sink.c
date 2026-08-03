@@ -32,14 +32,13 @@ struct mtx svc_rdma_sink_lock;
 void	*svc_rdma_sink_head;	/* LIFO; next ptr lives in buf[0] */
 int	 svc_rdma_sink_count;
 volatile int svc_rdma_sink_draining;	/* set once at unload; never cleared */
-eventhandler_tag svc_rdma_sink_lowmem_tag; /* vm_lowmem registration (#60) */
-MTX_SYSINIT(svc_rdma_sink_lock, &svc_rdma_sink_lock, "nfsrdma_sink", MTX_DEF);
+eventhandler_tag svc_rdma_sink_lowmem_tag;
 
 /*
- * Borrow a sink buffer: pop the recycle list, else contigmalloc a fresh one.
- * Always SVC_RDMA_MAX_READ bytes so any buffer fits any read.  M_NOWAIT -- the
- * callers (CQ workqueue, accept under the CM handler_mutex) are non-sleepable
- * and already handle NULL.  Returned memory is UNMAPPED; the caller maps it.
+ * Borrow a sink buffer from the recycle list, or allocate one.  Always
+ * SVC_RDMA_MAX_READ bytes, so any buffer fits any read.  M_NOWAIT because the
+ * callers run in the CQ workqueue and under the CM handler mutex.  The
+ * returned memory is unmapped; the caller maps it.
  */
 void *
 svc_rdma_sink_get(void)
@@ -60,26 +59,16 @@ svc_rdma_sink_get(void)
 }
 
 /*
- * Return a sink buffer.  It MUST be plain, unmapped, SVC_RDMA_MAX_READ-sized
- * contiguous memory (the invariant every caller upholds).  Recycle it unless the
- * cache is full OR we are draining at unload, in which case free() it (bounded,
- * rare).  NULL-safe.
+ * Return a sink buffer, which must be unmapped and full size.  Recycle it
+ * unless the cache is full or we are draining at unload, in which case free
+ * it.  NULL-safe.
  *
- * The svc_rdma_sink_draining gate makes a LATE put -- a sink mbuf that is nfsd-
- * owned and outlives the conn (see svc_rdma_read_extfree) and is freed after
- * svc_rdma_sink_drain() has run at module unload -- free() the buffer back to the
- * system instead of re-stocking a list that will never be drained again.
- *
- * The flag is checked TWICE.  The first check is an unlocked atomic load BEFORE
- * svc_rdma_sink_lock is taken: at module unload the MTX_SYSINIT teardown of
- * svc_rdma_sink_lock (SI_SUB_LOCK = 0x1B00000) runs BEFORE malloc_uninit of
- * M_NFSRDMA (SI_SUB_KMEM = 0x1800000), so a late ext_free in that window must NOT
- * touch the already-destroyed mutex -- it free()s directly, exactly as the
- * pre-recycle code did (which took no such lock).  The second check, under the
- * lock, closes the post-drain re-stock leak (a put that passed the unlocked check
- * just as drain set the flag still must not cache).  Once M_NFSRDMA itself is
- * gone the residual exposure (free() / the stored ext_free function pointer) is
- * inherent to any KLD ext_free and is unchanged from the pre-recycle code.
+ * The draining flag is checked twice.  The unlocked check comes first because
+ * MOD_UNLOAD destroys svc_rdma_sink_lock once svc_rdma_sink_drain() has run,
+ * and a sink mbuf owned by nfsd can outlive the connection and be freed after
+ * that point; it must free directly rather than touch the destroyed mutex.
+ * The check under the lock stops a put that raced drain from re-stocking a
+ * list nothing will drain again.
  */
 void
 svc_rdma_sink_put(void *buf)
@@ -87,7 +76,7 @@ svc_rdma_sink_put(void *buf)
 	if (buf == NULL)
 		return;
 	if (atomic_load_acq_int(&svc_rdma_sink_draining)) {
-		free(buf, M_NFSRDMA);	/* unload: never touch the (torn-down) lock */
+		free(buf, M_NFSRDMA);	/* the lock may already be destroyed */
 		return;
 	}
 	mtx_lock(&svc_rdma_sink_lock);
@@ -103,8 +92,10 @@ svc_rdma_sink_put(void *buf)
 		free(buf, M_NFSRDMA);
 }
 
-/* Pop-and-free every buffer currently on the recycle list (drops the lock for
- * each free() so the contig free never nests under svc_rdma_sink_lock). */
+/*
+ * Free every buffer on the recycle list.  The lock is dropped around each
+ * free so a contiguous free never nests under svc_rdma_sink_lock.
+ */
 static void
 svc_rdma_sink_flush(void)
 {
@@ -122,11 +113,9 @@ svc_rdma_sink_flush(void)
 }
 
 /*
- * vm_lowmem handler (#60): under memory pressure, hand the IDLE recycle cache
- * back to the system.  In-flight sinks are not on the list and are untouched;
- * the cache refills on demand (sink_get's contigmalloc fallback) once pressure
- * passes.  This does NOT set svc_rdma_sink_draining -- it is a transient trim,
- * the analogue of UMA's per-zone lowmem drain, not the permanent unload drain.
+ * vm_lowmem handler: hand the idle cache back under memory pressure.
+ * In-flight sinks are not on the list.  This is a transient trim and does not
+ * set svc_rdma_sink_draining, so the cache refills once pressure passes.
  */
 void
 svc_rdma_sink_reclaim(void *arg __unused, int how __unused)
@@ -135,10 +124,8 @@ svc_rdma_sink_reclaim(void *arg __unused, int how __unused)
 }
 
 /*
- * Free every recycled sink buffer; called from svc_rdma_uninit at unload.  Set
- * the draining flag FIRST (under the lock) so any concurrent or later put stops
- * caching and free()s instead -- the list then cannot be re-populated and any
- * mbuf that outlives this drain returns its buffer to the system, not the list.
+ * Drain the cache at unload.  The flag is set first, so a concurrent or later
+ * put frees instead of caching and the list cannot be repopulated.
  */
 void
 svc_rdma_sink_drain(void)

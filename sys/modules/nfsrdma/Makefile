@@ -12,4 +12,4 @@ CFLAGS+= ${LINUXKPI_INCLUDES}
 
 .include <bsd.kmod.mk>
 
-CFLAGS+= -Wno-cast-qual -Wno-pointer-arith
+CWARNFLAGS+= -Wno-cast-qual -Wno-pointer-arith

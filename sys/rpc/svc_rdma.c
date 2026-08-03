@@ -177,7 +177,8 @@ static int	svc_rdma_krpc_listen_port;	/* last started port; 0 == down */
 
 /*
  * The nfsd-pool listen hook, exported as a built-in kernel symbol and called
- * from nfsd (sys/fs/nfsserver/nfs_nfsdkrpc.c, guarded by options OFED).  The
+ * unconditionally from nfsd (sys/fs/nfsserver/nfs_nfsdkrpc.c); it returns ENXIO
+ * until the nfsrdma module registers a verbs provider.  The
  * prototype is declared in <rpc/svc.h>, included here and by nfsd via
  * <rpc/rpc.h>; that satisfies -Wmissing-prototypes for the non-static
  * definition below without a local extern in this file.
@@ -200,7 +201,7 @@ static int	svc_rdma_krpc_listen_port;	/* last started port; 0 == down */
  * the table pointer go away, so when the nfsrdma module is unloaded no
  * listen-hook thread is still executing inside the ops it is about to revoke.
  *
- * svc_rdma_verbs_stopping (BLOCKER B2) gates NEW in-flight arms during unregister.
+ * svc_rdma_verbs_stopping gates NEW in-flight arms during unregister.
  * Unregister must run the outgoing table's svo_listen_stop() -- which sweeps live
  * connections and drives sro_disconnect upcalls THROUGH this very table (the ctx
  * wrappers below dereference svc_rdma_verbs) -- with the table STILL VALID, and
@@ -783,7 +784,7 @@ svc_rdma_do_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 	bool have_pend;
 
 	/*
-	 * Pre-allocate this pool thread's linuxkpi `current` shadow OFF-LOCK (#59)
+	 * Pre-allocate this pool thread's linuxkpi `current` shadow OFF-LOCK
 	 * before any of the post sites below run ib_post_send under xr_lock: the
 	 * first mlx5_ib_post_send on a fresh krpc thread would otherwise do that
 	 * M_WAITOK alloc while holding the leaf mutex (WITNESS warns).  Optional op,
@@ -1231,8 +1232,10 @@ svc_rdma_do_bck_send(SVCXPRT *xprt, struct mbuf *mreq,
 	u_int rlen, total;
 	int rc;
 
-	/* Pre-warm the linuxkpi `current` shadow off-lock before the post (#59);
-	 * vops is the caller-held verbs snapshot (see svc_rdma_bck_send). */
+	/*
+	 * Pre-warm the linuxkpi `current` shadow off-lock before the post;
+	 * vops is the caller-held verbs snapshot (see svc_rdma_bck_send).
+	 */
 	if (vops != NULL && vops->svo_thread_setup != NULL)
 		vops->svo_thread_setup();
 
@@ -1708,7 +1711,7 @@ static const struct svc_rdma_ops svc_rdma_consumer_ops = {
  * for the whole window these run: newconn/recv are delivered only by a running
  * listener (which holds the table live), and sro_disconnect is driven either by
  * a live listener or by unregister's svo_listen_stop() -- which now runs with the
- * table STILL VALID and only clears it afterward (BLOCKER B2).  So the KASSERTs
+ * table STILL VALID and only clears it afterward.  So the KASSERTs
  * are a defensive net, never the expected path.
  */
 static void
@@ -1733,7 +1736,7 @@ svc_rdma_conn_get_ctx_wrap(struct svc_rdma_conn *conn)
  * ===========================================================================
  * Cross-module verbs ops registration (called from the nfsrdma module at load/unload).
  * Owner-keyed, with the modular-build UAF guard; the unregister path now runs
- * svo_listen_stop() with the table still valid (BLOCKER B2, see below).
+ * svo_listen_stop() with the table still valid (see below).
  */
 int
 svc_rdma_register_verbs(const struct svc_rdma_verbs_ops *ops)
@@ -1781,7 +1784,7 @@ svc_rdma_unregister_verbs(const struct svc_rdma_verbs_ops *ops)
 	}
 
 	/*
-	 * BLOCKER B2: run svo_listen_stop() with the table STILL VALID.
+	 * Run svo_listen_stop() with the table STILL VALID.
 	 *
 	 * svo_listen_stop() (svc_verbs.c svc_rdma_listen_stop) sweeps every live
 	 * connection and delivers sro_disconnect for each; our sro_disconnect ->
@@ -1862,7 +1865,7 @@ svc_rdma_nfsd_listen(SVCPOOL *pool, int port)
 	 * Snapshot the verbs table and arm the in-flight refcount under the
 	 * lock (the modular-build UAF guard, identical to the bring-up sysctl), then
 	 * issue the blocking verbs call with the lock dropped.  Refuse to arm
-	 * while unregister is stopping the table (B2): treat an in-progress
+	 * while unregister is stopping the table: treat an in-progress
 	 * unregister as "nfsrdma going away" and return ENXIO.
 	 */
 	mtx_lock(&svc_rdma_verbs_lock);
