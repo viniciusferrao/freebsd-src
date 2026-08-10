@@ -363,6 +363,18 @@ typedef struct __rpc_svcpool {
 } SVCPOOL;
 
 /*
+ * The nfsd side of the RDMA listen contract.  nfsd defines these; the RDMA
+ * transport module drives them.  svc_rdma_listen is NULL until nfsrdma is
+ * loaded, nfsrvd_rdma_port is the last port started so nfsd can bring the
+ * listener back up if it restarts, and newnfs_numnfsd is nfsd's thread count,
+ * which the module checks before it will let itself be unloaded.
+ */
+typedef int	svc_rdma_listen_ftype(SVCPOOL *pool, int port);
+extern svc_rdma_listen_ftype *svc_rdma_listen;
+extern int	nfsrvd_rdma_port;
+extern int	newnfs_numnfsd;
+
+/*
  * Operations defined on an SVCXPRT handle
  *
  * SVCXPRT		*xprt;

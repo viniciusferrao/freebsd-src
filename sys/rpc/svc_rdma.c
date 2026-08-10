@@ -27,75 +27,21 @@
  */
 
 /*
- * svc_rdma.c -- krpc-side (built into the kernel) NFS-over-RDMA SERVER
- * transport.  It turns each accepted RDMA connection (owned by the verbs layer
- * svc_verbs.c, in the nfsrdma module) into a krpc SVCXPRT so the EXISTING nfsd
- * serves NFS over RDMA.  It provides the SVCXPRT and the nfsd-pool wiring, and
- * is the RDMA analogue of sys/rpc/svc_vc.c (the TCP server transport), which it
- * mirrors closely.
+ * krpc side of the NFS-over-RDMA server transport, implementing RPC-over-RDMA
+ * version 1 (RFC 8166).  It turns each connection the verbs layer accepts into
+ * an SVCXPRT, and is the RDMA analogue of svc_vc.c.  The verbs layer drives the
+ * Read and Write engines; this file marshals the transport header, captures
+ * the chunks the client offered, and hands over-inline replies and
+ * DDP-eligible READ data to the engine.
  *
- * It implements RPC-over-RDMA version 1 (RFC 8166): inline RDMA_MSG plus the
- * read-list, write-list, and reply-chunk data path.  The verbs layer
- * (svc_verbs.c) drives the RDMA Read/Write engine; this file marshals the
- * RPC-over-RDMA transport header, captures the client's offered chunks, and
- * hands over-inline replies and DDP-eligible READ data to the engine for
- * placement.  An over-inline reply with no usable chunk is answered with a
- * per-request RDMA_ERROR/ERR_CHUNK (the connection stays up); the inline send
- * buffer is never overflowed.
- *
- * Module layering (docs/16-svcxprt-rdma-integration.md "Module layering").  The
- * verbs entry points (svc_rdma_listen_start_ops / svc_rdma_conn_send /
- * svc_rdma_conn_set_ctx / svc_rdma_conn_get_ctx, plus the private
- * svc_rdma_listen_stop) are DEFINED in the nfsrdma module.  This file is built
- * INTO the kernel (rpc/svc_rdma.c is "optional krpc | nfslockd | nfscl | nfsd",
- * like svc_vc.c, so it is part of the kernel image whenever nfsd is).  A kernel
- * built-in cannot hard-link a loadable module's symbols,
- * so we never call the verbs entry points directly: this file EXPORTS the
- * built-in symbols svc_rdma_register_verbs()/svc_rdma_unregister_verbs(), nfsrdma
- * registers a function-pointer table at module load, and we reach the verbs only
- * through that table (svc_rdma_verbs).  With nothing registered (nfsrdma not
- * loaded) the listen hook returns ENXIO instead of dereferencing a NULL table.
- *
- * Lifecycle, mirroring svc_vc:
- *   sro_newconn  -> svc_xprt_alloc + xprt_register into the nfsd pool, attach
- *                   per-conn state, svc_rdma_conn_set_ctx(conn, xprt).  Sleepable
- *                   CM context (M_WAITOK ok), exactly where svc_vc_create_conn
- *                   runs.  This is the start of the xprt lifetime.
- *   sro_recv     -> copy the inline RPC bytes into an mbuf (NON-sleeping:
- *                   m_getm2(M_NOWAIT)+m_copyback), enqueue on the xprt's recv
- *                   queue under its leaf mtx, xprt_active(xprt) to wake a pool
- *                   thread.  This is the RDMA analogue of svc_vc_soupcall:
- *                   "recv completion" plays the role of the socket upcall.
- *   xp_recv      -> a pool thread dequeues one queued mbuf, xdr_callmsg-decodes
- *                   the ONC RPC call header into *msg, hands the remaining body
- *                   as an mbuf, returns the peer sockaddr.  Mirror svc_vc_recv's
- *                   tail (the xdrmbuf_create/xdr_callmsg/xdrmbuf_getall block).
- *   xp_reply     -> XDR-encode the ONC RPC reply header + chain the body, prepend
- *                   the RFC 8166 RPC-over-RDMA v1 reply transport header
- *                   (RDMA_MSG, empty chunk lists), linearize, svc_rdma_conn_send.
- *   sro_disconnect -> xprt_unregister + SVC_RELEASE the pool's reference so
- *                   xp_destroy runs.  Sleepable teardown context, drained after
- *                   every sro_recv has returned (see the header contract).
- *   xp_destroy   -> free the recv queue + the per-conn state.  (The verbs QP/CQ
- *                   teardown is separate, driven by the verbs layer after
- *                   sro_disconnect returns.)
- *
- * Untrusted peer (RFC 8166 5).  The RPC bytes are peer data.  The recv path
- * copies a length the VERBS layer already BOUNDED: for a pure-inline call that is
- * the recv buffer size (<= SVC_RDMA_INLINE); for an RDMA-Read-assembled body
- * (an NFS WRITE) it is the inline head plus the read data, which the
- * verbs layer caps at SVC_RDMA_INLINE + 1 MiB (its SVC_RDMA_MAX_READ
- * whole-request cap), still a fixed verbs-imposed bound, NEVER a raw peer length
- * into an allocation.  m_getm2() sizes the mbuf chain dynamically to that bounded
- * length, so the larger assembled body is handled the same way as an inline one.
- * The call header is decoded with the standard xdr_callmsg(), which is bounds-safe
- * on a short/malformed body (it returns FALSE, we drop).  The reply send buffer is
- * a fixed-size local buffer; an over-inline reply is dropped, never overflowed.
+ * This is built into the kernel while the verbs live in nfsrdma, and a
+ * built-in cannot link against a module, so the module registers a table of
+ * entry points at load.  With nothing registered the listen hook returns ENXIO.
  */
 
 #include <sys/param.h>
 #include <sys/systm.h>
-#include <sys/endian.h>		/* be32enc: alignment-safe XDR word store */
+#include <sys/endian.h>
 #include <sys/kernel.h>
 #include <sys/lock.h>
 #include <sys/malloc.h>
@@ -105,63 +51,105 @@
 #include <sys/socket.h>
 #include <sys/sx.h>
 #include <sys/sysctl.h>
-#include <sys/time.h>		/* ppsratecheck: rate-limit peer-driven logs */
+#include <sys/time.h>
 
 #include <netinet/in.h>
 
 #include <rpc/rpc.h>
 #include <rpc/rpc_com.h>
-#include <rpc/krpc.h>		/* clnt_bck_svccall + clnt_bck_rdma_send hook */
+#include <rpc/krpc.h>
 
-#include <rpc/svc_rdma.h>	/* the shared cross-module contract */
+#include <rpc/svc_rdma.h>
+
+SYSCTL_DECL(_vfs_nfsd);
 
 /*
- * SVC_RDMA_INLINE matches the verbs layer's receive-buffer size
- * (svc_verbs.c SVC_RDMA_INLINE == 4096): the largest inline RPC-over-RDMA
- * message that fits a posted recv buffer.  It bounds an inbound inline call and
- * an outbound backchannel call (see svc_rdma_bck_send); the inline-REPLY ceiling
- * is the separate, smaller SVC_RDMA_REPLY_INLINE below.  It is a fixed local
- * constant, never peer-derived.
+ * vfs.nfsd.rdma_listen: the listener port, 0 for none.  The sysctl exists only
+ * while the module is loaded, but nfsd keeps the port, so it can bring the
+ * listener back on restart.
+ */
+VNET_DECLARE(SVCPOOL *, nfsrvd_pool);
+
+static int
+sysctl_nfsd_rdma_listen(SYSCTL_HANDLER_ARGS)
+{
+	int error, port;
+
+	port = nfsrvd_rdma_port;
+	error = sysctl_handle_int(oidp, &port, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (port < 0 || port > 65535)
+		return (EINVAL);
+
+	/*
+	 * A configuration knob, not a live control: the port is read when nfsd
+	 * starts, so setting it under a running server would not take effect
+	 * until the next one.  Refuse rather than appear to have worked.
+	 */
+	if (port != 0 && newnfs_numnfsd > 0)
+		return (ENXIO);
+
+	nfsrvd_rdma_port = port;
+	return (0);
+}
+SYSCTL_PROC(_vfs_nfsd, OID_AUTO, rdma_listen,
+    CTLTYPE_INT | CTLFLAG_MPSAFE | CTLFLAG_RW, NULL, 0,
+    sysctl_nfsd_rdma_listen, "I",
+    "RDMA port for the NFS server, read when nfsd starts; 0 disables RDMA. "
+    "ENXIO if nfsd is already running");
+
+/*
+ * Publish or withdraw the listen hook nfsd calls, from the module event
+ * handler, so nfsd can reach the listener exactly while the module is loaded.
+ */
+void
+svc_rdma_publish_listen(bool publish)
+{
+
+	svc_rdma_listen = publish ? svc_rdma_nfsd_listen : NULL;
+}
+
+/*
+ * True while nfsd has threads running.  The verbs module refuses to unload in
+ * that window: the SVCXPRT ops those threads drive live in its text.
+ */
+bool
+svc_rdma_nfsd_running(void)
+{
+
+	return (newnfs_numnfsd != 0);
+}
+
+/*
+ * The verbs layer's receive-buffer size, bounding an inbound call and an
+ * outbound backchannel call.  Replies use the smaller ceiling below.
  */
 #define	SVC_RDMA_INLINE		4096
-/* Conservative RPC-over-RDMA v1 reply inline limit: the client posts recv
- * buffers of ~1KB for replies (no in-protocol inline negotiation in v1), so an
- * inline reply larger than this overflows the client recv buffer and is NAKd
- * REM_INV_REQ.  Larger replies must use the client-offered reply chunk. */
+/*
+ * Version 1 has no inline negotiation and clients post roughly 1 KB recv
+ * buffers for replies, so a larger inline reply overflows the client buffer
+ * and is NAKed.  Anything bigger goes in the offered reply chunk.
+ */
 #define	SVC_RDMA_REPLY_INLINE	1024
 
 /*
- * RFC 8166 (RPC-over-RDMA version 1) transport-header constants, identical to
- * the verbs layer's (svc_verbs.c).  The header that prefixes an inline RPC
- * message is a sequence of big-endian XDR words:
- *   w0 rdma_xid, w1 rdma_vers(==1), w2 rdma_credit, w3 rdma_proc,
- *   w4 read_list, w5 write_list, w6 reply_chunk (each 0 == empty here).
- * For an inline RDMA_MSG with all chunk lists empty the ONC RPC message starts
- * at byte offset RPCRDMA_HDR_MIN (28).
+ * The transport header, big-endian: xid, vers, credit, proc, then the read
+ * list, write list and reply chunk, zero when empty.
  */
 #define	RPCRDMA_VERSION		1
-#define	RPCRDMA_HDR_MIN		28	/* 7 words: xid,vers,credit,proc + 3 empty lists */
+#define	RPCRDMA_HDR_MIN		28
 #define	RDMA_MSG		0	/* rdma_proc: inline RPC message follows */
 /*
- * RFC 8166 4.4 RDMA_ERROR rdma_err code we ask the verbs layer to emit (through
- * the optional svo_conn_error op) when a reply cannot be placed into the client's
- * chunks.  We only ever request ERR_CHUNK here: the server has a known
- * xid but cannot place the reply (an over-inline reply with no usable reply
- * chunk; the write-list READ out-of-range fall-through).  ERR_VERS is diagnosed
- * and replied entirely inside the verbs layer (it owns the version check).  The
- * verbs layer builds the full RDMA_ERROR header; this file only names the error
- * kind.  ERR_CHUNK is a PER-REQUEST error -- the connection stays up and the
- * client may retry -- so the reply path returns FALSE (drop) after requesting it
- * and does NOT close.
+ * Requested when a reply cannot be placed in the client's chunks.  ERR_VERS
+ * belongs to the verbs layer, which owns the version check.
  */
 #define	RDMA_ERR_CHUNK		2	/* rdma_err: chunk lists unusable for reply */
 
 /*
- * Fallback flow-control credit for a reply's w2 rdma_credit (SF1).  The primary
- * value is the verbs layer's REAL granted depth, read per-reply through
- * svo_conn_credits() (== conn->sc_nrecv, clamped to the device QP recv cap); see
- * svc_rdma_xprt_reply().  This constant is used only as a conservative non-zero
- * floor if the accessor ever returns 0 (it should not happen in practice).
+ * Fallback credit for a reply's rdma_credit word.  The real value comes from
+ * the verbs layer per reply; this is only a non-zero floor for the case where
+ * that accessor returns 0.
  */
 #define	SVC_RDMA_CREDIT_GRANT	8
 
@@ -175,42 +163,16 @@ static void	svc_rdma_conn_set_ctx_wrap(struct svc_rdma_conn *, void *);
 static void	*svc_rdma_conn_get_ctx_wrap(struct svc_rdma_conn *);
 static int	svc_rdma_krpc_listen_port;	/* last started port; 0 == down */
 
-/*
- * The nfsd-pool listen hook, exported as a built-in kernel symbol and called
- * unconditionally from nfsd (sys/fs/nfsserver/nfs_nfsdkrpc.c); it returns ENXIO
- * until the nfsrdma module registers a verbs provider.  The
- * prototype is declared in <rpc/svc.h>, included here and by nfsd via
- * <rpc/rpc.h>; that satisfies -Wmissing-prototypes for the non-static
- * definition below without a local extern in this file.
- */
+/* Returns ENXIO until the module registers a verbs provider. */
 
 /*
- * ===========================================================================
- * Cross-module verbs ops registration.
- *
- * The registered nfsrdma verbs ops table, or NULL when nfsrdma is not loaded.
- * svc_rdma_verbs_lock serializes register/unregister against the listen-hook
- * reader so the hook never samples a half-published table and a verbs call is
- * never issued against a table unregister is concurrently clearing.  It is a
- * leaf mutex held only briefly; the blocking verbs calls are made with it
- * DROPPED, guarded by svc_rdma_verbs_inflight.
- *
- * svc_rdma_verbs_inflight counts threads that have snapshotted a non-NULL
- * svc_rdma_verbs and are about to call (or are calling) through it with the lock
- * DROPPED.  svc_rdma_unregister_verbs() waits for it to reach 0 before it lets
- * the table pointer go away, so when the nfsrdma module is unloaded no
- * listen-hook thread is still executing inside the ops it is about to revoke.
- *
- * svc_rdma_verbs_stopping gates NEW in-flight arms during unregister.
- * Unregister must run the outgoing table's svo_listen_stop() -- which sweeps live
- * connections and drives sro_disconnect upcalls THROUGH this very table (the ctx
- * wrappers below dereference svc_rdma_verbs) -- with the table STILL VALID, and
- * only THEN clear svc_rdma_verbs.  So it cannot NULL the pointer first.  Instead
- * it sets svc_rdma_verbs_stopping under the lock, drains the existing in-flight
- * callers, runs svo_listen_stop() with the table valid, and clears the pointer
- * afterward.  Every arm site (svc_rdma_nfsd_listen) arms only if
- * svc_rdma_verbs != NULL AND !svc_rdma_verbs_stopping, so no new caller enters
- * the ops while unregister is tearing them down.
+ * svc_rdma_verbs is the registered nfsrdma table, NULL when the module is not
+ * loaded, under the leaf mutex svc_rdma_verbs_lock.  Blocking verbs calls run
+ * with it dropped, so svc_rdma_verbs_inflight counts the threads inside them
+ * and unregister waits for zero.  Unregister cannot just clear the pointer: it
+ * must run the outgoing table's svo_listen_stop(), which drives sro_disconnect
+ * back through that same table, so it marks stopping, drains, stops the
+ * listener, and clears afterwards.
  */
 static struct mtx		 svc_rdma_verbs_lock;
 static const struct svc_rdma_verbs_ops *svc_rdma_verbs;
@@ -220,14 +182,10 @@ static bool			 svc_rdma_verbs_stopping;
 MTX_SYSINIT(svc_rdma_verbs_lock, &svc_rdma_verbs_lock, "svcrdma_verbs", MTX_DEF);
 
 /*
- * Hold/release the verbs table across a call that drops svc_rdma_verbs_lock and
- * calls through the ops table (the reply and backchannel paths).  Hold snapshots
- * the table and arms svc_rdma_verbs_inflight; svc_rdma_unregister_verbs sets
- * svc_rdma_verbs_stopping, drains inflight to zero, and only THEN clears the
- * table and lets the nfsrdma module's text be freed -- so a held caller cannot have the
- * module pulled out from under it (the modular-build UAF guard).  Returns NULL
- * when nothing is registered (or unregister is stopping); the caller must then
- * not dereference the table, and must NOT call unhold.
+ * Hold the verbs table across a call that drops svc_rdma_verbs_lock, so
+ * unregister cannot free the module's text under a caller inside the ops.
+ * NULL when nothing is registered or unregister is stopping; the caller must
+ * then neither dereference the table nor unhold.
  */
 static const struct svc_rdma_verbs_ops *
 svc_rdma_verbs_hold(void)
@@ -259,33 +217,19 @@ static struct timeval		 svc_rdma_log_last;
 static int			 svc_rdma_log_pps;
 
 /*
- * Monotonic generator for per-connection xp_sockref (SF2).  Incremented
- * atomically in sro_newconn; +1 at the use site guarantees the first sockref is
- * non-zero (0 is the "no socket" sentinel the DRC must not alias).
+ * Source of per-connection xp_sockref values.  The use site adds one, so the
+ * first is non-zero: 0 is the no-socket sentinel the DRC must not alias.
  */
 static volatile uint64_t	 svc_rdma_sockref_gen;
 
 /*
- * ===========================================================================
- * Listener and per-connection state.
- *
- * svc_rdma_listener is the consumer ctx handed to svo_listen_start() and back to
- * every upcall: it carries the SVCPOOL the accepted connections register into
- * (the nfsd pool).  It is allocated by the listen hook and lives
- * until svc_rdma_listen_stop() returns; the upcalls only READ sl_pool, which is
- * set once before the listener starts and never mutated.
- *
- * svc_rdma_xprt is the per-connection SVCXPRT private state, hung off
- * xprt->xp_p1.  It owns:
- *   - xr_conn: the opaque verbs connection handle (valid newconn..disconnect).
- *     Guarded by xr_lock; cleared to NULL by sro_disconnect so a pool thread
- *     racing in xp_reply after disconnect cannot post on a freed conn.
- *   - xr_mq:   the recv queue, an mbuf STAILQ of complete inline ONC RPC
- *     messages, each enqueued by sro_recv and dequeued by xp_recv.
- *   - xr_lock: a leaf mutex guarding xr_mq and xr_conn.  It is NEVER held across
- *     a krpc call that can take a pool/group lock (xprt_active is called with it
- *     dropped) and is taken only for brief list/pointer manipulation, so it
- *     cannot form a lock-order cycle with the krpc locks.
+ * svc_rdma_listener is the consumer ctx handed to svo_listen_start() and back
+ * to every upcall, carrying the SVCPOOL accepted connections register into.
+ * svc_rdma_xprt is the per-connection state hung off xp_p1; its xr_lock is a
+ * leaf mutex over xr_mq and xr_conn, never held across a krpc call that can
+ * take a pool or group lock, xprt_active() included.  sro_disconnect clears
+ * xr_conn under it, so a pool thread reaching xp_reply afterwards cannot post
+ * on a freed connection.
  */
 struct svc_rdma_listener {
 	SVCPOOL		*sl_pool;	/* pool accepted conns register into */
@@ -295,26 +239,16 @@ struct svc_rdma_qent {
 	STAILQ_ENTRY(svc_rdma_qent) sq_link;
 	struct mbuf	*sq_m;		/* one complete inline ONC RPC message */
 	/*
-	 * Reply-chunk carry.  If the request that produced sq_m offered
-	 * an RFC 8166 reply chunk (the client pre-registered memory for an over-inline
-	 * reply -- e.g. the NFSv4 mount-handshake compound), the parsed-and-validated
-	 * reply chunk is captured here by sro_recv (a pure value type, no pointers, so
-	 * copying it is safe past the recv buffer's repost).  xp_recv moves it into the
-	 * per-xprt pending table keyed by xid so xp_reply can RDMA-Write the reply into
-	 * it.  sq_has_reply distinguishes "no reply chunk offered" from a zeroed one.
+	 * The offered reply chunk, a value type with no pointers, so it
+	 * outlives the recv buffer's repost.  sq_has_reply distinguishes none
+	 * offered from a zeroed one.
 	 */
 	bool		sq_has_reply;
 	uint32_t	sq_xid;
 	struct svc_rdma_write_chunk sq_reply;
 	/*
-	 * Write-list carry (write-list READ engine).  If the request offered an
-	 * RFC 8166 WRITE list (a Linux NFS/RDMA client offers one for every READ,
-	 * to receive the read data by DDP -- no reply chunk), the FIRST write chunk
-	 * is captured here (RFC 8267 maps the single DDP-eligible READ result to one
-	 * write chunk).  Like sq_reply it is a pure value type, safe to copy past
-	 * the recv buffer's repost.  sq_has_writes distinguishes "no write list"
-	 * from a zeroed chunk.  xp_recv moves it (and sq_xid) into the pending table
-	 * so xp_reply can RDMA-Write the over-inline READ data into it.
+	 * The first offered write chunk, for a READ taking its data by DDP;
+	 * RFC 8267 maps the single DDP-eligible result to one chunk.
 	 */
 	bool		sq_has_writes;
 	struct svc_rdma_write_chunk sq_writes;
@@ -323,15 +257,10 @@ struct svc_rdma_qent {
 STAILQ_HEAD(svc_rdma_qhead, svc_rdma_qent);
 
 /*
- * Pending reply-chunk table.  A reply chunk captured by sro_recv
- * must survive from xp_recv (where the request is dispatched) to xp_reply (where
- * the reply is marshalled), linked only by the ONC RPC xid.  We keep a small
- * fixed-size per-xprt table keyed by xid: xp_recv inserts the captured chunk,
- * xp_reply looks it up by msg->rm_xid and consumes it.  The table is bounded by
- * SVC_RDMA_REPLY_PEND (>= the verbs recv depth, so it cannot be outrun by the
- * number of concurrently-dispatchable requests); a full table or a missing entry
- * means "no reply chunk for this reply" -> the inline path (or drop) handles it,
- * never an over-write.  Guarded by xr_lock.
+ * A captured chunk must survive from xp_recv to xp_reply with only the xid
+ * linking them, so this fixed table under xr_lock holds it.  Sized at or above
+ * the verbs recv depth, so requests cannot outrun it; a missing entry just
+ * means no chunk for that reply.
  */
 #define	SVC_RDMA_REPLY_PEND	64
 struct svc_rdma_reply_pend {
@@ -339,16 +268,10 @@ struct svc_rdma_reply_pend {
 	uint32_t	rp_xid;
 	struct svc_rdma_write_chunk rp_reply;
 	/*
-	 * Write-list READ engine carry.  rp_has_writes + rp_writes hold the
-	 * client's (single) write-list chunk for an over-inline READ reply.
-	 * rp_has_ddp + rp_ddp_off/rp_ddp_len hold the DDP boundary the nfsd READ
-	 * path supplied via SVC_CONTROL(SVCSET_READDDP) (offset of the read data
-	 * within the reply BODY, and its unpadded length).  Both are filled at
-	 * different times -- the write list in xp_recv from the qent, the DDP
-	 * boundary later from xp_control on the SAME xid's request thread -- and
-	 * both are consumed together by xp_reply.  rp_has_reply replaces the old
-	 * implicit "rp_valid means a reply chunk is present" meaning so an entry can
-	 * exist for a write-list-only READ.  All guarded by xr_lock.
+	 * The chunk is filled in xp_recv and the read-data boundary later from
+	 * xp_control on the same thread, then both are consumed by xp_reply.
+	 * rp_has_reply is separate so an entry can exist for a write-list-only
+	 * READ.  All under xr_lock.
 	 */
 	bool		rp_has_reply;
 	bool		rp_has_writes;
@@ -369,7 +292,6 @@ struct svc_rdma_xprt {
 };
 
 /*
- * ===========================================================================
  * xp_ops: the SVCXPRT operations a pool thread drives.
  */
 static bool_t svc_rdma_xprt_recv(SVCXPRT *, struct rpc_msg *,
@@ -408,13 +330,9 @@ svc_rdma_drain_queue(struct svc_rdma_xprt *xr)
 }
 
 /*
- * Insert a captured reply chunk into the per-xprt pending table keyed by xid.
- * Called from xp_recv when a dispatched request offered a reply
- * chunk.  Picks the first free slot, or REUSES a slot already holding the same xid
- * (a client RC-retransmit of the same request re-offers its reply chunk -- the
- * latest wins).  If the table is full we silently drop the chunk: xp_reply then
- * finds no pending entry and falls back to the inline-or-drop path, which is
- * correct (never an over-write).  Guarded by xr_lock.
+ * Insert a captured chunk keyed by xid, reusing a slot already holding that
+ * xid so a retransmit's re-offered chunk wins.  A full table drops it and
+ * xp_reply falls back to inline-or-drop.  Under xr_lock.
  */
 static void
 svc_rdma_reply_pend_insert(struct svc_rdma_xprt *xr, uint32_t xid,
@@ -446,9 +364,9 @@ svc_rdma_reply_pend_insert(struct svc_rdma_xprt *xr, uint32_t xid,
 			p->rp_writes = *writes;
 		p->rp_nwrites = has_writes ? nwrites : 0;
 		/*
-		 * The DDP boundary is filled LATER by svc_rdma_readddp_set() (from
-		 * xp_control on the request thread); start it cleared so a request
-		 * with no READ-DDP op never carries a stale boundary into xp_reply.
+		 * The boundary is filled later by svc_rdma_readddp_set(), so
+		 * start it cleared: a request with no READ-DDP op must not
+		 * carry a stale one into xp_reply.
 		 */
 		p->rp_has_ddp = false;
 		p->rp_ddp_off = 0;
@@ -462,15 +380,9 @@ svc_rdma_reply_pend_insert(struct svc_rdma_xprt *xr, uint32_t xid,
 }
 
 /*
- * Record the DDP {off,len} boundary the nfsd READ path supplied via
- * SVC_CONTROL(SVCSET_READDDP) into this xid's pending entry (write-list READ
- * engine).  Runs on the request's pool thread between xp_recv (which inserted the
- * entry) and xp_reply (which consumes it).  Sets the boundary on the FIRST READ
- * for the xid only -- a COMPOUND with several DDP-eligible READs reduces just one
- * result (RFC 8267), so later READs are ignored and fall back to inline.  If no
- * pending entry exists (no write list was offered) this is a no-op: with no write
- * chunk there is nowhere to DDP, so the boundary is irrelevant.  Guarded by
- * xr_lock.
+ * Record the DDP boundary from SVCSET_READDDP into this xid's entry, between
+ * xp_recv and xp_reply on the request's pool thread.  Only the first READ for
+ * an xid takes it, RFC 8267 reducing one result.  Under xr_lock.
  */
 static void
 svc_rdma_readddp_set(struct svc_rdma_xprt *xr, uint32_t xid, uint32_t off,
@@ -492,12 +404,7 @@ svc_rdma_readddp_set(struct svc_rdma_xprt *xr, uint32_t xid, uint32_t off,
 	mtx_unlock(&xr->xr_lock);
 }
 
-/*
- * Take (look up and remove) the pending reply chunk for xid, if any.
- * Called from xp_reply.  Returns true and fills *reply if a
- * pending entry existed (and clears the slot); false if none.  Guarded by
- * xr_lock.
- */
+/* Look up and remove the pending chunk for xid.  Under xr_lock. */
 static bool
 svc_rdma_reply_pend_take(struct svc_rdma_xprt *xr, uint32_t xid,
     struct svc_rdma_reply_pend *out)
@@ -519,16 +426,9 @@ svc_rdma_reply_pend_take(struct svc_rdma_xprt *xr, uint32_t xid,
 }
 
 /*
- * xp_recv: a pool thread (woken by xprt_active) pulls one queued inline message
- * off the recv queue and decodes its ONC RPC call header.  Mirrors the tail of
- * svc_vc_recv: xdrmbuf_create + xdr_callmsg + xdrmbuf_getall, with the body
- * handed back as an mbuf chain and the peer address taken from xp_rtaddr.
- *
- * Returns TRUE with msg, mp and addrp filled when a request was produced, FALSE
- * when the queue is empty or the message was malformed (dropped).  When we drain
- * the last message we call xprt_inactive_self() so the pool stops scheduling
- * this xprt until the next recv completion re-activates it -- exactly as
- * svc_vc_recv does when the socket has no more data.
+ * xp_recv: take one queued message and decode its call header, mirroring the
+ * tail of svc_vc_recv.  Draining the last one calls xprt_inactive_self(), so
+ * the pool stops scheduling this transport until a completion reactivates it.
  */
 static bool_t
 svc_rdma_xprt_recv(SVCXPRT *xprt, struct rpc_msg *msg,
@@ -547,13 +447,9 @@ svc_rdma_xprt_recv(SVCXPRT *xprt, struct rpc_msg *msg,
 			STAILQ_REMOVE_HEAD(&xr->xr_mq, sq_link);
 		empty = STAILQ_EMPTY(&xr->xr_mq);
 		/*
-		 * Mark inactive while still holding xr_lock so we cannot race a
-		 * concurrent sro_recv enqueue+xprt_active: if a message arrives
-		 * after we sampled "empty", that enqueue path takes xr_lock to
-		 * insert and then calls xprt_active() -- serialised behind us --
-		 * so the transport is re-activated and the new message is not
-		 * stranded.  (svc_vc_recv inactivates under the socket recvbuf
-		 * lock for the same reason.)
+		 * Mark inactive while still holding xr_lock: a message arriving
+		 * after we sampled empty takes the same lock to enqueue and
+		 * calls xprt_active() behind us, so it is not stranded.
 		 */
 		if (q == NULL || empty)
 			xprt_inactive_self(xprt);
@@ -565,11 +461,9 @@ svc_rdma_xprt_recv(SVCXPRT *xprt, struct rpc_msg *msg,
 		m = q->sq_m;
 
 		/*
-		 * Carry the reply chunk forward.  If this request
-		 * offered a reply chunk, record it in the per-xprt pending table
-		 * keyed by xid so xp_reply can RDMA-Write the over-inline reply into
-		 * it.  Done before freeing the qent.  A full table just means this
-		 * reply falls back to the inline-or-drop path -- never an over-write.
+		 * Record any offered chunk in the pending table before the
+		 * queue entry is freed, so xp_reply can find it by xid.  A
+		 * full table just means this reply goes inline or is dropped.
 		 */
 		if (q->sq_has_reply || q->sq_has_writes)
 			svc_rdma_reply_pend_insert(xr, q->sq_xid,
@@ -578,10 +472,9 @@ svc_rdma_xprt_recv(SVCXPRT *xprt, struct rpc_msg *msg,
 		free(q, M_SVCRDMA);
 
 		/*
-		 * Decode the ONC RPC call header.  xdr_callmsg is the standard
-		 * bounds-safe decoder; on a short/malformed inline body it
-		 * returns FALSE and we drop this message (the client retransmits
-		 * or the connection is reset).  We never hand-parse peer bytes.
+		 * xdr_callmsg() is the standard decoder and returns FALSE on a
+		 * short or malformed body, which drops the message; peer bytes
+		 * are never hand-parsed here.
 		 */
 		xdrmbuf_create(&xdrs, m, XDR_DECODE);
 		if (!xdr_callmsg(&xdrs, msg)) {
@@ -595,10 +488,9 @@ svc_rdma_xprt_recv(SVCXPRT *xprt, struct rpc_msg *msg,
 		}
 
 		/*
-		 * Peer address: copy from xp_rtaddr (set at newconn).  NFS uses
-		 * svc_getrpccaller(), which falls back to &xp_rtaddr when
-		 * rq_addr is NULL, so returning NULL here is also valid; we
-		 * return NULL like svc_vc_recv does for a connected transport.
+		 * svc_getrpccaller() falls back to xp_rtaddr when rq_addr is
+		 * NULL, so NULL is correct here, as it is in svc_vc_recv for a
+		 * connected transport.
 		 */
 		*addrp = NULL;
 		*mp = xdrmbuf_getall(&xdrs);
@@ -630,18 +522,9 @@ svc_rdma_xprt_stat(SVCXPRT *xprt)
 }
 
 /*
- * xp_ack: report the reply "sent" high-water mark for the nfsd duplicate-request
- * cache (DRC).  nfsd keys the DRC ack list on xp_sockref and, for each cached
- * reply, records the xp_reply *seq; nfsrc_trimcache() confirms a cached reply as
- * delivered once this ack is SEQ_GEQ that recorded seq.  We return xr_seq, the
- * count of replies we have successfully posted (svc_rdma_conn_send returned 0).
- *
- * Inline-RDMA boundary: posting the SEND WR is as far as the krpc layer can
- * observe -- there is no krpc-visible send completion -- so "posted" is treated
- * as "sent".  That is the same delivery confidence as svc_vc gets from sosend()
- * returning success (the bytes are queued, not ACKed by the peer).  A non-NULL
- * xp_ack also makes SVC_ACK(xprt, NULL) return TRUE so nfsd records the reply in
- * the DRC at all (otherwise have_seq is false and the entry is left pending).
+ * xp_ack: the reply high-water mark for the duplicate-request cache.  There is
+ * no krpc-visible send completion, so posted counts as sent, the same
+ * confidence svc_vc takes from a successful sosend().
  */
 static bool_t
 svc_rdma_xprt_ack(SVCXPRT *xprt, uint32_t *ack)
@@ -655,31 +538,10 @@ svc_rdma_xprt_ack(SVCXPRT *xprt, uint32_t *ack)
 }
 
 /*
- * xp_reply: marshal an RPC-over-RDMA v1 reply and post it -- inline when it fits,
- * or RDMA-Written into the client's reply chunk when it does not.
- *
- * The ONC RPC reply (header + body) is built into an mbuf chain exactly as
- * svc_vc_reply does: xdr_replymsg() encodes the reply header, and on the
- * accepted/success path the caller's body mbuf m is appended via xdr_putmbuf().
- *
- * INLINE path (fits SVC_RDMA_REPLY_INLINE): PREPEND the 28-byte RFC 8166 transport
- * header (RDMA_MSG, all chunk lists empty), linearize, and hand to
- * svc_rdma_conn_send() (which copies it into the connection's DMA send buffer and
- * posts the SEND WR).
- *
- * REPLY-CHUNK path: if the marshalled reply exceeds SVC_RDMA_REPLY_INLINE
- * AND the request offered a reply chunk (captured during sro_recv, looked up here
- * by xid), linearize the marshalled ONC RPC reply ALONE (no RFC 8166 header) and
- * hand it to svc_rdma_conn_reply_chunk(), which RDMA-Writes it into the client's
- * reply-chunk memory and SENDs an RDMA_NOMSG header reporting the length.  THIS is
- * what unblocks a usable NFSv4 mount: the mount-handshake compound reply is too big
- * for inline and the client always offers a reply chunk for it.
- *
- * If the reply is over-inline and NO reply chunk was offered (or the reply exceeds
- * the offered chunk's capacity), we answer with a per-request RDMA_ERROR/ERR_CHUNK
- * and return FALSE rather than overflow -- the connection stays up (the client
- * learns this request could not be placed and may retry; the recv side is
- * unaffected).
+ * xp_reply: marshal a reply and post it, inline when it fits or RDMA-Written
+ * into the chunk captured during sro_recv and looked up here by xid.
+ * Over-inline with no usable chunk, or past the offered capacity, is answered
+ * with ERR_CHUNK and a FALSE return; the connection stays up.
  */
 
 /*
@@ -689,15 +551,10 @@ svc_rdma_xprt_ack(SVCXPRT *xprt, uint32_t *ack)
 #define	SVC_RDMA_RD_MAXPGS	((1U << 20) / PAGE_SIZE)
 
 /*
- * Collect the M_EXTPG data pages for the read span [doff, doff+dlen) of the reply
- * mbuf chain (Rick Macklem's enable_mextpg path), so the verbs
- * engine can RDMA-Write them directly instead of from a contigmalloc'd copy.
- * Returns the page count on success, or 0 to mean "not cleanly M_EXTPG -- use the
- * contigmalloc fallback".  Conservative by construction: it requires doff to land
- * exactly on an mbuf boundary, every mbuf in the span to be M_EXTPG with no
- * embedded TLS header/trailer and a page-aligned start (m_epg_1st_off == 0), and
- * the page count to fit pd[0..maxpd); any deviation returns 0.  Read-only walk; no
- * locks, no allocation, no ownership change.
+ * Collect the M_EXTPG pages for the read span so the engine can write them
+ * without a copy.  Requires doff on an mbuf boundary and every mbuf
+ * page-aligned with no header or trailer; anything else returns 0 for the
+ * copy path.
  */
 static int
 svc_rdma_collect_extpg(struct mbuf *m, u_int doff, u_int dlen,
@@ -712,7 +569,7 @@ svc_rdma_collect_extpg(struct mbuf *m, u_int doff, u_int dlen,
 		m = m->m_next;
 	}
 	if (m == NULL || cum != doff)
-		return (0);		/* doff not on an mbuf boundary */
+		return (0);
 
 	npd = 0;
 	need = dlen;
@@ -722,14 +579,14 @@ svc_rdma_collect_extpg(struct mbuf *m, u_int doff, u_int dlen,
 		if (m == NULL || (m->m_flags & M_EXTPG) == 0 ||
 		    m->m_epg_hdrlen != 0 || m->m_epg_trllen != 0 ||
 		    m->m_epg_1st_off != 0)
-			return (0);	/* not a clean page-aligned EXTPG data mbuf */
+			return (0);
 		for (pg = 0; pg < m->m_epg_npgs && need > 0; pg++) {
 			u_int plen = m_epg_pagelen(m, pg, 0);
 
 			/* trim the final (padded) page to dlen */
 			plen = MIN(plen, need);
 			if (npd >= maxpd)
-				return (0);	/* more pages than the engine can take */
+				return (0);
 			pd[npd].pg_pa = m->m_epg_pa[pg];
 			pd[npd].pg_off = 0;
 			pd[npd].pg_len = plen;
@@ -753,10 +610,8 @@ svc_rdma_xprt_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 	bool_t stat;
 
 	/*
-	 * Hold the verbs table across the whole reply: svc_rdma_do_reply calls
-	 * through it (svo_thread_setup, the write-list/reply-chunk engines,
-	 * svo_conn_send) with xr_lock dropped, and on the modular build a
-	 * concurrent kldunload nfsrdma must not free that text mid-reply.
+	 * Hold the verbs table across the whole reply, which calls through it
+	 * with xr_lock dropped, so an unload cannot free that text mid-reply.
 	 */
 	vops = svc_rdma_verbs_hold();
 	stat = svc_rdma_do_reply(xprt, msg, addr, m, seq, vops);
@@ -784,21 +639,16 @@ svc_rdma_do_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 	bool have_pend;
 
 	/*
-	 * Pre-allocate this pool thread's linuxkpi `current` shadow OFF-LOCK
-	 * before any of the post sites below run ib_post_send under xr_lock: the
-	 * first mlx5_ib_post_send on a fresh krpc thread would otherwise do that
-	 * M_WAITOK alloc while holding the leaf mutex (WITNESS warns).  Optional op,
-	 * NULL on an older nfsrdma.  vops is the caller-held verbs snapshot (see
-	 * svc_rdma_xprt_reply): non-NULL means svc_rdma_verbs_inflight is armed, so
-	 * the table (nfsrdma text) stays valid across this whole reply.
+	 * Pre-allocate this thread's linuxkpi current shadow off-lock: the
+	 * first post on a fresh thread would otherwise allocate it under
+	 * xr_lock.  Optional, so NULL on an older module.
 	 */
 	if (vops != NULL && vops->svo_thread_setup != NULL)
 		vops->svo_thread_setup();
 
 	/*
-	 * Build the ONC RPC reply into a fresh pkthdr mbuf, mirroring
-	 * svc_vc_reply (minus the record-mark reservation: the RDMA transport
-	 * header is prepended after marshalling, not in-band).
+	 * Build the reply into a fresh pkthdr mbuf as svc_vc_reply does, with
+	 * no record mark: the transport header is prepended after marshalling.
 	 */
 	mrep = m_gethdr(M_WAITOK, MT_DATA);
 	xdrmbuf_create(&xdrs, mrep, XDR_ENCODE);
@@ -809,12 +659,10 @@ svc_rdma_do_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 			stat = FALSE;
 		} else {
 			/*
-			 * Capture the NFS reply body length BEFORE it is consumed
-			 * into the reply chain (write-list READ engine).  xdr_putmbuf
-			 * (xdrmbuf_putmbuf) tail-links the body verbatim, so the RPC
-			 * reply-header length is (rlen - nfsreply_len) and the DDP
-			 * read-data offset within the marshalled reply is that header
-			 * length + the body-relative offset nfsd recorded.
+			 * Take the body length before the chain consumes it:
+			 * xdr_putmbuf() tail-links it as is, so the header is
+			 * rlen - nfsreply_len and the read data sits at that
+			 * plus the offset nfsd recorded.
 			 */
 			nfsreply_len = m_length(m, NULL);
 			(void)xdr_putmbuf(&xdrs, m);
@@ -836,9 +684,8 @@ svc_rdma_do_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 	XDR_DESTROY(&xdrs);
 
 	/*
-	 * On the non-success (error reply) path xdr_replymsg encodes just the
-	 * reply header and the body mbuf m is not part of the reply; free it so
-	 * it is not leaked (on the success path m was consumed and is NULL).
+	 * On the error path xdr_replymsg() encodes only the header and the body
+	 * is not part of the reply, so free it; on success it is already NULL.
 	 */
 	if (m != NULL) {
 		m_freem(m);
@@ -849,35 +696,25 @@ svc_rdma_do_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 	total = RPCRDMA_HDR_MIN + rlen;
 
 	/*
-	 * Take this xid's pending reply chunk, if the request offered
-	 * one.  We take it unconditionally (so the slot is always reclaimed) and use it
-	 * only on the over-inline path below; if the reply fits inline we simply drop
-	 * the (taken) chunk and reply inline, which RFC 8166 permits.
+	 * Take this xid's pending chunk unconditionally, so the slot is always
+	 * reclaimed, and use it only on the over-inline path below.  Replying
+	 * inline and dropping a taken chunk is permitted.
 	 */
 	have_pend = svc_rdma_reply_pend_take(xr, msg->rm_xid, &pend);
 
 	/*
-	 * INLINE bound.  RPCRDMA_HDR_MIN + reply must fit one inline send buffer.  A
-	 * larger reply (big READDIR/READLINK/READ, or the NFSv4 mount-handshake
-	 * compound) is the RDMA Write engine's job: if the client offered
-	 * a reply chunk, RDMA-Write the marshalled ONC RPC reply into it and SEND an
-	 * RDMA_NOMSG header reporting the length.  With no reply chunk offered we cannot
-	 * deliver an over-inline reply -- answer with a per-request ERR_CHUNK (never
-	 * overflow the send buffer); the verbs layer's reply_chunk also returns
-	 * EMSGSIZE if the reply exceeds the offered chunk, which we treat the same way.
+	 * Header plus reply must fit one send buffer.  A larger reply is
+	 * written into the offered reply chunk with an RDMA_NOMSG header
+	 * reporting the length; with no chunk, or one too small, the answer is
+	 * ERR_CHUNK rather than an overflowed send buffer.
 	 */
 	if (total > SVC_RDMA_REPLY_INLINE) {
 		/*
-		 * Multi-chunk write list (RFC 8166 3.4.2): a COMPOUND that offered more
-		 * than one write chunk (i.e. >1 DDP-eligible READ).  The reduction
-		 * engine maps a SINGLE DDP result to one write chunk (RFC 8267) and
-		 * echoes a one-chunk reply write list, so it cannot place a multi-chunk
-		 * reply.  Rather than send a non-conformant single-chunk reply or drop
-		 * silently, answer with a per-request RDMA_ERROR/ERR_CHUNK keyed by the
-		 * KNOWN xid (RFC 8166 4.4/5): the client learns this request could not
-		 * be placed and may retry (e.g. without DDP), and the connection STAYS
-		 * UP.  Only matters over-inline; an inline reply simply leaves every
-		 * offered write chunk empty, which is always conformant.
+		 * A compound offering more than one write chunk cannot be
+		 * reduced: the engine maps a single DDP result to one chunk
+		 * (RFC 8267) and echoes a one-chunk write list, so ERR_CHUNK by
+		 * xid is conformant where a single-chunk reply would not be.
+		 * Inline replies leave every chunk empty and are unaffected.
 		 */
 		if (have_pend && pend.rp_has_writes && pend.rp_nwrites > 1) {
 			m_freem(mrep);
@@ -897,21 +734,11 @@ svc_rdma_do_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 			return (FALSE);
 		}
 		/*
-		 * Write-list READ engine (RFC 8166 reduction).  An over-inline READ
-		 * whose data is DDP-eligible into the client's write list: the request
-		 * offered a SINGLE write chunk (captured at recv; multi-chunk handled
-		 * above) AND the nfsd READ path stamped the DDP boundary {off,len} via
-		 * SVCSET_READDDP.  RDMA-Write the read data into the write list and
-		 * SEND a reduced RDMA_MSG instead of dropping.  The data sits at
-		 * rpchdr + ddp_off within mrep, where rpchdr = rlen - nfsreply_len.
-		 * The read data mbuf was XDR round-up padded by nfsvno_read
-		 * (NFSM_RNDUP(cnt)), so the inline reduced body must excise the PADDED
-		 * span [doff, doff+padded) while the write list receives exactly
-		 * ddp_len (unpadded) bytes (RFC 8166 3.4.5).  Bounds-check the padded
-		 * window against the marshalled reply before trusting it; a failed
-		 * bound falls through to the existing reply-chunk / drop path.
-		 * Strictly prefer this over the reply-chunk path: a READ never offers a
-		 * reply chunk.
+		 * An over-inline READ whose data is DDP-eligible: the data goes
+		 * into the offered write chunk and a reduced RDMA_MSG is sent.
+		 * The data was XDR round-up padded, so the reduced body excises
+		 * the padded span while the chunk receives exactly the unpadded
+		 * length (RFC 8166 3.4.5).
 		 */
 		if (have_pend && pend.rp_has_writes && pend.rp_nwrites == 1 &&
 		    pend.rp_has_ddp && pend.rp_ddp_len > 0 && vops != NULL &&
@@ -930,10 +757,9 @@ svc_rdma_do_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 			if (nfsreply_len <= rlen && padded <= rlen &&
 			    doff <= rlen - padded) {
 				/*
-				 * reduced: the inline body with [doff, doff+padded)
-				 * removed (the read data AND its XDR pad) -- head
-				 * [0,doff) ++ tail [doff+padded,rlen).  Built off the
-				 * xr_lock either way.
+				 * The reduced body is head [0,doff) followed by
+				 * tail [doff+padded,rlen), excising the read
+				 * data and its XDR pad.  Built off xr_lock.
 				 */
 				reducedlen = rlen - padded;
 				reduced = malloc(reducedlen, M_SVCRDMA, M_WAITOK);
@@ -945,13 +771,11 @@ svc_rdma_do_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 					    reduced + doff);
 
 				/*
-				 * ZERO-COPY: if the engine offers the
-				 * page entry point and the read data is a clean M_EXTPG
-				 * page chain, RDMA-Write those pages DIRECTLY -- no
-				 * contigmalloc, no per-READ m_copydata of the data (the
-				 * old read ceiling).  svc_rdma_collect_extpg returns 0
-				 * to fall back to the contiguous copy.  pgs is heap
-				 * (~4 KiB) to stay off the kernel stack.
+				 * With the page entry point and a clean M_EXTPG
+				 * chain, write those pages directly, with no
+				 * allocation and no copy; a 0 from
+				 * svc_rdma_collect_extpg() means the copy path.
+				 * pgs is heap to keep it off the stack.
 				 */
 				pgs = malloc(SVC_RDMA_RD_MAXPGS * sizeof(*pgs),
 				    M_SVCRDMA, M_WAITOK);
@@ -960,11 +784,11 @@ svc_rdma_do_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 				    pgs, SVC_RDMA_RD_MAXPGS) : 0;
 				if (npg == 0) {
 					/*
-					 * Fallback: copy the unpadded read data into a
-					 * contiguous DMA source OFF the lock and hand it
-					 * to the contig engine (which owns src).
-					 * Prefer the recycle pool (#B1) to avoid the
-					 * per-op contigmalloc/free TLB shootdown.
+					 * Otherwise copy the unpadded data into
+					 * a contiguous source off the lock,
+					 * which the engine owns.  The recycle
+					 * pool is preferred, since allocating
+					 * per operation costs a shootdown.
 					 */
 					src = NULL;
 					if (vops->svo_sink_get != NULL) {
@@ -1004,11 +828,9 @@ svc_rdma_do_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 					    conn, msg->rm_xid, &pend.rp_writes, mrep,
 					    pgs, npg, dlen, reduced, reducedlen);
 					/*
-					 * The engine OWNS mrep on EVERY return (0 or
-					 * errno: it frees mrep at badm, through
-					 * svc_rdma_write_free, or at drain on a committed
-					 * partial post), so drop our reference here
-					 * UNCONDITIONALLY -- never m_freem() it below.
+					 * The engine owns mrep on every return,
+					 * so the reference is dropped here and
+					 * it is never freed below.
 					 */
 					mrep = NULL;
 					if (rc == 0)
@@ -1020,14 +842,13 @@ svc_rdma_do_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 					    src_pooled);
 					if (rc == 0)
 						seqval = ++xr->xr_seq;
-					/* svo_conn_write_list OWNS src on every return. */
 				}
 				mtx_unlock(&xr->xr_lock);
 
 				free(pgs, M_SVCRDMA);
 				free(reduced, M_SVCRDMA);
 				if (mrep != NULL)
-					m_freem(mrep);	/* fallback/error: engine didn't take it */
+					m_freem(mrep);
 
 				if (rc != 0) {
 					if (rc != ENOTCONN &&
@@ -1044,18 +865,16 @@ svc_rdma_do_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 				return (TRUE);
 			}
 			/*
-			 * boundary out of range: fall through to the reply-chunk /
-			 * ERR_CHUNK path below.  A READ never offers a reply chunk, so
-			 * an out-of-range write-list boundary lands on the ERR_CHUNK
-			 * drop (RFC 8166 4.4/5), not on a reply-chunk send.
+			 * An out-of-range boundary falls through below, and
+			 * since a READ never offers a reply chunk it lands on
+			 * ERR_CHUNK rather than a reply-chunk send.
 			 */
 		}
 		if (have_pend && pend.rp_has_reply) {
 			/*
-			 * Linearize the marshalled ONC RPC reply ALONE (no RFC 8166
-			 * header -- the verbs layer builds the RDMA_NOMSG header).  Post
-			 * under xr_lock so we observe a stable live xr_conn (SF1/SF2
-			 * race window, identical to the inline path below).
+			 * Linearize the reply on its own; the verbs layer
+			 * builds the RDMA_NOMSG header.  Post under xr_lock to
+			 * observe a stable xr_conn, as the inline path does.
 			 */
 			buf = malloc(rlen, M_SVCRDMA, M_WAITOK);
 			m_copydata(mrep, 0, rlen, buf);
@@ -1090,18 +909,12 @@ svc_rdma_do_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 		}
 		m_freem(mrep);
 		/*
-		 * ERR_CHUNK (RFC 8166 4.4/5).  We could not place this
-		 * reply: it is over-inline and either no reply chunk was offered, or a
-		 * write-list read's DDP boundary was out of range and fell through to
-		 * here.  Rather than drop silently, report RDMA_ERROR/ERR_CHUNK keyed
-		 * by the request's KNOWN xid (msg->rm_xid, decoded by xdr_callmsg) so
-		 * the client learns this specific request failed and can retry -- the
-		 * connection STAYS UP (a per-request error).  Post under xr_lock so we
-		 * observe a stable live xr_conn (the same SF1/SF2 window as the inline
-		 * and reply-chunk paths above), and only when the verbs layer supplies
-		 * the OPTIONAL svo_conn_error (an older nfsrdma without it falls back to
-		 * the plain drop).  mrep was freed above and is not touched here.  We
-		 * still return FALSE: no inline reply was sent.
+		 * Over-inline with no usable chunk, either none offered or a
+		 * write-list boundary out of range.  ERR_CHUNK by xid lets the
+		 * client retry instead of dropping silently, posted under
+		 * xr_lock for a stable xr_conn and only when the optional op
+		 * exists.  The return is still FALSE, no inline reply having
+		 * been sent.
 		 */
 		mtx_lock(&xr->xr_lock);
 		conn = xr->xr_conn;
@@ -1118,42 +931,35 @@ svc_rdma_do_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 	}
 
 	/*
-	 * Linearize [RFC 8166 header | ONC RPC reply] into one contiguous buffer
-	 * for svc_rdma_conn_send().  All header words except the credit are fixed
-	 * local data (only the echoed xid is peer-derived); the credit (w2) is
-	 * the verbs layer's real posted recv depth and is filled inside the lock
-	 * below, once we have confirmed a live conn to read it from (SF1).
+	 * Linearize the header and reply into one buffer.  Every header word is
+	 * local except the echoed xid, and the credit is filled inside the lock
+	 * below, once there is a live connection to read it from.
 	 */
 	buf = malloc(total, M_SVCRDMA, M_WAITOK);
-	be32enc(buf + 0, msg->rm_xid); /* w0 rdma_xid */
-	be32enc(buf + 4, RPCRDMA_VERSION); /* w1 rdma_vers */
-	be32enc(buf + 8, SVC_RDMA_CREDIT_GRANT); /* w2 rdma_credit */
-	be32enc(buf + 12, RDMA_MSG); /* w3 rdma_proc */
-	be32enc(buf + 16, 0); /* w4 read_list */
-	be32enc(buf + 20, 0); /* w5 write_list */
-	be32enc(buf + 24, 0); /* w6 reply_chunk */
+	be32enc(buf + 0, msg->rm_xid);
+	be32enc(buf + 4, RPCRDMA_VERSION);
+	be32enc(buf + 8, SVC_RDMA_CREDIT_GRANT);
+	be32enc(buf + 12, RDMA_MSG);
+	be32enc(buf + 16, 0);
+	be32enc(buf + 20, 0);
+	be32enc(buf + 24, 0);
 	m_copydata(mrep, 0, rlen, buf + RPCRDMA_HDR_MIN);
 	m_freem(mrep);
 
 	/*
-	 * Post under xr_lock so we observe a stable xr_conn: sro_disconnect
-	 * NULLs xr_conn under the same lock after draining all sro_recv, so if
-	 * we win the race we hold a live conn for the duration of the (non-
-	 * sleeping) svc_rdma_conn_send; if we lose it, conn is NULL and we drop.
-	 * svc_rdma_conn_send does not sleep and is documented safe to call
-	 * holding a leaf mutex.  While we hold the live conn we also read its
-	 * real granted credit (svo_conn_credits == conn->sc_nrecv, SF1) and write
-	 * it into w2 -- exactly what the verbs layer would grant -- and, on a
-	 * successful post, advance xr_seq and report it as *seq for the DRC (SF2).
+	 * Post under xr_lock to observe a stable xr_conn: sro_disconnect NULLs
+	 * it under the same lock after draining every sro_recv, so either the
+	 * conn is live for the whole of the non-sleeping send or it is NULL and
+	 * this drops.  The granted credit is read from the same live conn.
 	 */
 	mtx_lock(&xr->xr_lock);
 	conn = xr->xr_conn;
 	if (conn != NULL && vops != NULL) {
 		uint32_t credit = vops->svo_conn_credits(conn);
 
-		if (credit == 0)		/* defensive: never advertise 0 */
+		if (credit == 0)
 			credit = SVC_RDMA_CREDIT_GRANT;
-		be32enc(buf + 8, credit);	/* w2 rdma_credit: real depth */
+		be32enc(buf + 8, credit);
 		rc = vops->svo_conn_send(conn, buf, total);
 		if (rc == 0)
 			seqval = ++xr->xr_seq;
@@ -1177,27 +983,12 @@ svc_rdma_do_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 }
 
 /*
- * svc_rdma_bck_send: send one NFSv4.1 backchannel CB RPC CALL (server->client
- * callback, e.g. CB_NULL) over the SAME established RDMA QP, in the reverse
- * direction of the forward NFS stream.  Reached only through the link-safe
- * clnt_bck_rdma_send hook from clnt_bck_call (xp_socket == NULL).  mreq is the
- * marshalled ONC RPC CALL whose first XDR word is the already-network-order
- * xid (clnt_bck_call wrote htonl(xid) there and, on the RDMA path, prepended no
- * TCP record mark); it is consumed (m_freem) here.
- *
- * This is the inline reply-send path of svc_rdma_xprt_reply above with a CALL
- * body instead of a REPLY body: build the 7-word RFC 8166 RDMA_MSG transport
- * header (w0 = the echoed ONC xid so the client's RPC-over-RDMA layer mirrors
- * it and the clnt_bck_call reply matcher keys on the same value; w1 =
- * RPCRDMA_VERSION; w2 = the real granted credit read from the live conn under
- * xr_lock; w3 = RDMA_MSG; w4/w5/w6 = empty chunk lists -- a CB_NULL CALL is
- * pure-inline), prepend it, then post under xr_lock against a stable xr_conn --
- * the identical SF1 discipline as the forward reply (sro_disconnect NULLs
- * xr_conn under the same lock after draining recv; svo_conn_send does not sleep
- * and is safe under a leaf mutex).  Lock order xr_lock -> sc_lock is the
- * existing forward-reply order; ct_lock is never held here (clnt_bck_call drops
- * it before the send block), so no new lock order is introduced.  Returns 0, or
- * ENOTCONN/EBUSY/EINVAL which clnt_bck_call maps to RPC_CANTSEND.
+ * Send one NFSv4.1 backchannel call over the established QP, in the reverse
+ * direction of the forward stream.  mreq is the marshalled call, whose first
+ * XDR word is the already network-order xid, and it is consumed here.  This is
+ * the forward reply's inline send path with a call body instead, posting under
+ * xr_lock against a stable xr_conn; the order xr_lock before sc_lock is the
+ * forward-reply order and ct_lock is not held, so nothing new is introduced.
  */
 static int svc_rdma_do_bck_send(SVCXPRT *, struct mbuf *,
     const struct svc_rdma_verbs_ops *);
@@ -1209,9 +1000,8 @@ svc_rdma_bck_send(SVCXPRT *xprt, struct mbuf *mreq)
 	int rc;
 
 	/*
-	 * Hold the verbs table across the backchannel send: svc_rdma_do_bck_send
-	 * calls through it (svo_thread_setup, svo_conn_credits, svo_conn_send) with
-	 * xr_lock dropped, so a concurrent kldunload nfsrdma must not free that text
+	 * Hold the verbs table across the backchannel send, which calls through
+	 * it with xr_lock dropped, so a concurrent unload cannot free that text
 	 * mid-call on the modular build.
 	 */
 	vops = svc_rdma_verbs_hold();
@@ -1232,10 +1022,7 @@ svc_rdma_do_bck_send(SVCXPRT *xprt, struct mbuf *mreq,
 	u_int rlen, total;
 	int rc;
 
-	/*
-	 * Pre-warm the linuxkpi `current` shadow off-lock before the post;
-	 * vops is the caller-held verbs snapshot (see svc_rdma_bck_send).
-	 */
+	/* Pre-warm the linuxkpi current shadow off-lock before the post. */
 	if (vops != NULL && vops->svo_thread_setup != NULL)
 		vops->svo_thread_setup();
 
@@ -1243,19 +1030,19 @@ svc_rdma_do_bck_send(SVCXPRT *xprt, struct mbuf *mreq,
 	total = RPCRDMA_HDR_MIN + rlen;
 	if (total > SVC_RDMA_INLINE) {
 		m_freem(mreq);
-		return (EINVAL);		/* CB_NULL is tiny; never trips */
+		return (EINVAL);
 	}
 
 	/* The ONC xid is word0 of mreq, already in network byte order. */
 	m_copydata(mreq, 0, sizeof(netxid), (caddr_t)&netxid);
 	buf = malloc(total, M_SVCRDMA, M_WAITOK);
-	be32enc(buf + 0, ntohl(netxid)); /* w0 rdma_xid (echo) */
-	be32enc(buf + 4, RPCRDMA_VERSION); /* w1 rdma_vers */
-	be32enc(buf + 8, SVC_RDMA_CREDIT_GRANT); /* w2 rdma_credit */
-	be32enc(buf + 12, RDMA_MSG); /* w3 rdma_proc */
-	be32enc(buf + 16, 0); /* w4 read_list */
-	be32enc(buf + 20, 0); /* w5 write_list */
-	be32enc(buf + 24, 0); /* w6 reply_chunk */
+	be32enc(buf + 0, ntohl(netxid));
+	be32enc(buf + 4, RPCRDMA_VERSION);
+	be32enc(buf + 8, SVC_RDMA_CREDIT_GRANT);
+	be32enc(buf + 12, RDMA_MSG);
+	be32enc(buf + 16, 0);
+	be32enc(buf + 20, 0);
+	be32enc(buf + 24, 0);
 	m_copydata(mreq, 0, rlen, buf + RPCRDMA_HDR_MIN);
 	m_freem(mreq);
 
@@ -1264,9 +1051,9 @@ svc_rdma_do_bck_send(SVCXPRT *xprt, struct mbuf *mreq,
 	if (conn != NULL && vops != NULL) {
 		uint32_t credit = vops->svo_conn_credits(conn);
 
-		if (credit == 0)		/* defensive: never advertise 0 */
+		if (credit == 0)
 			credit = SVC_RDMA_CREDIT_GRANT;
-		be32enc(buf + 8, credit);	/* w2 rdma_credit: real depth */
+		be32enc(buf + 8, credit);
 		rc = vops->svo_conn_send(conn, buf, total);
 	} else
 		rc = ENOTCONN;
@@ -1290,13 +1077,10 @@ svc_rdma_xprt_control(SVCXPRT *xprt, const u_int rq, void *in)
 	switch (rq) {
 	case SVCSET_READDDP:
 		/*
-		 * The nfsd READ path located the DDP-eligible read data within the
-		 * reply body it is building (write-list READ engine).  Stamp the
-		 * {off,len} onto this xid's pending entry (created at recv when a
-		 * write list was offered); xp_reply consumes it to RDMA-Write the
-		 * data into the client's write chunk and send a reduced reply.  No
-		 * write list -> no pending entry -> silent no-op (the reply falls
-		 * back to inline / drop).  Unknown commands keep the FALSE no-op.
+		 * The READ path has located the DDP-eligible data in the reply
+		 * body, so stamp the boundary onto this xid's entry for
+		 * xp_reply.  With no write list there is no entry and this is a
+		 * no-op.
 		 */
 		if (xr == NULL || in == NULL)
 			return (FALSE);
@@ -1311,10 +1095,9 @@ svc_rdma_xprt_control(SVCXPRT *xprt, const u_int rq, void *in)
 }
 
 /*
- * xp_destroy: the final SVC_RELEASE dropped the last reference, so no pool
- * thread holds this xprt.  Free the recv queue and the per-conn state.  The
- * verbs connection itself is torn down separately by the verbs layer after
- * sro_disconnect returned; we must not touch xr_conn here.
+ * xp_destroy: the last reference is gone, so free the queue and the
+ * per-connection state.  The verbs connection is torn down separately after
+ * sro_disconnect returned, so xr_conn must not be touched here.
  */
 static void
 svc_rdma_xprt_destroy(SVCXPRT *xprt)
@@ -1328,14 +1111,10 @@ svc_rdma_xprt_destroy(SVCXPRT *xprt)
 		xprt->xp_p1 = NULL;
 	}
 	/*
-	 * Release the NFSv4.1 backchannel CLIENT bound at CREATE_SESSION
-	 * (nfs_nfsdstate.c:840 CLNT_ACQUIRE'd nr_client into xp_p2).  Runs on the
-	 * last SVC_RELEASE, after every recv completion has drained and after
-	 * sro_disconnect already CLNT_CLOSE'd it, so no clnt_bck_svccall can
-	 * still reference it.  Mirrors svc_vc_destroy (svc_vc.c:539,550).  The
-	 * session's own xprt reference is released separately by
-	 * nfsrv_freesession via SVC_RELEASE, so this is a distinct refcount and
-	 * not a double free.
+	 * Release the backchannel client bound at CREATE_SESSION, as
+	 * svc_vc_destroy does.  This runs on the last release, after the recv
+	 * completions drained and sro_disconnect closed it.  The session's own
+	 * transport reference is a separate refcount.
 	 */
 	if (xprt->xp_p2 != NULL) {
 		CLNT_RELEASE((CLIENT *)xprt->xp_p2);
@@ -1346,24 +1125,17 @@ svc_rdma_xprt_destroy(SVCXPRT *xprt)
 }
 
 /*
- * ===========================================================================
- * Consumer upcalls (struct svc_rdma_ops) driven by the verbs layer.
+ * Consumer upcalls driven by the verbs layer.
  */
 
 /*
- * sro_newconn: an RDMA connection reached ESTABLISHED.  Sleepable CM context
- * (M_WAITOK ok), guaranteed before any sro_recv for this conn.  Allocate and
- * register the SVCXPRT into the pool and bind it to the conn -- the RDMA
- * analogue of svc_vc_create_conn.
+ * sro_newconn: allocate and register the SVCXPRT and bind it to the
+ * connection, as svc_vc_create_conn does.  Sleepable and guaranteed before any
+ * recv upcall.
  *
- * We do NOT call svc_reg(NFS_PROG,...) per-connection here, and deliberately so:
- * svc_reg attaches a (prog,vers)->dispatch callout to the POOL (sp_callouts),
- * not to the xprt, and nfsd already populated those callouts for its pool when
- * its first (TCP/UDP) transport came up (nfsrvd_addsock).  xprt_register alone
- * is therefore enough for svc_executereq to dispatch NFS on this transport --
- * exactly as svc_vc leaves svc_reg to its caller (nfsrvd_addsock), not to the
- * transport.  We DO call svc_rdma_conn_set_ctx so our recv/disconnect upcalls
- * recover the xprt from the conn.
+ * svc_reg() is deliberately not called per connection: it attaches the
+ * dispatch callouts to the pool, not the transport, and nfsd populated those
+ * when its first transport came up.
  */
 static void
 svc_rdma_sro_newconn(void *ctx, struct svc_rdma_conn *conn)
@@ -1385,34 +1157,25 @@ svc_rdma_sro_newconn(void *ctx, struct svc_rdma_conn *conn)
 	xprt->xp_p1 = xr;
 	xprt->xp_p2 = NULL;
 	xprt->xp_ops = &svc_rdma_xp_ops;
-	xprt->xp_extpg = true;		/* nfsd may build M_EXTPG READ
-					 * replies for this xprt; the verbs engine
-					 * RDMA-Writes the data pages directly. */
 	/*
-	 * No xp_idletimeout: the idle reaper (svc_checkidle) calls
-	 * soshutdown(xp_socket,...) unconditionally on a timed-out xprt, which
-	 * would NULL-deref here.  RDMA connection lifetime is driven by the
-	 * verbs CM (sro_disconnect), not by the krpc idle timer, so we leave
-	 * xp_idletimeout == 0 (reaper skips us).
+	 * nfsd may build M_EXTPG READ replies for this transport; the verbs
+	 * engine RDMA-Writes those data pages directly.
+	 */
+	xprt->xp_extpg = true;
+	/*
+	 * xp_idletimeout stays 0, so the reaper skips this transport: it calls
+	 * soshutdown() unconditionally on a timed-out one, and there is no
+	 * socket here.  Connection lifetime comes from the CM instead.
 	 */
 
 	/*
-	 * Give the transport a unique non-zero xp_sockref so the nfsd duplicate-
-	 * request cache (DRC) can key its per-transport ack list on it (SF2):
-	 * nfsd records each reply under xp_sockref + the xp_reply *seq, and
-	 * nfsrc_trimcache() confirms cached replies for this sockref once xp_ack
-	 * reports a SEQ_GEQ value.  A zero sockref would alias the "no socket"
-	 * sentinel and collide across connections, so we allocate from a process-
-	 * wide monotonic counter (atomic; wrap is astronomically distant and would
-	 * at worst momentarily share a DRC bucket, never corrupt it).
+	 * xp_sockref keys the duplicate-request cache per transport.  Zero
+	 * would alias the no-socket sentinel and collide across connections, so
+	 * it comes from a monotonic counter; a wrap at worst shares a bucket.
 	 *
-	 * Peer address: surface the RDMA-CM resolved client
-	 * sockaddr into xp_rtaddr so NFS export-address checks
-	 * (svc_getrpccaller -> xp_rtaddr) match the client against -network/-host
-	 * exports, exactly as svc_vc does for a TCP peer.  If the verbs layer
-	 * cannot supply it (older provider, or an unknown address family) it stays
-	 * AF_UNSPEC and only unrestricted exports match -- the prior behavior.
-	 * The DRC is keyed on xp_sockref (below), independent of the peer address.
+	 * xp_rtaddr carries the CM-resolved client sockaddr, so export address
+	 * checks match -network/-host as they do for a TCP peer.  Without one
+	 * it stays AF_UNSPEC and only unrestricted exports match.
 	 */
 	xprt->xp_sockref = atomic_fetchadd_64(&svc_rdma_sockref_gen, 1) + 1;
 
@@ -1429,37 +1192,21 @@ svc_rdma_sro_newconn(void *ctx, struct svc_rdma_conn *conn)
 	svc_rdma_conn_set_ctx_wrap(conn, xprt);
 
 	/*
-	 * Drop the svc_xprt_alloc() reference (xp_refs was 1; xprt_register
-	 * bumped it to 2).  After this the pool holds the SOLE reference, so the
-	 * transport is destroyed via SVC_DESTROY -> svc_rdma_xprt_destroy on the
-	 * last release (sro_disconnect's xprt_unregister, or a pool thread seeing
-	 * XPRT_DIED) -- not leaked.  This mirrors svc_vc.c:477, which does
-	 * SVC_RELEASE(new_xprt) right after svc_vc_create_conn.  The release MUST
-	 * come AFTER svc_rdma_conn_set_ctx_wrap: while we still held the alloc
-	 * reference no pool thread could destroy the xprt mid-setup (a recv that
-	 * raced in would xprt_active it, but destroy cannot run until refs hit 0,
-	 * which only this release allows).  We MUST NOT touch xprt after this.
+	 * Drop the allocation reference so the pool holds the only one and the
+	 * transport is destroyed on the last release, as svc_vc does.  It must
+	 * come after the connection is bound: until then that reference is what
+	 * stops a pool thread destroying the transport mid-setup, and xprt must
+	 * not be touched afterwards.
 	 */
 	SVC_RELEASE(xprt);
 }
 
 /*
- * sro_recv: a good inline RDMA_MSG call completed.  recv-completion
- * (IB_POLL_WORKQUEUE) context: *** MUST NOT SLEEP ***.  Copy the inline RPC
- * bytes into an mbuf (the verbs recv buffer is reposted the instant we return,
- * so we must copy), enqueue, and xprt_active() to wake a pool thread.  This is
- * the RDMA analogue of svc_vc_soupcall: the recv completion is the "data ready"
- * signal.
- *
- * Non-sleeping allocation: m_getm2(M_NOWAIT) pre-sizes a chain large enough for
- * rpc_len so the subsequent m_copyback does not extend (and thus does not sleep
- * or allocate).  On alloc failure we DROP (return 0 so the verbs layer reposts);
- * the RC client retransmits.  We never block a completion thread.
- *
- * msg->rpc_len was bounded by the verbs layer: <= SVC_RDMA_INLINE for a pure-
- * inline call, or <= SVC_RDMA_INLINE + 1 MiB for an RDMA-Read-assembled NFS WRITE
- * body; either way a fixed verbs-imposed bound, not a peer-supplied
- * length into an allocation.  m_getm2 sizes the chain to it dynamically.
+ * sro_recv: an inline call completed.  The analogue of svc_vc_soupcall, with
+ * the completion as the data-ready signal.  Runs in the recv completion and
+ * must not sleep, so m_getm2() pre-sizes the chain with M_NOWAIT and a failed
+ * allocation drops the call for the client to retransmit.  rpc_len was
+ * bounded by the verbs layer, so the chain is never sized from a peer length.
  */
 static int
 svc_rdma_sro_recv(void *ctx, struct svc_rdma_conn *conn,
@@ -1470,37 +1217,21 @@ svc_rdma_sro_recv(void *ctx, struct svc_rdma_conn *conn,
 	struct svc_rdma_qent *q;
 	struct mbuf *m;
 
-	if (xprt == NULL)	/* newconn must have run first (header contract) */
+	if (xprt == NULL)
 		return (0);
 	xr = (struct svc_rdma_xprt *)xprt->xp_p1;
 
 	if (msg->rpc_len == 0)
-		return (0);	/* nothing to dispatch; repost */
+		return (0);
 
 	/*
-	 * NFSv4.1 backchannel REPLY demux.  Forward NFS CALLs and the client's
-	 * server-originated callback (CB) REPLYs both arrive as inline RDMA_MSG
-	 * SENDs on this one recv ring; the RPC-over-RDMA transport header carries
-	 * no direction, so the direction lives in the INNER ONC RPC header at
-	 * word1 (offset +4 of the inline body; the xid is at +0): CALL == 0,
-	 * REPLY == 1 (rpc_msg.h).  When a backchannel CLIENT is bound
-	 * (xp_p2 != NULL) and this is a REPLY, route it to the krpc reply matcher
-	 * (clnt_bck_svccall) instead of dispatching it as a forward call -- the
-	 * RDMA analogue of svc_vc_recv's TCP demux, but here on the recv-
-	 * completion workqueue (an independent context from the nfsd pool thread
-	 * blocked in clnt_bck_call awaiting this reply), which guarantees the
-	 * reply's wakeup always has a runnable context and cannot deadlock on
-	 * pool-thread occupancy.
-	 *
-	 * MUST copy the bytes NOW: msg->rpc points into the verbs recv buffer,
-	 * which is reposted the instant this function returns, so an mbuf is
-	 * built with M_NOWAIT (we are in IB_POLL_WORKQUEUE context and MUST NOT
-	 * SLEEP) before the call.  clnt_bck_svccall takes only ct_lock + wakeup
-	 * (no sleep, no XDR decode, and it m_freem's an unmatched/late reply and
-	 * honors ct_closing itself), so it is safe here.  On copy-alloc failure
-	 * we drop and repost; the client/session layer retransmits.  We return
-	 * WITHOUT enqueueing to xr_mq or calling xprt_active -- a diverted reply
-	 * is never a forward call.  Use the symbolic REPLY enum, never a literal.
+	 * Forward calls and callback replies share the recv ring and the
+	 * transport header carries no direction, so it comes from the inner ONC
+	 * header at word1.  A reply goes to clnt_bck_svccall(); this runs on
+	 * the completion workqueue, independent of the pool thread waiting in
+	 * clnt_bck_call, so the wakeup always has a runnable context.  The
+	 * bytes are copied now with M_NOWAIT, since msg->rpc points into the
+	 * recv buffer and this cannot sleep.
 	 */
 	if (msg->rpc_len >= 8 && xprt->xp_p2 != NULL &&
 	    be32dec((const char *)msg->rpc + 4) == REPLY) {
@@ -1508,12 +1239,12 @@ svc_rdma_sro_recv(void *ctx, struct svc_rdma_conn *conn,
 
 		rm = m_getm2(NULL, msg->rpc_len, M_NOWAIT, MT_DATA, M_PKTHDR);
 		if (rm == NULL)
-			return (0);	/* drop; client retransmits the CB */
+			return (0);
 		m_copyback(rm, 0, msg->rpc_len, msg->rpc);
 		rm->m_pkthdr.len = msg->rpc_len;
 		clnt_bck_svccall(xprt->xp_p2, rm,
 		    be32dec((const char *)msg->rpc));
-		return (0);	/* matched (or freed) by the CB client; repost */
+		return (0);
 	}
 
 	q = malloc(sizeof(*q), M_SVCRDMA, M_NOWAIT);
@@ -1523,31 +1254,24 @@ svc_rdma_sro_recv(void *ctx, struct svc_rdma_conn *conn,
 	m = m_getm2(NULL, msg->rpc_len, M_NOWAIT, MT_DATA, M_PKTHDR);
 	if (m == NULL) {
 		free(q, M_SVCRDMA);
-		return (0);	/* drop; client retransmits */
+		return (0);
 	}
 	m_copyback(m, 0, msg->rpc_len, msg->rpc);
 	m->m_pkthdr.len = msg->rpc_len;
 	q->sq_m = m;
 
 	/*
-	 * Capture the reply chunk if the client offered one for this
-	 * request: the whole RPC reply will be too large for inline and must be
-	 * RDMA-Written into the client's reply-chunk memory.  msg->reply is a pure
-	 * value type (a fixed-size validated segment array, no pointers), so copying it
-	 * here is safe even though msg itself is valid only for this call.  We key it on
-	 * the ONC RPC xid so xp_reply (a later pool thread) can find it.
+	 * Capture any offered reply chunk, for a reply too large to go inline.
+	 * msg->reply is a value type with no pointers, so the copy outlives msg
+	 * itself, keyed on the xid for xp_reply.
 	 */
 	q->sq_has_reply = msg->reply_present;
 	/*
-	 * Capture the FIRST write-list chunk too (write-list READ engine): a READ
-	 * offers a write list (not a reply chunk) to receive its data by DDP.
-	 * msg->writes is a pure value type, safe to copy here.  RFC 8267 maps the
-	 * single DDP-eligible READ result to one write chunk, so we carry
-	 * writes[0] only -- but ALSO carry the offered chunk count so xp_reply can
-	 * tell a single-chunk READ (reduced) from a multi-chunk write list (a
-	 * COMPOUND with >1 DDP-eligible READ), which the engine does not reduce and
-	 * must answer with a conformant ERR_CHUNK rather than a single-chunk reply.
-	 * sq_xid is set whenever EITHER list is present.
+	 * Capture the first write-list chunk too, a READ offering a write list
+	 * rather than a reply chunk.  RFC 8267 maps one DDP result to one
+	 * chunk, so only writes[0] is carried, but the offered count comes with
+	 * it: xp_reply needs that to tell a single-chunk READ from a compound
+	 * with several, which it answers with ERR_CHUNK.
 	 */
 	q->sq_has_writes = (msg->wr_nchunks > 0);
 	q->sq_nwrites = msg->wr_nchunks;
@@ -1563,25 +1287,19 @@ svc_rdma_sro_recv(void *ctx, struct svc_rdma_conn *conn,
 	mtx_unlock(&xr->xr_lock);
 
 	/*
-	 * Wake a pool thread.  xprt_active is the krpc wakeup primitive (the
-	 * same call svc_vc_soupcall makes); it takes the group lock internally.
-	 * We call it with xr_lock DROPPED to avoid any lock-order coupling
-	 * between our leaf mutex and the krpc group lock.
+	 * Wake a pool thread with xr_lock dropped: xprt_active() takes the
+	 * group lock internally, and our leaf mutex must not couple to it.
 	 */
 	xprt_active(xprt);
 	return (0);
 }
 
 /*
- * sro_recv_mbuf: zero-copy variant of sro_recv for the RDMA-Read-assembled NFS
- * WRITE path.  Same IB_POLL_WORKQUEUE context and MUST-NOT-SLEEP
- * rule as sro_recv, same sro_newconn-happened-before guarantee.  m is a COMPLETE
- * ONC RPC call already assembled by the verbs layer as an mbuf chain (small head
- * fragments bracketing one EXT_DISPOSABLE segment over the DMA'd read sink); we
- * enqueue it with NO copy (no m_getm2/m_copyback of the body).  On return 0
- * ownership of m transfers to us (drained via xr_mq / svc_rdma_drain_queue);
- * on any drop we m_freem(m) here, which runs the verbs-layer ext_free and
- * releases the read sink.  reply is a pure value type captured iff has_reply.
+ * sro_recv_mbuf: the assembled-body form of sro_recv, same context and
+ * no-sleep rule.  m is head fragments bracketing one EXT_DISPOSABLE segment
+ * over the read sink, so it is queued without copying.  Ownership transfers on
+ * a 0 return; a drop frees it here, running the ext_free that releases the
+ * sink.
  */
 static int
 svc_rdma_sro_recv_mbuf(void *ctx, struct svc_rdma_conn *conn, struct mbuf *m,
@@ -1591,23 +1309,23 @@ svc_rdma_sro_recv_mbuf(void *ctx, struct svc_rdma_conn *conn, struct mbuf *m,
 	struct svc_rdma_xprt *xr;
 	struct svc_rdma_qent *q;
 
-	if (xprt == NULL) {	/* newconn must have run first (header contract) */
-		m_freem(m);	/* runs ext_free -> releases the read sink */
+	if (xprt == NULL) {
+		m_freem(m);
 		return (0);
 	}
 	xr = (struct svc_rdma_xprt *)xprt->xp_p1;
 
 	if (m->m_pkthdr.len == 0) {
 		m_freem(m);
-		return (0);	/* nothing to dispatch; repost */
+		return (0);
 	}
 
 	q = malloc(sizeof(*q), M_SVCRDMA, M_NOWAIT);
 	if (q == NULL) {
-		m_freem(m);	/* drop; client retransmits */
+		m_freem(m);
 		return (0);
 	}
-	q->sq_m = m;		/* OWNERSHIP TRANSFERS; no m_getm2/m_copyback */
+	q->sq_m = m;		/* ownership passes to the queue */
 
 	/*
 	 * Capture the reply chunk if the client offered one (same rationale as
@@ -1615,10 +1333,8 @@ svc_rdma_sro_recv_mbuf(void *ctx, struct svc_rdma_conn *conn, struct mbuf *m,
 	 */
 	q->sq_has_reply = has_reply;
 	/*
-	 * The RDMA-Read-assembled NFS WRITE path has no outbound write list to
-	 * carry (the read list it consumed is inbound), so there is nothing to
-	 * capture for the write-list READ engine.  q is M_NOWAIT (not M_ZERO), so
-	 * sq_has_writes MUST be explicitly cleared here.
+	 * This path consumed an inbound read list and has no outbound write
+	 * list to carry.  q is not zeroed on allocation, so clear it here.
 	 */
 	q->sq_has_writes = false;
 	q->sq_nwrites = 0;
@@ -1631,22 +1347,18 @@ svc_rdma_sro_recv_mbuf(void *ctx, struct svc_rdma_conn *conn, struct mbuf *m,
 	STAILQ_INSERT_TAIL(&xr->xr_mq, q, sq_link);
 	mtx_unlock(&xr->xr_lock);
 
-	xprt_active(xprt);	/* xr_lock dropped (same discipline as sro_recv) */
+	xprt_active(xprt);
 	return (0);
 }
 
 /*
- * sro_disconnect: the connection is going away.  Sleepable teardown context,
- * delivered ONCE and paired with newconn, AFTER every sro_recv has returned (the
- * verbs layer drains in-flight upcalls first), so no sro_recv runs concurrently.
+ * sro_disconnect: the connection is going away.  Sleepable, delivered once and
+ * paired with newconn, after every recv upcall has returned.
  *
- * Mirror svc_vc's destroy refcounting: xprt_unregister() removes the transport
- * from the pool and drops the pool's reference (the matching SVC_ACQUIRE done by
- * xprt_register).  Any pool thread still mid-xp_recv holds its OWN reference, so
- * xp_destroy runs only after that thread releases -- our state is not freed from
- * under it.  We NULL xr_conn under xr_lock first so a pool thread that reaches
- * xp_reply after this returns finds conn == NULL and drops instead of posting on
- * a conn the verbs layer is about to free.
+ * Refcounting follows svc_vc: xprt_unregister() drops the pool's reference
+ * while a pool thread still in xp_recv holds its own, so xp_destroy runs only
+ * once that thread releases.  xr_conn is cleared under xr_lock first, so a
+ * thread reaching xp_reply afterwards drops the reply.
  */
 static void
 svc_rdma_sro_disconnect(void *ctx, struct svc_rdma_conn *conn)
@@ -1659,10 +1371,8 @@ svc_rdma_sro_disconnect(void *ctx, struct svc_rdma_conn *conn)
 	xr = (struct svc_rdma_xprt *)xprt->xp_p1;
 
 	/*
-	 * Stop any future xp_reply from touching the conn the verbs layer is
-	 * about to free, and mark the transport dead so xp_stat reports
-	 * XPRT_DIED once the queue drains (which makes svc_getreq call
-	 * xprt_unregister too -- idempotent with ours).
+	 * Stop any later xp_reply touching the connection, and mark the
+	 * transport dead so xp_stat reports XPRT_DIED once the queue drains.
 	 */
 	mtx_lock(&xr->xr_lock);
 	xr->xr_conn = NULL;
@@ -1670,15 +1380,10 @@ svc_rdma_sro_disconnect(void *ctx, struct svc_rdma_conn *conn)
 	mtx_unlock(&xr->xr_lock);
 
 	/*
-	 * Quiesce the NFSv4.1 backchannel CLIENT (if one is bound) AFTER xr_conn
-	 * is NULL: an in-flight CB send now drops with ENOTCONN, and CLNT_CLOSE
-	 * (clnt_bck_close) sets ct_closing so any late CB REPLY still arriving on
-	 * the draining recv ring hits the ct_closing guard in clnt_bck_svccall
-	 * and is m_freem'd rather than matched against state about to be freed.
-	 * Do NOT release or NULL xp_p2 here -- svc_rdma_xprt_destroy holds the
-	 * single CLNT_RELEASE, on the last SVC_RELEASE after all recv completions
-	 * have drained.  This runs in the sleepable deferred-teardown context
-	 * (svo_listen_stop / CM), so clnt_bck_close's msleep is legal.
+	 * Quiesce the backchannel client after xr_conn is NULL, so an in-flight
+	 * send drops with ENOTCONN and a late reply is freed rather than
+	 * matched against state about to go away.  xp_p2 is not released here;
+	 * xp_destroy holds the single release.  The close may sleep.
 	 */
 	if (xprt->xp_p2 != NULL)
 		CLNT_CLOSE((CLIENT *)xprt->xp_p2);
@@ -1688,11 +1393,9 @@ svc_rdma_sro_disconnect(void *ctx, struct svc_rdma_conn *conn)
 	svc_rdma_conn_set_ctx_wrap(conn, NULL);
 
 	/*
-	 * Drop the pool's reference.  xprt_unregister is a no-op if a pool
-	 * thread (via svc_getreq seeing XPRT_DIED) already unregistered; the
-	 * SVC_RELEASE it performs balances xprt_register's SVC_ACQUIRE.  When
-	 * the last reference goes the xp_destroy op frees xr and the xprt.
-	 * xp_socket is NULL so xprt_unregister's soshutdown() is skipped.
+	 * Drop the pool's reference.  xprt_unregister() is a no-op if a pool
+	 * thread already unregistered, and balances the xprt_register()
+	 * acquire.  xp_socket is NULL, so its soshutdown() is skipped.
 	 */
 	xprt_unregister(xprt);
 }
@@ -1705,14 +1408,10 @@ static const struct svc_rdma_ops svc_rdma_consumer_ops = {
 };
 
 /*
- * Thin wrappers over the registered verbs table for conn ctx get/set, so the
- * upcalls above read like svc_vc (direct calls) while still routing through the
- * cross-module function-pointer table.  svc_rdma_verbs is guaranteed non-NULL
- * for the whole window these run: newconn/recv are delivered only by a running
- * listener (which holds the table live), and sro_disconnect is driven either by
- * a live listener or by unregister's svo_listen_stop() -- which now runs with the
- * table STILL VALID and only clears it afterward.  So the KASSERTs
- * are a defensive net, never the expected path.
+ * Wrappers over the registered table, so the upcalls above read like direct
+ * calls.  The table is live for their whole window: newconn and recv come only
+ * from a running listener, and sro_disconnect from one or from unregister,
+ * which runs svo_listen_stop() before clearing.  The assertions are a net.
  */
 static void
 svc_rdma_conn_set_ctx_wrap(struct svc_rdma_conn *conn, void *cctx)
@@ -1733,10 +1432,9 @@ svc_rdma_conn_get_ctx_wrap(struct svc_rdma_conn *conn)
 }
 
 /*
- * ===========================================================================
- * Cross-module verbs ops registration (called from the nfsrdma module at load/unload).
- * Owner-keyed, with the modular-build UAF guard; the unregister path now runs
- * svo_listen_stop() with the table still valid (see below).
+ * Cross-module verbs ops registration, called from the nfsrdma module at load
+ * and unload.  Owner-keyed, and unregister runs svo_listen_stop() with the
+ * table still valid.
  */
 int
 svc_rdma_register_verbs(const struct svc_rdma_verbs_ops *ops)
@@ -1756,12 +1454,10 @@ svc_rdma_register_verbs(const struct svc_rdma_verbs_ops *ops)
 	}
 	svc_rdma_verbs = ops;
 	/*
-	 * Arm the link-safe backchannel send hook (rpc/krpc.h, defined NULL in
-	 * rpc/clnt_bck.c) atomically with the verbs table under this lock, so
-	 * clnt_bck_call can drive an NFSv4.1 callback over an RDMA xprt only when
-	 * the OFED verbs table is live.  clnt_bck_call reaches svc_rdma_bck_send
-	 * solely through this pointer, so the always-compiled krpc never names an
-	 * OFED symbol.
+	 * Arm the backchannel send hook under this lock, so a callback goes
+	 * over RDMA only while the table is live.  clnt_bck_call reaches the
+	 * send only through this pointer, so the always-compiled krpc never
+	 * names an OFED symbol.
 	 */
 	clnt_bck_rdma_send = svc_rdma_bck_send;
 	mtx_unlock(&svc_rdma_verbs_lock);
@@ -1776,32 +1472,18 @@ svc_rdma_unregister_verbs(const struct svc_rdma_verbs_ops *ops)
 
 	mtx_lock(&svc_rdma_verbs_lock);
 
-	/* Owner-keyed: only the registration that owns the global may revoke
-	 * it (so a non-owner unregister is a strict no-op). */
+	/* Only the registration owning the global may revoke it. */
 	if (ops == NULL || svc_rdma_verbs != ops) {
 		mtx_unlock(&svc_rdma_verbs_lock);
 		return;
 	}
 
 	/*
-	 * Run svo_listen_stop() with the table STILL VALID.
-	 *
-	 * svo_listen_stop() (svc_verbs.c svc_rdma_listen_stop) sweeps every live
-	 * connection and delivers sro_disconnect for each; our sro_disconnect ->
-	 * svc_rdma_conn_get_ctx_wrap / svc_rdma_conn_set_ctx_wrap dereference
-	 * svc_rdma_verbs.  If we NULLed the table first those wrappers
-	 * would hit a NULL function-pointer table -- a deterministic panic on
-	 * kldunload nfsrdma with a live NFS-over-RDMA
-	 * connection.  So:
-	 *   1. mark stopping so no NEW in-flight arm enters the ops (the arm sites
-	 *      check svc_rdma_verbs != NULL && !svc_rdma_verbs_stopping);
-	 *   2. drain the in-flight callers already inside the lock-dropped ops;
-	 *   3. drop the lock and call svo_listen_stop() -- svc_rdma_verbs is still
-	 *      the live, owner table, so every sro_disconnect upcall it drives
-	 *      resolves through it correctly;
-	 *   4. retake the lock and only NOW clear svc_rdma_verbs.
-	 * msleep here is legal: unregister runs in the nfsrdma module's SYSUNINIT/unload
-	 * context, which is sleepable.
+	 * svo_listen_stop() must run while the table is valid: it delivers
+	 * sro_disconnect for every live connection and those upcalls resolve
+	 * through the table, so clearing it first would leave them on NULL.
+	 * Mark stopping, drain the callers already inside, stop the listener,
+	 * then clear.  The wait may sleep, which unload allows.
 	 */
 	svc_rdma_verbs_stopping = true;
 	svc_rdma_krpc_listen_port = 0;
@@ -1816,12 +1498,9 @@ svc_rdma_unregister_verbs(const struct svc_rdma_verbs_ops *ops)
 	mtx_lock(&svc_rdma_verbs_lock);
 	svc_rdma_verbs = NULL;
 	/*
-	 * Disarm the backchannel send hook atomically with the verbs table.
-	 * svo_listen_stop() above already delivered sro_disconnect for every
-	 * live conn (NULLing each xr_conn and CLNT_CLOSE'ing each xp_p2), so no
-	 * clnt_bck_call can still be mid-send; any future socket-less send now
-	 * falls back to ENOTCONN -> RPC_CANTSEND, and no stale pointer into this
-	 * (about-to-unload) module remains.
+	 * Disarm the backchannel hook with the table.  The stop above delivered
+	 * sro_disconnect for every connection, so nothing is mid-send, a later
+	 * send falls back to ENOTCONN, and no pointer into this module is left.
 	 */
 	clnt_bck_rdma_send = NULL;
 	svc_rdma_verbs_stopping = false;
@@ -1831,22 +1510,9 @@ svc_rdma_unregister_verbs(const struct svc_rdma_verbs_ops *ops)
 }
 
 /*
- * ===========================================================================
- * nfsd-pool listen hook.
- *
- * svc_rdma_nfsd_listen() is the built-in kernel symbol nfsd (nfs_nfsdkrpc.c)
- * calls to start/stop the RDMA listener bound to its SVCPOOL -- the FreeBSD
- * analogue of Linux's `echo "rdma 20049" > /proc/fs/nfsd/portlist`.  nfsd passes
- * VNET(nfsrvd_pool) and the host-order port; we stash the pool in a listener ctx
- * and drive the registered verbs' svo_listen_start() with our SVCXPRT consumer
- * ops, so accepted connections svc_xprt_alloc + xprt_register into nfsd's pool.
- *
- * port != 0 starts; port == 0 stops.  Returns 0 on success, ENXIO if nfsrdma is
- * not loaded (no verbs registered), EBUSY if a listener is already up, EINVAL
- * for a bad port, or the verbs bring-up errno.
- *
- * Single global listener (one verbs CM listener exists), so a single static
- * listener ctx suffices; it is published before start and only read by upcalls.
+ * The hook nfsd calls to start and stop the listener bound to its pool.  A
+ * non-zero port starts, 0 stops.  There is one global listener, so one static
+ * ctx suffices; it is published before the start and only read by the upcalls.
  */
 static struct svc_rdma_listener svc_rdma_the_listener;
 
@@ -1862,11 +1528,9 @@ svc_rdma_nfsd_listen(SVCPOOL *pool, int port)
 		return (EINVAL);
 
 	/*
-	 * Snapshot the verbs table and arm the in-flight refcount under the
-	 * lock (the modular-build UAF guard, identical to the bring-up sysctl), then
-	 * issue the blocking verbs call with the lock dropped.  Refuse to arm
-	 * while unregister is stopping the table: treat an in-progress
-	 * unregister as "nfsrdma going away" and return ENXIO.
+	 * Snapshot the table and arm the in-flight count under the lock, then
+	 * make the blocking call with it dropped.  Arming is refused while
+	 * unregister is stopping the table, which returns ENXIO.
 	 */
 	mtx_lock(&svc_rdma_verbs_lock);
 	ops = svc_rdma_verbs;

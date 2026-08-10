@@ -1,7 +1,8 @@
-.PATH:	${SRCTOP}/sys/ofed/drivers/infiniband/ulp/nfsrdma
+.PATH:	${SRCTOP}/sys/ofed/drivers/infiniband/ulp/nfsrdma ${SRCTOP}/sys/rpc
 
 KMOD=	nfsrdma
-SRCS=	svc_verbs.c nfsrdma_sink.c nfsrdma_decode.c nfsrdma_data.c nfsrdma_conn.c
+SRCS=	svc_verbs.c nfsrdma_sink.c nfsrdma_decode.c nfsrdma_data.c
+SRCS+=	nfsrdma_conn.c svc_rdma.c
 SRCS+=	${LINUXKPI_GENSRCS}
 SRCS+=	opt_inet.h opt_inet6.h opt_ofed.h
 

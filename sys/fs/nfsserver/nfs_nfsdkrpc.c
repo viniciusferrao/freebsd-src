@@ -120,53 +120,10 @@ VNET_DEFINE(struct nfsv4lock, nfsd_suspend_lock);
 
 VNET_DEFINE_STATIC(bool, nfsrvd_inited) = false;
 
-/*
- * NFS-over-RDMA listen hook.  svc_rdma_nfsd_listen() is a base kernel symbol
- * exported by the krpc RDMA transport (sys/rpc/svc_rdma.c, built whenever the
- * krpc server stack is).  It starts/stops the RDMA-CM listener bound to THIS nfsd's
- * SVCPOOL (VNET(nfsrvd_pool)), so accepted RDMA connections register as SVCXPRTs
- * in the nfsd pool and the existing nfsd dispatch serves them -- the FreeBSD
- * analogue of Linux's `echo "rdma 20049" > /proc/fs/nfsd/portlist`.
- *
- * vfs.nfsd.rdma_listen: write a nonzero port to start, 0 to stop.  The sysctl is
- * always present; the handler returns ENXIO until nfsrdma (the verbs module that
- * registers the RDMA transport) is kldloaded.  This is the bring-up control; a
- * netconfig-driven path (rdma/rdma6 netids) is the clean end state.
- */
-
-/* Last started RDMA port for read-back; 0 means the listener is down. */
-VNET_DEFINE_STATIC(int, nfsrvd_rdma_port) = 0;
-
-static int
-sysctl_nfsd_rdma_listen(SYSCTL_HANDLER_ARGS)
-{
-	int error, port;
-
-	port = VNET(nfsrvd_rdma_port);
-	error = sysctl_handle_int(oidp, &port, 0, req);
-	if (error != 0 || req->newptr == NULL)
-		return (error);
-	if (port < 0 || port > 65535)
-		return (EINVAL);
-
-	/*
-	 * The nfsd pool must exist (nfsd has been initialized) before we can
-	 * register RDMA transports into it.  nfsrvd_init() creates it; a NULL
-	 * pool means the server has not started.
-	 */
-	if (port != 0 && VNET(nfsrvd_pool) == NULL)
-		return (ENXIO);
-
-	error = svc_rdma_nfsd_listen(VNET(nfsrvd_pool), port);
-	if (error == 0)
-		VNET(nfsrvd_rdma_port) = port;
-	return (error);
-}
-SYSCTL_PROC(_vfs_nfsd, OID_AUTO, rdma_listen,
-    CTLTYPE_INT | CTLFLAG_VNET | CTLFLAG_MPSAFE | CTLFLAG_RW, NULL, 0,
-    sysctl_nfsd_rdma_listen, "I",
-    "Nonzero port starts the NFS-over-RDMA listener on the nfsd pool, 0 stops "
-    "it; ENXIO if nfsrdma is not loaded or nfsd has not started");
+/* Server RDMA listen hook, set by nfsrdma at MOD_LOAD. */
+svc_rdma_listen_ftype *svc_rdma_listen = NULL;
+/* Last started RDMA port; 0 means the listener is down. */
+int nfsrvd_rdma_port = 0;
 
 /*
  * NFS server system calls
@@ -668,6 +625,22 @@ nfsrvd_nfsd(struct thread *td, struct nfsd_nfsd_args *args)
 		VNET(nfsrv_numnfsd)++;	/* Num for this vnet. */
 
 		NFSD_UNLOCK();
+		/*
+		 * Start the RDMA listener now that this vnet has an nfsd to
+		 * serve it.  The pool exists from nfsd load, but nothing runs
+		 * on it until here, so this is the point where a listener can
+		 * usefully accept.
+		 */
+		if (!jailed(curthread->td_ucred) && svc_rdma_listen != NULL &&
+		    nfsrvd_rdma_port != 0) {
+			error = (*svc_rdma_listen)(VNET(nfsrvd_pool),
+			    nfsrvd_rdma_port);
+			if (error != 0) {
+				printf("nfsrvd_nfsd: RDMA listen failed=%d\n",
+				    error);
+				nfsrvd_rdma_port = 0;
+			}
+		}
 		error = nfsrv_createdevids(args, td);
 		if (error == 0) {
 			/* An empty string implies AUTH_SYS only. */
@@ -744,14 +717,18 @@ nfsrvd_init(int terminating)
 		VNET(nfsd_master_proc) = NULL;
 		NFSD_UNLOCK();
 		/*
-		 * Stop the NFS-over-RDMA listener before closing the pool, so no
-		 * newly-accepted RDMA connection can xprt_register into a pool
-		 * that is being torn down.  svc_rdma_nfsd_listen(_, 0) only needs
-		 * the verbs table (it ignores the pool argument on stop) and is a
-		 * no-op if no listener is up or nfsrdma is not loaded.
+		 * Stop the NFS-over-RDMA listener before closing the pool, so
+		 * no newly-accepted RDMA connection can xprt_register into a
+		 * pool that is being torn down.  The hook is NULL until
+		 * nfsrdma is loaded, and stopping ignores the pool argument.
 		 */
-		(void)svc_rdma_nfsd_listen(VNET(nfsrvd_pool), 0);
-		VNET(nfsrvd_rdma_port) = 0;
+		if (!jailed(curthread->td_ucred) && svc_rdma_listen != NULL)
+			(void)(*svc_rdma_listen)(VNET(nfsrvd_pool), 0);
+		/*
+		 * Keep nfsrvd_rdma_port: it is the administrator's setting, not
+		 * listener state.  Clearing it here would mean RDMA silently
+		 * failed to come back the next time nfsd started.
+		 */
 		nfsrv_freealllayoutsanddevids();
 		nfsrv_freeallbackchannel_xprts();
 		svcpool_close(VNET(nfsrvd_pool));

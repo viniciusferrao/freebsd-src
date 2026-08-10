@@ -29,21 +29,8 @@
 #include "nfsrdma_var.h"
 
 /*
- * ===========================================================================
- * Cross-module verbs-ops registration with the krpc layer.
- *
- * Module layering.  The SVCXPRT/krpc consumer lives in sys/rpc/svc_rdma.c, built
- * into the kernel with nfsd; the verbs live here in nfsrdma.ko.  The krpc layer
- * exports svc_rdma_register_verbs()/svc_rdma_unregister_verbs() (declared in
- * <rpc/svc_rdma.h>); this module declares MODULE_DEPEND on krpc, so those
- * symbols are resolved at load.  We hand krpc a table of our verbs entry points
- * at module load and revoke it at module unload; krpc reaches the verbs ONLY
- * through this table and refuses RDMA (ENXIO) when it is absent.
- *
- * ibcore_verbs_ops is a file-static const table -- it is the krpc registration's
- * "ops must outlive the registration window" object.  It is valid for the whole
- * lifetime of this module's text, and we svc_rdma_unregister_verbs() before that
- * text can go away (MOD_UNLOAD below), so krpc never holds a dangling table.
+ * Verbs entry points krpc calls into.  The table must outlive its
+ * registration, so it is static for the life of the module text.
  */
 static const struct svc_rdma_verbs_ops ibcore_verbs_ops = {
 	.svo_listen_start	= svc_rdma_listen_start_ops,
@@ -63,57 +50,13 @@ static const struct svc_rdma_verbs_ops ibcore_verbs_ops = {
 };
 
 /*
- * Module lifecycle.  This file is the NFS-over-RDMA server verbs layer, shipped
- * as the loadable nfsrdma.ko (sys/modules/nfsrdma) -- an InfiniBand upper-layer
- * protocol, like ipoib.  It is module-only: svc_verbs.c is not in
- * sys/conf/files, so there is no built-in variant to sequence against and all
- * load/unload work belongs in the module event handler.
+ * Unload order: deregister the vm_lowmem handler before draining the sink
+ * cache, revoke the verbs table before stopping the listener, destroy the
+ * locks last.
  *
- * Dependencies (MODULE_DEPEND below):
- *   ibcore   -- the IB verbs/RDMA-CM core this code drives (imported syms);
- *   krpc     -- the base svc_rdma.c SVCXPRT layer we register with
- *               (svc_rdma_register_verbs, M_NFSRDMA), built in with nfsd;
- *   linuxkpi -- the compat layer this OFED code is written against.
- *
- * The ibcore dependency is what makes the teardown below safe.  Every verbs and
- * CM call on the unload path -- rdma_destroy_id() on the listening ids, and the
- * per-connection rdma_disconnect/ib_drain_qp/rdma_destroy_id that the teardown
- * tasks run -- needs the CM core and the provider still alive.  MODULE_DEPEND
- * holds a reference on ibcore for as long as this module is loaded, so ibcore
- * cannot unload before we do and the core is live for the whole of MOD_UNLOAD.
- *
- * Unload order is load-bearing:
- *   1. drop the vm_lowmem handler -- EVENTHANDLER_DEREGISTER waits for an
- *      in-flight svc_rdma_sink_reclaim, so it cannot race the drain in step 4;
- *   2. revoke the verbs table -- krpc's pointer goes NULL and its bring-up
- *      returns ENXIO, so no NEW listen can start against text about to be
- *      freed.  svc_rdma_unregister_verbs() drains in-flight callers and
- *      itself calls svo_listen_stop() on the outgoing table, tearing a live
- *      listener down THROUGH the still-valid verbs path rather than
- *      orphaning callbacks into freed text;
- *   3. svc_rdma_listen_stop() again -- idempotent (sl_id/sl_id6 already NULL,
- *      registry already empty), and the belt-and-braces path if this module was
- *      never the registered owner;
- *   4. drain the sink recycle cache, now that every connection has torn
- *      down and returned its buffers;
- *   5. destroy the locks last, once nothing can take them.
- *
- * A failed MOD_LOAD deliberately does NOT unwind inline.
- * module_register_init() (kern_module.c) calls MOD_EVENT(MOD_LOAD) and, on any
- * nonzero return, immediately calls MOD_EVENT(MOD_UNLOAD) on the same handler
- * before releasing the module.  MOD_UNLOAD is therefore the single teardown
- * path, and it is already correct after a failed registration:
- * svc_rdma_unregister_verbs() is owner-keyed and no-ops when we never became
- * the owner, svc_rdma_listen_stop() finds NULL cm_ids and an empty registry,
- * svc_rdma_sink_drain() an empty cache, and every lock is destroyed exactly
- * once.  Unwinding here would destroy the locks that the follow-up MOD_UNLOAD
- * then locks and destroys again.
- * module_release() drops the module from its linker file afterwards, so a later
- * kldunload cannot deliver a second MOD_UNLOAD.
- *
- * The error is not visible to kldload(8) -- module_register_init() is a void
- * SYSINIT callback -- so a failed registration leaves this module resident but
- * inert: krpc's verbs table stays NULL and its bring-up returns ENXIO.
+ * MOD_LOAD must not unwind on failure.  module_register_init() calls
+ * MOD_UNLOAD itself when MOD_LOAD returns nonzero, so unwinding here would
+ * destroy the locks twice.
  */
 static int
 nfsrdma_evhand(module_t mod __unused, int event, void *arg __unused)
@@ -133,14 +76,20 @@ nfsrdma_evhand(module_t mod __unused, int event, void *arg __unused)
 			    error);
 			break;
 		}
-		/*
-		 * Make the sink recycle cache elastic: give it back under
-		 * memory pressure.
-		 */
+		svc_rdma_publish_listen(true);
 		svc_rdma_sink_lowmem_tag = EVENTHANDLER_REGISTER(vm_lowmem,
 		    svc_rdma_sink_reclaim, NULL, EVENTHANDLER_PRI_ANY);
 		break;
 	case MOD_UNLOAD:
+		/*
+		 * Refuse while nfsd is running: its pool holds SVCXPRTs whose
+		 * ops live in this module's text.
+		 */
+		if (svc_rdma_nfsd_running()) {
+			error = EBUSY;
+			break;
+		}
+		svc_rdma_publish_listen(false);
 		if (svc_rdma_sink_lowmem_tag != NULL) {
 			EVENTHANDLER_DEREGISTER(vm_lowmem,
 			    svc_rdma_sink_lowmem_tag);
@@ -171,4 +120,5 @@ DECLARE_MODULE(nfsrdma, nfsrdma_mod, SI_SUB_OFED_MODINIT, SI_ORDER_ANY);
 MODULE_VERSION(nfsrdma, 1);
 MODULE_DEPEND(nfsrdma, ibcore, 1, 1, 1);
 MODULE_DEPEND(nfsrdma, krpc, 1, 1, 1);
+MODULE_DEPEND(nfsrdma, nfsd, 1, 1, 1);
 MODULE_DEPEND(nfsrdma, linuxkpi, 1, 1, 1);
