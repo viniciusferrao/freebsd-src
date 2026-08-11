@@ -186,7 +186,7 @@ nfssvc_program(struct svc_req *rqst, SVCXPRT *xprt)
 	nd.nd_mreq = NULL;
 	nd.nd_cred = NULL;
 
-	if (VNET(nfs_privport) != 0) {
+	if (VNET(nfs_privport) != 0 && rqst->rq_xprt->xp_socket != NULL) {
 		/* Check if source port is privileged */
 		u_short port;
 		struct sockaddr *nam = nd.nd_nam;
