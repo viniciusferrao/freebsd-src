@@ -186,7 +186,7 @@ nfssvc_program(struct svc_req *rqst, SVCXPRT *xprt)
 	nd.nd_mreq = NULL;
 	nd.nd_cred = NULL;
 
-	if (VNET(nfs_privport) != 0 && rqst->rq_xprt->xp_socket != NULL) {
+	if (VNET(nfs_privport) != 0 && xprt->xp_socket != NULL) {
 		/* Check if source port is privileged */
 		u_short port;
 		struct sockaddr *nam = nd.nd_nam;
@@ -337,6 +337,10 @@ nfssvc_program(struct svc_req *rqst, SVCXPRT *xprt)
 		if ((nfsrv_mextpg || xprt->xp_extpg) && nd.nd_nam2 == NULL &&
 		    PMAP_HAS_DMAP != 0)
 			nd.nd_flag |= ND_CANEXTPG;
+
+		/* If the xprt xp_socket == NULL, this is a RDMA call. */
+		if (xprt->xp_socket == NULL)
+			nd.nd_flag |= ND_RDMA;
 #ifdef MAC
 		mac_cred_associate_nfsd(nd.nd_cred);
 #endif

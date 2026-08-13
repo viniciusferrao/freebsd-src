@@ -149,6 +149,14 @@ struct cf_conn {  /* kept in xprt->xp_p1 for actual connection */
 
 void rpcnl_init(void);
 
+struct rpcrdma_reduce {
+	struct iovec	*iov;
+	uint32_t	xid;
+	uint32_t	off;
+	uint32_t	len;
+	uint8_t		into_mem;
+};
+
 #endif	/* _KERNEL */
 
 #endif	/* _RPC_KRPC_H_ */

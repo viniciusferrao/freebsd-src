@@ -58,6 +58,7 @@
 #include <rpc/rpc.h>
 #include <rpc/rpc_com.h>
 #include <rpc/krpc.h>
+#include <rpc/svc.h>
 
 #include <rpc/svc_rdma.h>
 
@@ -98,6 +99,8 @@ SYSCTL_PROC(_vfs_nfsd, OID_AUTO, rdma_listen,
     sysctl_nfsd_rdma_listen, "I",
     "RDMA port for the NFS server, read when nfsd starts; 0 disables RDMA. "
     "ENXIO if nfsd is already running");
+
+static int svc_rdma_nfsd_listen(SVCPOOL *pool, int port);
 
 /*
  * Publish or withdraw the listen hook nfsd calls, from the module event
@@ -1072,7 +1075,7 @@ static bool_t
 svc_rdma_xprt_control(SVCXPRT *xprt, const u_int rq, void *in)
 {
 	struct svc_rdma_xprt *xr = (struct svc_rdma_xprt *)xprt->xp_p1;
-	const struct svcxprt_readddp *rd;
+	const struct rpcrdma_reduce *rd;
 
 	switch (rq) {
 	case SVCSET_READDDP:
@@ -1084,10 +1087,10 @@ svc_rdma_xprt_control(SVCXPRT *xprt, const u_int rq, void *in)
 		 */
 		if (xr == NULL || in == NULL)
 			return (FALSE);
-		rd = (const struct svcxprt_readddp *)in;
-		if (rd->rd_len == 0)
+		rd = (const struct rpcrdma_reduce *)in;
+		if (rd->len == 0)
 			return (FALSE);
-		svc_rdma_readddp_set(xr, rd->rd_xid, rd->rd_off, rd->rd_len);
+		svc_rdma_readddp_set(xr, rd->xid, rd->off, rd->len);
 		return (TRUE);
 	default:
 		return (FALSE);
@@ -1516,7 +1519,7 @@ svc_rdma_unregister_verbs(const struct svc_rdma_verbs_ops *ops)
  */
 static struct svc_rdma_listener svc_rdma_the_listener;
 
-int
+static int
 svc_rdma_nfsd_listen(SVCPOOL *pool, int port)
 {
 	const struct svc_rdma_verbs_ops *ops;

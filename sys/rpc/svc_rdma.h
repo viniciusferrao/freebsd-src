@@ -278,4 +278,9 @@ bool	svc_rdma_nfsd_running(void);
 int	svc_rdma_register_verbs(const struct svc_rdma_verbs_ops *ops);
 void	svc_rdma_unregister_verbs(const struct svc_rdma_verbs_ops *ops);
 
+/*
+ * SVCSET_READDDP tells the transport where the read data sits in the NFS
+ * reply body, for RFC 8166 reduction.  `in' points at a rpcrdma_reduce.
+ */
+
 #endif	/* _RDMA_SVC_RDMA_H */
