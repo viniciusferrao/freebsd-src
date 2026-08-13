@@ -133,7 +133,7 @@ static void		pci_unmask_msix(device_t dev, u_int index);
 static int		pci_msi_blacklisted(void);
 static int		pci_msix_blacklisted(void);
 static void		pci_resume_msi(device_t dev);
-static void		pci_resume_msix(device_t dev);
+static void		pci_resume_msix(device_t dev, bool use_method);
 static struct pci_devinfo * pci_fill_devinfo(device_t pcib, device_t bus, int d,
     int b, int s, int f, uint16_t vid, uint16_t did);
 
@@ -1742,7 +1742,7 @@ pci_enable_msix_method(device_t dev, device_t child, u_int index,
 		pci_write_config(child,
 		    msix->msix_location + PCIR_MSIX_CTRL,
 		    msix->msix_ctrl & ~PCIM_MSIXCTRL_MSIX_ENABLE, 2);
-		pci_resume_msix(child);
+		pci_resume_msix(child, false);
 	} else
 		pci_write_msix_entry(child, index, address, data);
 
@@ -1804,10 +1804,18 @@ pci_pending_msix(device_t dev, u_int index)
 /*
  * Restore MSI-X registers and table during resume.  If MSI-X is
  * enabled then walk the virtual table to restore the actual MSI-X
- * table.
+ * table.  Message writes go through the pci_enable_msix method, as at
+ * enable time, so a bus driver that owns the message (e.g. pseries,
+ * where the hypervisor programs it and the table of a passthrough
+ * device must not be written by the guest) covers this path too.  The
+ * default method's whole-table rewrite (pci_msix_rewrite_table) calls
+ * back with use_method == false to write the table directly rather
+ * than recursing; that callback is bounded to one level, and on hosts
+ * with the rewrite quirk resume is quadratic in table entries, the
+ * same cost the quirk already has at enable time.
  */
 static void
-pci_resume_msix(device_t dev)
+pci_resume_msix(device_t dev, bool use_method)
 {
 	struct pci_devinfo *dinfo = device_get_ivars(dev);
 	struct pcicfg_msix *msix = &dinfo->cfg.msix;
@@ -1828,8 +1836,12 @@ pci_resume_msix(device_t dev)
 			if (mte->mte_vector == 0 || mte->mte_handlers == 0)
 				continue;
 			mv = &msix->msix_vectors[mte->mte_vector - 1];
-			pci_write_msix_entry(dev, i, mv->mv_address,
-			    mv->mv_data);
+			if (use_method)
+				pci_enable_msix(dev, i, mv->mv_address,
+				    mv->mv_data);
+			else
+				pci_write_msix_entry(dev, i, mv->mv_address,
+				    mv->mv_data);
 			pci_unmask_msix(dev, i);
 		}
 	}
@@ -6688,7 +6700,7 @@ pci_cfg_restore(device_t dev, struct pci_devinfo *dinfo)
 	if (dinfo->cfg.msi.msi_location != 0)
 		pci_resume_msi(dev);
 	if (dinfo->cfg.msix.msix_location != 0)
-		pci_resume_msix(dev);
+		pci_resume_msix(dev, true);
 
 #ifdef PCI_IOV
 	/* The SR-IOV capability is implemented only by PFs. */

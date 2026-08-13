@@ -131,6 +131,21 @@ must_bounce(bus_dma_tag_t dmat, bus_addr_t paddr)
 	return (false);
 }
 
+/*
+ * Report whether DMA through this tag is a 1:1 mapping of the physical
+ * address, allowing a consumer (e.g. LinuxKPI) to bypass the bus_dma
+ * machinery.  With an IOMMU (PAPR TCE/DDW window) the address is translated,
+ * so it is never 1:1; otherwise it is 1:1 only if the tag can never bounce.
+ */
+static bool
+bounce_bus_dma_id_mapped(bus_dma_tag_t dmat, vm_paddr_t buf __unused,
+    bus_size_t buflen __unused)
+{
+	if (dmat->iommu != NULL)
+		return (false);
+	return ((dmat->bounce_flags & BF_COULD_BOUNCE) == 0);
+}
+
 static int
 bounce_bus_dma_zone_setup(bus_dma_tag_t newtag)
 {
@@ -789,4 +804,5 @@ struct bus_dma_impl bus_dma_bounce_impl = {
 	.map_unload = bounce_bus_dmamap_unload,
 	.map_sync = bounce_bus_dmamap_sync,
 	.set_iommu = bounce_bus_dma_tag_set_iommu,
+	.id_mapped = bounce_bus_dma_id_mapped,
 };

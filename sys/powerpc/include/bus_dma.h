@@ -36,6 +36,20 @@
 #include <machine/bus_dma_impl.h>
 
 /*
+ * Is the DMA address a 1:1 mapping of the physical address?  Used by
+ * consumers (e.g. LinuxKPI) to decide whether the bus_dma machinery can be
+ * short-circuited.  With an IOMMU (PAPR TCE window) the answer is no.
+ */
+static inline bool
+bus_dma_id_mapped(bus_dma_tag_t dmat, vm_paddr_t buf, bus_size_t buflen)
+{
+	struct bus_dma_tag_common *tc;
+
+	tc = (struct bus_dma_tag_common *)dmat;
+	return (tc->impl->id_mapped(dmat, buf, buflen));
+}
+
+/*
  * Allocate a handle for mapping from kva/uva/physical
  * address space into bus device space.
  */

@@ -292,15 +292,22 @@ dma_sync_single_for_device(struct device *dev, dma_addr_t dma,
 {
 	bus_dmasync_op_t op;
 
+	/*
+	 * DMA_TO_DEVICE is a memory-to-device transfer: the CPU's data
+	 * must be flushed (and copied into a bounce page, where one is in
+	 * use) before the device reads, which is BUS_DMASYNC_PREWRITE.
+	 * DMA_FROM_DEVICE prepares the buffer for a device-to-memory
+	 * transfer, which is BUS_DMASYNC_PREREAD.
+	 */
 	switch (direction) {
 	case DMA_BIDIRECTIONAL:
-		op = BUS_DMASYNC_PREWRITE;
+		op = BUS_DMASYNC_PREREAD | BUS_DMASYNC_PREWRITE;
 		break;
 	case DMA_TO_DEVICE:
-		op = BUS_DMASYNC_PREREAD;
+		op = BUS_DMASYNC_PREWRITE;
 		break;
 	case DMA_FROM_DEVICE:
-		op = BUS_DMASYNC_PREWRITE;
+		op = BUS_DMASYNC_PREREAD;
 		break;
 	default:
 		return;

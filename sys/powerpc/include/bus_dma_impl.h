@@ -76,6 +76,8 @@ struct bus_dma_impl {
 	void (*map_sync)(bus_dma_tag_t dmat, bus_dmamap_t map,
 	    bus_dmasync_op_t op);
 	int (*set_iommu)(bus_dma_tag_t dmat, device_t iommu, void *cookie);
+	bool (*id_mapped)(bus_dma_tag_t dmat, vm_paddr_t buf,
+	    bus_size_t buflen);
 };
 
 extern struct bus_dma_impl bus_dma_bounce_impl;
