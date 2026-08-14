@@ -120,6 +120,11 @@ VNET_DEFINE(struct nfsv4lock, nfsd_suspend_lock);
 
 VNET_DEFINE_STATIC(bool, nfsrvd_inited) = false;
 
+/* Server RDMA listen hook, set by nfsrdma at MOD_LOAD. */
+svc_rdma_listen_ftype *svc_rdma_listen = NULL;
+/* Last started RDMA port; 0 means the listener is down. */
+int nfsrvd_rdma_port = 0;
+
 /*
  * NFS server system calls
  */
@@ -181,7 +186,7 @@ nfssvc_program(struct svc_req *rqst, SVCXPRT *xprt)
 	nd.nd_mreq = NULL;
 	nd.nd_cred = NULL;
 
-	if (VNET(nfs_privport) != 0) {
+	if (VNET(nfs_privport) != 0 && xprt->xp_socket != NULL) {
 		/* Check if source port is privileged */
 		u_short port;
 		struct sockaddr *nam = nd.nd_nam;
@@ -332,6 +337,10 @@ nfssvc_program(struct svc_req *rqst, SVCXPRT *xprt)
 		if ((nfsrv_mextpg || xprt->xp_extpg) && nd.nd_nam2 == NULL &&
 		    PMAP_HAS_DMAP != 0)
 			nd.nd_flag |= ND_CANEXTPG;
+
+		/* If the xprt xp_socket == NULL, this is a RDMA call. */
+		if (xprt->xp_socket == NULL)
+			nd.nd_flag |= ND_RDMA;
 #ifdef MAC
 		mac_cred_associate_nfsd(nd.nd_cred);
 #endif
@@ -620,6 +629,22 @@ nfsrvd_nfsd(struct thread *td, struct nfsd_nfsd_args *args)
 		VNET(nfsrv_numnfsd)++;	/* Num for this vnet. */
 
 		NFSD_UNLOCK();
+		/*
+		 * Start the RDMA listener now that this vnet has an nfsd to
+		 * serve it.  The pool exists from nfsd load, but nothing runs
+		 * on it until here, so this is the point where a listener can
+		 * usefully accept.
+		 */
+		if (!jailed(curthread->td_ucred) && svc_rdma_listen != NULL &&
+		    nfsrvd_rdma_port != 0) {
+			error = (*svc_rdma_listen)(VNET(nfsrvd_pool),
+			    nfsrvd_rdma_port);
+			if (error != 0) {
+				printf("nfsrvd_nfsd: RDMA listen failed=%d\n",
+				    error);
+				nfsrvd_rdma_port = 0;
+			}
+		}
 		error = nfsrv_createdevids(args, td);
 		if (error == 0) {
 			/* An empty string implies AUTH_SYS only. */
@@ -695,6 +720,19 @@ nfsrvd_init(int terminating)
 	if (terminating) {
 		VNET(nfsd_master_proc) = NULL;
 		NFSD_UNLOCK();
+		/*
+		 * Stop the NFS-over-RDMA listener before closing the pool, so
+		 * no newly-accepted RDMA connection can xprt_register into a
+		 * pool that is being torn down.  The hook is NULL until
+		 * nfsrdma is loaded, and stopping ignores the pool argument.
+		 */
+		if (!jailed(curthread->td_ucred) && svc_rdma_listen != NULL)
+			(void)(*svc_rdma_listen)(VNET(nfsrvd_pool), 0);
+		/*
+		 * Keep nfsrvd_rdma_port: it is the administrator's setting, not
+		 * listener state.  Clearing it here would mean RDMA silently
+		 * failed to come back the next time nfsd started.
+		 */
 		nfsrv_freealllayoutsanddevids();
 		nfsrv_freeallbackchannel_xprts();
 		svcpool_close(VNET(nfsrvd_pool));
