@@ -339,7 +339,7 @@ call_again:
 	} else {
 		/* Handle RDMA. */
 		if (clnt_bck_rdma_send != NULL) {
-			clnt_bck_rdma_send(xprt, mreq);
+			error = clnt_bck_rdma_send(xprt, mreq);
 			mreq = NULL;
 		} else
 			error = ENOTCONN;
@@ -629,4 +629,3 @@ clnt_bck_svccall(void *arg, struct mbuf *mrep, uint32_t xid)
 	if (foundreq == 0)
 		m_freem(mrep);
 }
-

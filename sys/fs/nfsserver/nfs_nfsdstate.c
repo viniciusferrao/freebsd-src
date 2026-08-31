@@ -4407,21 +4407,20 @@ nfsrv_docallback(struct nfsclient *clp, int procnum, nfsv4stateid_t *stateidp,
 	if (!error) {
 		if ((nd->nd_flag & ND_NFSV41) != 0) {
 			KASSERT(sep != NULL, ("sep NULL"));
-			if (sep->sess_cbsess.nfsess_xprt != NULL)
+			if (sep->sess_cbsess.nfsess_xprt != NULL &&
+			    sep->sess_cbsess.nfsess_xprt->xp_p2 != NULL)
 				error = newnfs_request(nd, NULL, clp,
 				    &clp->lc_req, NULL, NULL, cred,
 				    clp->lc_program, clp->lc_req.nr_vers, NULL,
 				    1, NULL, &sep->sess_cbsess);
 			else {
 				/*
-				 * This should probably never occur, but if a
-				 * client somehow does an RPC without a
-				 * SequenceID Op that causes a callback just
-				 * after the nfsd threads have been terminated
-				 * and restarted we could conceivably get here
-				 * without a backchannel xprt.
+				 * An RDMA transport has no socket.  Without a
+				 * bound client, this xprt cannot send
+				 * callbacks.
 				 */
-				printf("nfsrv_docallback: no xprt\n");
+				printf("nfsrv_docallback: no usable "
+				    "backchannel xprt\n");
 				error = ECONNREFUSED;
 			}
 			NFSD_DEBUG(4, "aft newnfs_request=%d\n", error);
