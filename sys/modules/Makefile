@@ -182,6 +182,7 @@ SUBDIR=	\
 	${_io} \
 	${_ioat} \
         ${_ipoib} \
+        ${_nfsrdma} \
 	ipdivert \
 	${_ipfilter} \
 	${_ipfw} \
@@ -573,6 +574,7 @@ _rtw89=		rtw89
 .if ${MK_OFED} != "no" || defined(ALL_MODULES)
 _ibcore=	ibcore
 _ipoib=		ipoib
+_nfsrdma=	nfsrdma
 _iser=		iser
 _mthca=		mthca
 _rdma=		rdma
