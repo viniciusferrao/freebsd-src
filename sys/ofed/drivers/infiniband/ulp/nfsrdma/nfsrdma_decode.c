@@ -225,8 +225,9 @@ svc_rdma_decode_reply_chunk(const void *buf, uint32_t len, uint32_t *offp,
  * byte by byte and are endian- and alignment-safe.
  *
  * EBADMSG for a malformed header, EOPNOTSUPP for a well-formed one past a
- * cap.  On a nonzero return *out is undefined and no pointer into buf
- * escapes.
+ * cap.  Once the fixed prefix and version are valid, xid, credit and
+ * rdma_proc remain defined on error so the receive path can send ERR_CHUNK.
+ * No pointer into buf escapes on an error path.
  */
 int
 svc_rdma_parse_header(const void *buf, uint32_t len, struct svc_rdma_msg *out)
@@ -242,30 +243,30 @@ svc_rdma_parse_header(const void *buf, uint32_t len, struct svc_rdma_msg *out)
 	if (len < RPCRDMA_HDR_FIXED)
 		return (EBADMSG);
 
+	out->xid = be32dec((const char *)buf + 0);
+
 	/*
 	 * A version mismatch returns EPROTONOSUPPORT rather than EBADMSG, so
 	 * the recv path can answer RDMA_ERROR with ERR_VERS.  That reply needs
-	 * the real xid, and the prefix gate above proved word0 readable, so it
-	 * is stamped here.  No other out field is defined on this path.
+	 * the real xid, and the prefix gate above proved word0 readable.
 	 */
 	vers = be32dec((const char *)buf + 4);
-	if (vers != RPCRDMA_VERSION) {
-		out->xid = be32dec((const char *)buf + 0);
+	if (vers != RPCRDMA_VERSION)
 		return (EPROTONOSUPPORT);
-	}
+
+	out->credit = be32dec((const char *)buf + 8);
+	out->rdma_proc = be32dec((const char *)buf + 12);
 
 	/*
 	 * Only RDMA_MSG and RDMA_NOMSG carry chunk lists.  Any other proc is
-	 * well-formed but not a valid client-to-server v1 call, so it returns
-	 * EOPNOTSUPP and the connection closes.
+	 * not a valid client-to-server v1 call, so it returns EOPNOTSUPP.  The
+	 * receive path treats RDMA_DONE specially and answers the other values
+	 * with ERR_CHUNK.
 	 */
-	proc = be32dec((const char *)buf + 12);
+	proc = out->rdma_proc;
 	if (proc != RDMA_MSG && proc != RDMA_NOMSG)
 		return (EOPNOTSUPP);
 
-	out->xid     = be32dec((const char *)buf + 0);
-	out->credit  = be32dec((const char *)buf + 8);
-	out->rdma_proc = proc;
 	out->rd_nchunks = 0;
 	out->wr_nchunks = 0;
 	out->reply_present = false;

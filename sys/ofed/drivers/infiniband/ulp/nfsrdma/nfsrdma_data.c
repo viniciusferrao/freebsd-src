@@ -33,6 +33,8 @@ static int	svc_rdma_read_start(struct svc_rdma_conn *conn,
 	    struct svc_rdma_recv *rr, const struct svc_rdma_msg *msg, uint32_t len);
 static void	svc_rdma_repost(struct svc_rdma_conn *conn,
 	    struct svc_rdma_recv *rr);
+static void	svc_rdma_error_repost(struct svc_rdma_conn *conn,
+	    struct svc_rdma_recv *rr, uint32_t xid);
 static void	svc_rdma_wc_rdma_read(struct ib_cq *cq, struct ib_wc *wc);
 static void	svc_rdma_read_sink_detach(struct svc_rdma_conn *conn,
 	    struct svc_rdma_read_state *rs, void **bufp, u64 *dmap,
@@ -158,6 +160,22 @@ svc_rdma_wc_recv(struct ib_cq *cq, struct ib_wc *wc)
 }
 
 /*
+ * Report a request-local transport error and return its receive buffer to
+ * the RQ.  If the error cannot be sent, close to report the lost reply.
+ */
+static void
+svc_rdma_error_repost(struct svc_rdma_conn *conn, struct svc_rdma_recv *rr,
+    uint32_t xid)
+{
+
+	if (svc_rdma_send_error(conn, xid, ERR_CHUNK) != 0) {
+		svc_rdma_conn_close(conn);
+		return;
+	}
+	svc_rdma_repost(conn, rr);
+}
+
+/*
  * Parse and dispatch one received call, separate from the recv completion so
  * the ESTABLISHED handler can replay one held on sc_early.  The caller has
  * synced rr_buf and found the connection ready, so the gate below only catches
@@ -174,33 +192,51 @@ svc_rdma_dispatch_recv(struct svc_rdma_conn *conn, struct svc_rdma_recv *rr,
 	rc = svc_rdma_parse_header(rr->rr_buf, len, &msg);
 	if (rc != 0) {
 		/*
-		 * EBADMSG for a malformed header, EOPNOTSUPP for a well-formed
-		 * one over a cap.  The log is rate-limited, the arrival rate
-		 * being peer-controlled, and nothing is reposted on a
-		 * connection being torn down.
+		 * A short fixed prefix has no trustworthy version or xid, while
+		 * a version mismatch gets ERR_VERS.  For recognized version 1,
+		 * malformed or unsupported chunk metadata gets ERR_CHUNK.  The
+		 * connection remains usable.  RDMA_DONE is the one exception:
+		 * RFC 8166 requires receivers to discard it silently.
 		 */
-		if (ppsratecheck(&svc_rdma_log_last, &svc_rdma_log_pps, 5)) {
-			if (rc == EPROTONOSUPPORT)
+		if (rc == EPROTONOSUPPORT) {
+			if (ppsratecheck(&svc_rdma_log_last,
+			    &svc_rdma_log_pps, 5))
 				printf("nfsrdma: RPC-over-RDMA version unsupported "
 				    "xid=0x%08x, replying ERR_VERS and closing\n",
 				    msg.xid);
-			else if (rc == EOPNOTSUPP)
-				printf("nfsrdma: unsupported RPC-over-RDMA "
-				    "request (proc or over fixed cap), closing "
-				    "(%u bytes)\n", len);
-			else
+			svc_rdma_send_error(conn, msg.xid, ERR_VERS);
+			svc_rdma_conn_close(conn);
+			return;
+		}
+		if (len < RPCRDMA_HDR_FIXED) {
+			if (ppsratecheck(&svc_rdma_log_last,
+			    &svc_rdma_log_pps, 5))
 				printf("nfsrdma: malformed RPC-over-RDMA header "
 				    "(%u bytes), closing\n", len);
+			svc_rdma_conn_close(conn);
+			return;
 		}
-		/*
-		 * Only a version mismatch leaves a trustworthy xid, the parser
-		 * having proved the fixed prefix present, so it alone gets an
-		 * RDMA_ERROR.  The SEND takes the same gate and barrier as any
-		 * reply, so the following close drains it.
-		 */
-		if (rc == EPROTONOSUPPORT)
-			svc_rdma_send_error(conn, msg.xid, ERR_VERS);
-		svc_rdma_conn_close(conn);
+		if (msg.rdma_proc == RDMA_DONE) {
+			svc_rdma_repost(conn, rr);
+			return;
+		}
+		if (ppsratecheck(&svc_rdma_log_last, &svc_rdma_log_pps, 5))
+			printf("nfsrdma: unusable RPC-over-RDMA v1 header "
+			    "xid=0x%08x (%u bytes), replying ERR_CHUNK\n",
+			    msg.xid, len);
+		svc_rdma_error_repost(conn, rr, msg.xid);
+		return;
+	}
+
+	/* The transport and embedded RPC transaction identifiers must agree. */
+	if (msg.rdma_proc == RDMA_MSG &&
+	    (msg.rpc_len < sizeof(uint32_t) ||
+	    be32dec(msg.rpc) != msg.xid)) {
+		if (ppsratecheck(&svc_rdma_log_last, &svc_rdma_log_pps, 5))
+			printf("nfsrdma: RPC-over-RDMA v1 xid mismatch or "
+			    "missing inline xid (xid=0x%08x), replying "
+			    "ERR_CHUNK\n", msg.xid);
+		svc_rdma_error_repost(conn, rr, msg.xid);
 		return;
 	}
 
@@ -208,18 +244,39 @@ svc_rdma_dispatch_recv(struct svc_rdma_conn *conn, struct svc_rdma_recv *rr,
 	 * Route by chunk shape.  A read list means the body is not in our
 	 * memory yet, so read_start() copies the metadata and inline head into
 	 * the durable rr_rs and its completion assembles, dispatches and
-	 * reposts.  A bodyless RDMA_NOMSG with no read list is closed.
+	 * reposts.  A bodyless RDMA_NOMSG with no read list is an XDR error.
 	 */
 	if (msg.rdma_proc == RDMA_NOMSG && msg.rd_nchunks == 0) {
 		if (ppsratecheck(&svc_rdma_log_last, &svc_rdma_log_pps, 5))
 			printf("nfsrdma: RPC-over-RDMA v1 RDMA_NOMSG xid=0x%08x "
-			    "credit=%u no read list (bodyless), closing\n",
+			    "credit=%u no read list, replying ERR_CHUNK\n",
 			    msg.xid, msg.credit);
-		svc_rdma_conn_close(conn);
+		svc_rdma_error_repost(conn, rr, msg.xid);
 		return;
 	}
 
 	if (msg.rd_nchunks != 0) {
+		uint32_t pos = msg.reads[0].rc_position;
+
+		/*
+		 * The position is an aligned byte offset in the unreduced RPC
+		 * Payload stream.  With our one-position read engine, it cannot
+		 * be beyond the remaining inline stream; RDMA_NOMSG carries the
+		 * complete RPC message in a Position Zero Read chunk.
+		 */
+		if ((pos & (RPCRDMA_WORD - 1)) != 0 ||
+		    (msg.rdma_proc == RDMA_MSG && pos > msg.rpc_len) ||
+		    (msg.rdma_proc == RDMA_NOMSG && pos != 0)) {
+			if (ppsratecheck(&svc_rdma_log_last,
+			    &svc_rdma_log_pps, 5))
+				printf("nfsrdma: invalid read chunk "
+				    "position %u "
+				    "for %u-byte inline RPC (xid=0x%08x), "
+				    "replying ERR_CHUNK\n", pos, msg.rpc_len,
+				    msg.xid);
+			svc_rdma_error_repost(conn, rr, msg.xid);
+			return;
+		}
 		rc = svc_rdma_read_start(conn, rr, &msg, len);
 		if (rc != 0)
 			svc_rdma_conn_close(conn);
@@ -682,9 +739,9 @@ svc_rdma_wc_rdma_read(struct ib_cq *cq, struct ib_wc *wc)
 	struct svc_rdma_read_state *rs;
 	struct svc_rdma_recv *rr;
 	struct svc_rdma_conn *conn;
-	uint32_t pos, bodylen;
+	uint32_t pos, bodylen, inner_xid;
 	int rc;
-	bool ready, first;
+	bool ready, first, xid_valid;
 
 	/* Same single-workqueue-thread invariant as the other wc handlers. */
 	MPASS(cq->poll_ctx == IB_POLL_WORKQUEUE);
@@ -724,12 +781,11 @@ svc_rdma_wc_rdma_read(struct ib_cq *cq, struct ib_wc *wc)
 	}
 
 	/*
-	 * The splice point is where the read data belongs in the XDR stream,
-	 * clamped to the head length so a peer position cannot index past it.
-	 * Both lengths are capped, so their sum cannot overflow.
+	 * The receive path validated the splice point before posting the RDMA
+	 * Reads, so it is safe to use directly.  Both lengths are capped, so
+	 * their sum cannot overflow.
 	 */
 	pos = rs->rs_msg.reads[0].rc_position;
-	pos = min_t(uint32_t, pos, rs->rs_headlen);
 	bodylen = rs->rs_headlen + rs->rs_total;
 
 	/*
@@ -739,6 +795,33 @@ svc_rdma_wc_rdma_read(struct ib_cq *cq, struct ib_wc *wc)
 	 */
 	ib_dma_sync_single_for_cpu(conn->sc_id->device, rs->rs_dma,
 	    rs->rs_total, DMA_FROM_DEVICE);
+
+	/*
+	 * RDMA_NOMSG carries its xid at the start of the Position Zero Read
+	 * chunk.  For a nonzero splice, it remains at the start of rs_head.
+	 * A mismatch is a transport XDR error, not an RPC call for the ULP.
+	 */
+	if (pos == 0) {
+		xid_valid = (rs->rs_total >= sizeof(uint32_t));
+		if (xid_valid)
+			inner_xid = be32dec(rs->rs_buf);
+		else
+			inner_xid = 0;
+	} else {
+		xid_valid = true;
+		inner_xid = be32dec(rs->rs_head);
+	}
+	if (!xid_valid || bodylen < sizeof(uint32_t) ||
+	    inner_xid != rs->rs_msg.xid) {
+		if (ppsratecheck(&svc_rdma_log_last, &svc_rdma_log_pps, 5))
+			printf("nfsrdma: assembled RPC xid mismatch or missing "
+			    "xid (transport xid=0x%08x), replying ERR_CHUNK\n",
+			    rs->rs_msg.xid);
+		inner_xid = rs->rs_msg.xid;
+		svc_rdma_read_free(conn, rr);
+		svc_rdma_error_repost(conn, rr, inner_xid);
+		return;
+	}
 
 	/*
 	 * Assemble without copying the data: the chain is
