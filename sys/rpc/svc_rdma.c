@@ -42,6 +42,7 @@
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/endian.h>
+#include <sys/jail.h>
 #include <sys/kernel.h>
 #include <sys/lock.h>
 #include <sys/malloc.h>
@@ -53,12 +54,16 @@
 #include <sys/sysctl.h>
 #include <sys/time.h>
 
+#include <net/vnet.h>
+
 #include <netinet/in.h>
 
 #include <rpc/rpc.h>
 #include <rpc/rpc_com.h>
 #include <rpc/krpc.h>
 #include <rpc/svc.h>
+
+#include <fs/nfs/nfs_extern.h>
 
 #include <rpc/svc_rdma.h>
 
@@ -1134,10 +1139,6 @@ svc_rdma_xprt_destroy(SVCXPRT *xprt)
  * sro_newconn: allocate and register the SVCXPRT and bind it to the
  * connection, as svc_vc_create_conn does.  Sleepable and guaranteed before any
  * recv upcall.
- *
- * svc_reg() is deliberately not called per connection: it attaches the
- * dispatch callouts to the pool, not the transport, and nfsd populated those
- * when its first transport came up.
  */
 static void
 svc_rdma_sro_newconn(void *ctx, struct svc_rdma_conn *conn)
@@ -1164,6 +1165,12 @@ svc_rdma_sro_newconn(void *ctx, struct svc_rdma_conn *conn)
 	 * engine RDMA-Writes those data pages directly.
 	 */
 	xprt->xp_extpg = true;
+	if (!jailed(curthread->td_ucred)) {
+		CURVNET_SET(TD_TO_VNET(curthread));
+		nfsrv_svc_reg(xprt);
+		CURVNET_RESTORE();
+	}
+
 	/*
 	 * xp_idletimeout stays 0, so the reaper skips this transport: it calls
 	 * soshutdown() unconditionally on a timed-out one, and there is no
