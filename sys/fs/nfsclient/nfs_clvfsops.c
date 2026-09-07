@@ -958,7 +958,7 @@ nfs_mount(struct mount *mp)
 	    krbnamelen, srvkrbnamelen;
 	size_t hstlen;
 	uint32_t newflag;
-	int aconn = 0, rdma_port;
+	int aconn = 0, rdma_port = 0;	/* To shut up compiler. */
 
 	has_nfs_args_opt = 0;
 	has_nfs_from_opt = 0;
@@ -1544,7 +1544,11 @@ nfs_mount(struct mount *mp)
 			error = EINVAL;
 			goto out;
 		}
+#ifdef VIMAGE
 		error = rdma_check_route(vnet0, nam, NFSV4_CBSLOTS);
+#else
+		error = rdma_check_route(NULL, nam, NFSV4_CBSLOTS);
+#endif
 		if (error != 0) {
 			vfs_mount_error(mp, "rdma is not configured");
 			error = EINVAL;

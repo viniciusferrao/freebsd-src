@@ -8845,15 +8845,116 @@ linuxkpi_80211_wiphy_register(struct wiphy *wiphy)
 static uint32_t
 lkpi_cfg80211_calculate_bitrate_ht(struct rate_info *rate)
 {
-	TODO("cfg80211_calculate_bitrate_ht");
-	return (rate->legacy);
+	/*
+	 * IEEE Std 802.11-2024, 19.5 Parameters for HT-MCSs;
+	 * Tables Table 19-27-MCS NSS=1 800ns GI, and following.
+	 * We use 100Kbit/s entries, the expacted return scale.
+	 * We can calulate MCS0..31 entries.
+	 */
+	uint32_t r;
+	uint8_t nss, mcsidx;
+
+	if (rate->mcs > 31)
+		goto inval;
+
+	switch (rate->bw) {
+	case RATE_INFO_BW_20:
+		r = 65;
+		break;
+	case RATE_INFO_BW_40:
+		r = 135;
+		break;
+	default:
+		goto inval;
+		/* NOTREACHED */
+	}
+
+	nss = (rate->mcs >> 3) + 1;
+	mcsidx = rate->mcs & 0x07;
+
+	switch (mcsidx) {
+	case 0 ... 3:
+		r *= (mcsidx + 1);
+		break;
+	case 4:
+		r *= (mcsidx + 2);
+		break;
+	case 5 ... 7:
+		r *= (mcsidx + 3);
+		break;
+	default:
+		goto inval;
+		/* NOTREACHED */
+	}
+	r *= nss;
+	if ((rate->flags & RATE_INFO_FLAGS_SHORT_GI) != 0)
+		r = (r * 10) / 9;
+
+	return (r);
+
+inval:
+	/* Do not warn every time or we get too much spam on console! */
+	WARN_ONCE(1, "%s: rate mcs %u nss %u mcsidx %u invalid!\n",  __func__,
+	    rate->mcs, nss, mcsidx);
+	return (0);
 }
 
 static uint32_t
 lkpi_cfg80211_calculate_bitrate_vht(struct rate_info *rate)
 {
-	TODO("cfg80211_calculate_bitrate_vht");
-	return (rate->legacy);
+	/*
+	 * IEEE Std 802.11-2024, 21.5 Parameters for VHT-MCSs;
+	 * Tables 21-29 NSS=1 800ns GI, and following.
+	 * We use 100Kbit/s entries, the expacted return scale.
+	 */
+	static const uint16_t datarate[4][10] = {
+		/* BW20 */
+		{ 65, 130, 195, 260, 390, 520, 585, 650, 780, 0 },
+		/* BW40 */
+		{ 135, 270, 405, 540, 810, 1080, 1215, 1350, 1620, 1800 },
+		/* BW80 */
+		{ 293, 585, 878, 1170, 1755, 2340, 2633, 2925, 3510, 3900 },
+		/* BW160 */
+		{ 585, 1170, 1755, 2340, 3510, 4680, 5265, 5850, 7020, 7800 }
+	};
+	uint32_t r;
+	uint8_t bwidx;
+
+	/* Should we warn about out of bounds values? */
+	if (rate->mcs > 9 || rate->nss > 8)
+		goto inval;
+
+	switch (rate->bw) {
+	case RATE_INFO_BW_20:
+		bwidx = 0;
+		break;
+	case RATE_INFO_BW_40:
+		bwidx = 1;
+		break;
+	case RATE_INFO_BW_80:
+		bwidx = 2;
+		break;
+	case RATE_INFO_BW_160:
+		bwidx = 2;
+		break;
+	default:
+		goto inval;
+		/* NOTREACHED */
+	}
+
+	r = datarate[bwidx][rate->mcs];
+	/* Calculate the other NSS tables and the SGI column. */
+	r *= rate->nss;
+	if ((rate->flags & RATE_INFO_FLAGS_SHORT_GI) != 0)
+		r = (r * 10) / 9;
+
+	return (r);
+
+inval:
+	/* Do not warn every time or we get too much spam on console! */
+	WARN_ONCE(1, "%s: rate mcs %u nss %u bw %d (%s) invalid!\n",  __func__,
+	    rate->mcs, rate->nss, rate->bw, lkpi_rate_info_bw_to_str(rate->bw));
+	return (0);
 }
 
 uint32_t
@@ -9128,7 +9229,15 @@ linuxkpi_ieee80211_tx_status_ext(struct ieee80211_hw *hw,
 
 		IMPROVE("only update rate if needed but that requires us to get a proper rate from mo_sta_statistics");
 		ieee80211_ratectl_tx_complete(ni, &txs);
-		ieee80211_ratectl_rate(ni->ni_vap->iv_bss, NULL, 0);
+		/*
+		 * A tx completion can land here after the vap has been torn
+		 * down (iv_bss cleared on the way to INIT) while frames were
+		 * still in flight; there is no bss node left to rate-adjust.
+		 * This is another case of !lvif->lvif_bss_synched but checking
+		 * that seems too cumbersome.
+		 */
+		if (ni->ni_vap->iv_bss != NULL)
+			ieee80211_ratectl_rate(ni->ni_vap->iv_bss, NULL, 0);
 
 #ifdef LINUXKPI_DEBUG_80211
 		if (linuxkpi_debug_80211 & D80211_TRACE_TX) {
