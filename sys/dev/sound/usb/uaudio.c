@@ -725,7 +725,7 @@ static const STRUCT_USB_HOST_ID uaudio_vendor_audio[] = {
 	{ USB_VPI(USB_VENDOR_ROLAND, USB_PRODUCT_ROLAND_UA33, 0) },
 };
 
-/* The following table is derived from Linux's quirks-table.h */ 
+/* The following table is derived from Linux's quirks-table.h */
 static const STRUCT_USB_HOST_ID uaudio_vendor_midi[] = {
 	{ USB_VPI(USB_VENDOR_YAMAHA, USB_PRODUCT_YAMAHA_UX256, 0) },
 	{ USB_VPI(USB_VENDOR_YAMAHA, USB_PRODUCT_YAMAHA_MU1000, 0) },
@@ -1204,13 +1204,6 @@ uaudio_attach_sub(device_t dev, kobj_class_t mixer_class, kobj_class_t chan_clas
 		DPRINTF("device needs bitperfect by default\n");
 		uaudio_pcm_setflags(dev, SD_F_BITPERFECT);
 	}
-	if (mixer_init(dev, mixer_class, sc))
-		goto detach;
-	mix_set(sc->sc_child[i].mixer_dev, SOUND_MIXER_MONITOR,
-	    UAUDIO_DEFAULT_MONITOR, UAUDIO_DEFAULT_MONITOR);
-	sc->sc_child[i].mixer_init = 1;
-
-	mixer_hwvol_init(dev);
 
 	device_set_descf(dev, "%s %s",
 	    usb_get_manufacturer(sc->sc_udev),
@@ -1222,6 +1215,14 @@ uaudio_attach_sub(device_t dev, kobj_class_t mixer_class, kobj_class_t chan_clas
 	pcm_init(dev, sc);
 
 	uaudio_pcm_setflags(dev, SD_F_MPSAFE);
+
+	if (mixer_init(dev, mixer_class, sc))
+		goto detach;
+	mix_set(sc->sc_child[i].mixer_dev, SOUND_MIXER_MONITOR,
+	    UAUDIO_DEFAULT_MONITOR, UAUDIO_DEFAULT_MONITOR);
+	sc->sc_child[i].mixer_init = 1;
+
+	mixer_hwvol_init(dev);
 
 	if (sc->sc_play_chan[i].num_alt > 0) {
 		sc->sc_play_chan[i].priv_sc = sc;
@@ -1491,7 +1492,7 @@ uaudio_configure_msg_sub(struct uaudio_softc *sc,
 		/* FALLTHROUGH */
 	} else if (sc->sc_audio_rev >= UAUDIO_VERSION_20) {
 		unsigned int x;
-	  
+
 		for (x = 0; x != 256; x++) {
 			if (dir == PCMDIR_PLAY) {
 				if (!(sc->sc_mixer_clocks.bit_output[x / 8] &
@@ -2519,7 +2520,7 @@ tr_setup:
 				/* reset receive jitter counters */
 				ch_rec->jitter_curr = 0;
 				ch_rec->jitter_rem = 0;
-		
+
 				/* compute exact number of transmit jitter samples */
 				rx_rate = ch_rec->usb_alt[rec_alt].sample_rate;
 				ch->jitter_curr += tx_jitter / rx_rate;
@@ -2791,16 +2792,12 @@ uaudio_chan_free(struct uaudio_chan *ch)
 int
 uaudio_chan_set_param_blocksize(struct uaudio_chan *ch, uint32_t blocksize)
 {
-	uint32_t temp = 2 * uaudio_get_buffer_size(ch, ch->set_alt);
-	sndbuf_setup(ch->pcm_buf, ch->buf, temp);
-	return (temp / 2);
-}
+	uint32_t temp;
 
-int
-uaudio_chan_set_param_fragments(struct uaudio_chan *ch, uint32_t blocksize,
-    uint32_t blockcount)
-{
-	return (1);
+	temp = 2 * uaudio_get_buffer_size(ch, ch->set_alt);
+	if (sndbuf_setup(ch->pcm_buf, ch->buf, temp) != 0)
+		return (0);
+	return (temp / 2);
 }
 
 int
@@ -3588,7 +3585,7 @@ uaudio_mixer_check_selectors(struct uaudio_softc *sc)
 	uint16_t j;
 	uint16_t k;
 
-	/* remove existing selector types from the reserve */	
+	/* remove existing selector types from the reserve */
 	for (i = 0; i < MIX(sc).maxval; i++) {
 		if (MIX(sc).slctrtype[i] == SOUND_MIXER_NRDEVICES)
 			continue;
@@ -3929,7 +3926,7 @@ uaudio20_mixer_add_feature(struct uaudio_softc *sc,
 			MIX(sc).name = "mute";
 			what = MUTE_CONTROL;
 			break;
-		case (3 << 2): 
+		case (3 << 2):
 			MIX(sc).type = MIX_SIGNED_16;
 			MIX(sc).ctl = mixernumber;
 			MIX(sc).name = "vol";
@@ -5446,6 +5443,7 @@ uaudio20_set_speed(struct usb_device *udev, uint8_t iface_no,
     uint8_t clockid, uint32_t speed)
 {
 	struct usb_device_request req;
+	usb_error_t err;
 	uDWord data;
 
 	DPRINTFN(6, "ifaceno=%d clockid=%d speed=%u\n",
@@ -5458,7 +5456,27 @@ uaudio20_set_speed(struct usb_device *udev, uint8_t iface_no,
 	USETW(req.wLength, sizeof(data));
 	USETDW(data, speed);
 
-	return (usbd_do_request(udev, NULL, &req, data));
+	err = usbd_do_request(udev, NULL, &req, data);
+	if (err != USB_ERR_NORMAL_COMPLETION)
+		return (err);
+
+	/*
+	 * Read the rate back, because some devices only apply it once it has
+	 * been read, and produce no sound otherwise.
+	 */
+	req.bmRequestType = UT_READ_CLASS_INTERFACE;
+	USETDW(data, 0);
+
+	err = usbd_do_request(udev, NULL, &req, data);
+	if (err != USB_ERR_NORMAL_COMPLETION) {
+		DPRINTF("could not read sample rate back: %s\n",
+		    usbd_errstr(err));
+	} else if (UGETDW(data) != speed) {
+		DPRINTF("sample rate is %u Hz, expected %u Hz\n",
+		    UGETDW(data), speed);
+	}
+
+	return (USB_ERR_NORMAL_COMPLETION);
 }
 
 static int
@@ -5578,7 +5596,7 @@ uaudio_mixer_init_sub(struct uaudio_softc *sc, struct snd_mixer *m)
 int
 uaudio_mixer_uninit_sub(struct uaudio_softc *sc, struct snd_mixer *m)
 {
-  	unsigned index = uaudio_get_child_index_by_dev(sc, mix_get_dev(m));
+	unsigned index = uaudio_get_child_index_by_dev(sc, mix_get_dev(m));
 
 	DPRINTF("child=%u\n", index);
 
@@ -5594,7 +5612,7 @@ void
 uaudio_mixer_set(struct uaudio_softc *sc, struct snd_mixer *m,
     unsigned type, unsigned left, unsigned right)
 {
-    	unsigned index = uaudio_get_child_index_by_dev(sc, mix_get_dev(m));
+	unsigned index = uaudio_get_child_index_by_dev(sc, mix_get_dev(m));
 	struct uaudio_mixer_node *mc;
 	int chan;
 
@@ -5613,7 +5631,7 @@ uaudio_mixer_set(struct uaudio_softc *sc, struct snd_mixer *m,
 uint32_t
 uaudio_mixer_setrecsrc(struct uaudio_softc *sc, struct snd_mixer *m, uint32_t src)
 {
-      	unsigned index = uaudio_get_child_index_by_dev(sc, mix_get_dev(m));
+	unsigned index = uaudio_get_child_index_by_dev(sc, mix_get_dev(m));
 	struct uaudio_mixer_node *mc;
 	uint32_t mask;
 	uint32_t temp;
@@ -6223,8 +6241,12 @@ uaudio_hid_rx_callback(struct usb_xfer *xfer, usb_error_t error)
 	struct snd_mixer *m;
 	uint8_t id;
 	int actlen;
+	bool mute, volume_up, volume_down;
 
 	usbd_xfer_status(xfer, &actlen, NULL, NULL, NULL);
+
+	m = NULL;
+	mute = volume_up = volume_down = false;
 
 	switch (USB_GET_STATE(xfer)) {
 	case USB_ST_TRANSFERRED:
@@ -6247,7 +6269,7 @@ uaudio_hid_rx_callback(struct usb_xfer *xfer, usb_error_t error)
 		    &sc->sc_hid.mute_loc)) {
 			DPRINTF("Mute toggle\n");
 
-			mixer_hwvol_mute_locked(m);
+			mute = true;
 		}
 
 		if ((sc->sc_hid.flags & UAUDIO_HID_HAS_VOLUME_UP) &&
@@ -6256,7 +6278,7 @@ uaudio_hid_rx_callback(struct usb_xfer *xfer, usb_error_t error)
 		    &sc->sc_hid.volume_up_loc)) {
 			DPRINTF("Volume Up\n");
 
-			mixer_hwvol_step_locked(m, 1, 1);
+			volume_up = true;
 		}
 
 		if ((sc->sc_hid.flags & UAUDIO_HID_HAS_VOLUME_DOWN) &&
@@ -6265,7 +6287,7 @@ uaudio_hid_rx_callback(struct usb_xfer *xfer, usb_error_t error)
 		    &sc->sc_hid.volume_down_loc)) {
 			DPRINTF("Volume Down\n");
 
-			mixer_hwvol_step_locked(m, -1, -1);
+			volume_down = true;
 		}
 
 	case USB_ST_SETUP:
@@ -6286,6 +6308,27 @@ tr_setup:
 		}
 		break;
 	}
+
+	if (!mute && !volume_up && !volume_down)
+		return;
+
+	/*
+	 * The mixer_hwvol_*() functions take the mixer lock, which is the PCM
+	 * lock, and end up in uaudio_mixer_ctl_set(), which takes the
+	 * mixer_lock this callback is entered with. Acquiring the two in that
+	 * order here would reverse the order taken by the mixer ioctl path
+	 * (PCM lock first, then mixer_lock), so drop mixer_lock for the
+	 * duration. The USB stack explicitly allows a callback to drop its
+	 * transfer mutex, and usbd_transfer_drain() accounts for it.
+	 */
+	mtx_unlock(&sc->sc_child[0].mixer_lock);
+	if (mute)
+		mixer_hwvol_mute(m->dev);
+	if (volume_up)
+		mixer_hwvol_step(m->dev, 1, 1);
+	if (volume_down)
+		mixer_hwvol_step(m->dev, -1, -1);
+	mtx_lock(&sc->sc_child[0].mixer_lock);
 }
 
 static int
@@ -6375,7 +6418,7 @@ uaudio_hid_detach(struct uaudio_softc *sc)
 
 DRIVER_MODULE_ORDERED(snd_uaudio, uhub, uaudio_driver, NULL, NULL, SI_ORDER_ANY);
 MODULE_DEPEND(snd_uaudio, usb, 1, 1, 1);
-MODULE_DEPEND(snd_uaudio, sound, SOUND_MINVER, SOUND_PREFVER, SOUND_MAXVER);
+MODULE_DEPEND(snd_uaudio, sound, 1, 1, 1);
 MODULE_DEPEND(snd_uaudio, hid, 1, 1, 1);
 MODULE_VERSION(snd_uaudio, 1);
 USB_PNP_HOST_INFO(uaudio_devs);

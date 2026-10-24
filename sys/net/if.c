@@ -257,7 +257,7 @@ int	(*carp_iamatch_p)(struct ifaddr *, uint8_t **);
 #endif
 #ifdef INET6
 struct ifaddr *(*carp_iamatch6_p)(struct ifnet *ifp, struct in6_addr *taddr6);
-caddr_t	(*carp_macmatch6_p)(struct ifnet *ifp, struct mbuf *m,
+char *	(*carp_macmatch6_p)(struct ifnet *ifp, struct mbuf *m,
     const struct in6_addr *taddr);
 #endif
 
@@ -886,7 +886,7 @@ if_attach_internal(struct ifnet *ifp, bool vmove)
 		ifp->if_addr = ifa;
 		ifa->ifa_ifp = ifp;
 		ifa->ifa_addr = (struct sockaddr *)sdl;
-		sdl = (struct sockaddr_dl *)(socksize + (caddr_t)sdl);
+		sdl = (struct sockaddr_dl *)((char *)sdl + socksize);
 		ifa->ifa_netmask = (struct sockaddr *)sdl;
 		sdl->sdl_len = masklen;
 		while (namelen != 0)
@@ -1932,8 +1932,8 @@ next:				continue;
 				 */
 				if (ifa_maybe == NULL ||
 				    ifa_preferred(ifa_maybe, ifa) ||
-				    rn_refines((caddr_t)ifa->ifa_netmask,
-				    (caddr_t)ifa_maybe->ifa_netmask)) {
+				    rn_refines(ifa->ifa_netmask,
+				    ifa_maybe->ifa_netmask)) {
 					ifa_maybe = ifa;
 				}
 			}
@@ -2853,6 +2853,9 @@ ifhwioctl(u_long cmd, struct ifnet *ifp, caddr_t data, struct thread *td)
 
 	case SIOCADDMULTI:
 	case SIOCDELMULTI:
+	{
+		struct sockaddr_dl sa_dl;
+
 		if (cmd == SIOCADDMULTI)
 			error = priv_check(td, PRIV_NET_ADDMULTI);
 		else
@@ -2864,8 +2867,24 @@ ifhwioctl(u_long cmd, struct ifnet *ifp, caddr_t data, struct thread *td)
 		if ((ifp->if_flags & IFF_MULTICAST) == 0)
 			return (EOPNOTSUPP);
 
-		/* Don't let users screw up protocols' entries. */
+		/*
+		 * The sockaddr embedded in the ifreq is not large enough to
+		 * hold a full sockaddr_dl, but existing callers of these ioctls
+		 * will set sa_len = sizeof(struct sockaddr_dl) anyway.  Bounce
+		 * the sockaddr into a sockaddr_dl on the stack to avoid
+		 * potential out-of-bounds accesses.
+		 */
 		if (ifr->ifr_addr.sa_family != AF_LINK)
+			return (EINVAL);
+		memset(&sa_dl, 0, sizeof(sa_dl));
+		memcpy(&sa_dl, &ifr->ifr_addr,
+		    MIN(ifr->ifr_addr.sa_len, sizeof(ifr->ifr_addr)));
+		sa_dl.sdl_family = AF_LINK;
+		sa_dl.sdl_len = MIN(ifr->ifr_addr.sa_len, sizeof(sa_dl));
+		if (sa_dl.sdl_nlen + sa_dl.sdl_alen + sa_dl.sdl_slen >
+		    sizeof(ifr->ifr_addr) -
+		    offsetof(struct sockaddr_dl, sdl_data) ||
+		    sa_dl.sdl_nlen > IFNAMSIZ)
 			return (EINVAL);
 
 		if (cmd == SIOCADDMULTI) {
@@ -2880,18 +2899,20 @@ ifhwioctl(u_long cmd, struct ifnet *ifp, caddr_t data, struct thread *td)
 			 * already exists.
 			 */
 			NET_EPOCH_ENTER(et);
-			ifma = if_findmulti(ifp, &ifr->ifr_addr);
+			ifma = if_findmulti(ifp, (struct sockaddr *)&sa_dl);
 			NET_EPOCH_EXIT(et);
 			if (ifma != NULL)
 				error = EADDRINUSE;
 			else
-				error = if_addmulti(ifp, &ifr->ifr_addr, &ifma);
+				error = if_addmulti(ifp,
+				    (struct sockaddr *)&sa_dl, &ifma);
 		} else {
-			error = if_delmulti(ifp, &ifr->ifr_addr);
+			error = if_delmulti(ifp, (struct sockaddr *)&sa_dl);
 		}
 		if (error == 0)
 			getmicrotime(&ifp->if_lastchange);
 		break;
+	}
 
 	case SIOCSIFPHYADDR:
 	case SIOCDIFPHYADDR:
@@ -5085,6 +5106,12 @@ void
 if_setqflushfn(if_t ifp, if_qflush_fn_t flush_fn)
 {
 	ifp->if_qflush = flush_fn;
+}
+
+if_qflush_fn_t
+if_getqflushfn(if_t ifp)
+{
+	return (ifp->if_qflush);
 }
 
 void

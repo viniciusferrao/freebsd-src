@@ -37,7 +37,6 @@
 #include <sys/cdefs.h>
 #include "opt_inet.h"
 #include "opt_inet6.h"
-#include "opt_rss.h"
 
 #include <sys/param.h>
 #include <sys/jail.h>
@@ -73,18 +72,14 @@
 #include <netinet/in_var.h>
 #include <netinet/ip.h>
 #include <netinet/ip_var.h>
-#ifdef RSS
 #include <netinet/in_rss.h>
-#endif
 #endif
 
 #ifdef INET6
 #include <netinet/ip6.h>
 #include <netinet6/in6_var.h>
 #include <netinet6/ip6_var.h>
-#ifdef RSS
 #include <netinet6/in6_rss.h>
-#endif
 #endif
 
 #include <netinet/ip_encap.h>
@@ -144,7 +139,7 @@ static int	gre_set_encap_nl(struct gre_softc *, struct nl_pstate *, uint32_t);
 static int	gre_set_udp_sport_nl(struct gre_softc *, struct nl_pstate *, uint16_t);
 
 SYSCTL_DECL(_net_link);
-static SYSCTL_NODE(_net_link, IFT_TUNNEL, gre, CTLFLAG_RW | CTLFLAG_MPSAFE, 0,
+static SYSCTL_NODE(_net_link, OID_AUTO, gre, CTLFLAG_RW | CTLFLAG_MPSAFE, 0,
     "Generic Routing Encapsulation");
 #ifndef MAX_GRE_NEST
 /*
@@ -761,11 +756,8 @@ gre_input(struct mbuf *m, int off, int proto, void *arg)
 	hlen = off + sizeof(struct grehdr) + 4 * sizeof(uint32_t);
 	if (m->m_pkthdr.len < hlen)
 		goto drop;
-	if (m->m_len < hlen) {
-		m = m_pullup(m, hlen);
-		if (m == NULL)
-			goto drop;
-	}
+	if ((m = m_pullup(m, hlen)) == NULL)
+		goto drop;
 	gh = (struct grehdr *)mtodo(m, off);
 	flags = ntohs(gh->gre_flags);
 	if (flags & ~GRE_FLAGS_MASK)
@@ -830,6 +822,8 @@ gre_input(struct mbuf *m, int off, int proto, void *arg)
 	m_clrprotoflags(m);
 	m->m_pkthdr.rcvif = ifp;
 	M_SETFIB(m, ifp->if_fib);
+	if (V_encap_hash_inbound)
+		encap_set_flowid(m, af);
 #ifdef MAC
 	mac_ifnet_create_mbuf(ifp, m);
 #endif
@@ -894,25 +888,15 @@ gre_flowid(struct gre_softc *sc, struct mbuf *m, uint32_t af)
 	switch (af) {
 #ifdef INET
 	case AF_INET:
-#ifdef RSS
 		flowid = rss_hash_ip4_2tuple(mtod(m, struct ip *)->ip_src,
 		    mtod(m, struct ip *)->ip_dst);
 		break;
 #endif
-		flowid = mtod(m, struct ip *)->ip_src.s_addr ^
-		    mtod(m, struct ip *)->ip_dst.s_addr;
-		break;
-#endif
 #ifdef INET6
 	case AF_INET6:
-#ifdef RSS
 		flowid = rss_hash_ip6_2tuple(
 		    &mtod(m, struct ip6_hdr *)->ip6_src,
 		    &mtod(m, struct ip6_hdr *)->ip6_dst);
-		break;
-#endif
-		flowid = mtod(m, struct ip6_hdr *)->ip6_src.s6_addr32[3] ^
-		    mtod(m, struct ip6_hdr *)->ip6_dst.s6_addr32[3];
 		break;
 #endif
 	default:

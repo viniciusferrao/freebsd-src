@@ -236,7 +236,7 @@ csa_attach(device_t dev)
 	scp->binfo.card = scp->card;
 	printf("csa: card is %s\n", scp->card->name);
 	resp->io_rid = PCIR_BAR(0);
-	resp->io = bus_alloc_resource_any(dev, SYS_RES_MEMORY, 
+	resp->io = bus_alloc_resource_any(dev, SYS_RES_MEMORY,
 		&resp->io_rid, RF_ACTIVE);
 	if (resp->io == NULL)
 		return (ENXIO);
@@ -1034,5 +1034,5 @@ static driver_t csa_driver = {
  * csa can be attached to a pci bus.
  */
 DRIVER_MODULE(snd_csa, pci, csa_driver, 0, 0);
-MODULE_DEPEND(snd_csa, sound, SOUND_MINVER, SOUND_PREFVER, SOUND_MAXVER);
+MODULE_DEPEND(snd_csa, sound, 1, 1, 1);
 MODULE_VERSION(snd_csa, 1);

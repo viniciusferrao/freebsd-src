@@ -422,7 +422,7 @@ struct tcpcb {
 	struct sackblk sackblks[MAX_SACK_BLKS]; /* seq nos. of sack blocks */
 	struct sackhint	sackhint;	/* SACK scoreboard hint */
 	int	t_rttlow;		/* smallest observerved RTT */
-	int	rfbuf_cnt;		/* recv buffer autoscaling byte count */
+	u_int	rfbuf_cnt;		/* recv buffer autoscaling byte count */
 	struct toedev	*tod;		/* toedev handling this connection */
 	int	t_sndrexmitpack;	/* retransmit packets sent */
 	int	t_rcvoopack;		/* out-of-order packets received */
@@ -1022,9 +1022,6 @@ struct	tcpstat {
 	uint64_t tcps_predack;		/* times hdr predict ok for acks */
 	uint64_t tcps_preddat;		/* times hdr predict ok for data pkts */
 	uint64_t tcps_pcbcachemiss;
-	uint64_t tcps_cachedrtt;	/* times cached RTT in route updated */
-	uint64_t tcps_cachedrttvar;	/* times cached rttvar updated */
-	uint64_t tcps_cachedssthresh;	/* times cached ssthresh updated */
 	uint64_t tcps_usedrtt;		/* times RTT initialized from route */
 	uint64_t tcps_usedrttvar;	/* times RTTVAR initialized from rt */
 	uint64_t tcps_usedssthresh;	/* times ssthresh initialized from rt*/
@@ -1052,8 +1049,18 @@ struct	tcpstat {
 	uint64_t tcps_sc_spurcookie;	/* SYN cookie spurious, rejected */
 	uint64_t tcps_sc_failcookie;	/* SYN cookie failed, rejected */
 
+	/* TCP host cache */
+	uint64_t tcps_hc_hits;
+	uint64_t tcps_hc_misses;
 	uint64_t tcps_hc_added;		/* entry added to hostcache */
 	uint64_t tcps_hc_bucketoverflow;/* hostcache per bucket limit hit */
+	uint64_t tcps_hc_allocfail;	/* hostcache zone full */
+	uint64_t tcps_cachedrtt;	/* times cached RTT in route updated */
+	uint64_t tcps_cachedrttvar;	/* times cached rttvar updated */
+	uint64_t tcps_cachedssthresh;	/* times cached ssthresh updated */
+	uint64_t tcps_cachedcwnd;	/* times cached congestion window */
+	uint64_t tcps_cachedsendpipe;	/* times cached send buffer size */
+	uint64_t tcps_cachedrecvpipe;	/* times cached recv buffer size */
 
 	uint64_t tcps_finwait2_drops;    /* Drop FIN_WAIT_2 connection after time limit */
 
@@ -1296,13 +1303,13 @@ VNET_DECLARE(int, path_mtu_discovery);
 VNET_DECLARE(int, tcp_abc_l_var);
 VNET_DECLARE(uint32_t, tcp_ack_war_cnt);
 VNET_DECLARE(uint32_t, tcp_ack_war_time_window);
-VNET_DECLARE(int, tcp_autorcvbuf_max);
-VNET_DECLARE(int, tcp_autosndbuf_inc);
-VNET_DECLARE(int, tcp_autosndbuf_max);
+VNET_DECLARE(u_int, tcp_autorcvbuf_max);
+VNET_DECLARE(u_int, tcp_autosndbuf_inc);
+VNET_DECLARE(u_int, tcp_autosndbuf_max);
 VNET_DECLARE(int, tcp_bind_all_fibs);
 VNET_DECLARE(int, tcp_delack_enabled);
-VNET_DECLARE(int, tcp_do_autorcvbuf);
-VNET_DECLARE(int, tcp_do_autosndbuf);
+VNET_DECLARE(bool, tcp_do_autorcvbuf);
+VNET_DECLARE(bool, tcp_do_autosndbuf);
 VNET_DECLARE(int, tcp_do_ecn);
 VNET_DECLARE(int, tcp_do_lrd);
 VNET_DECLARE(int, tcp_do_prr);
@@ -1329,14 +1336,14 @@ VNET_DECLARE(int, tcp_mssdflt);
 VNET_DECLARE(int, tcp_perconn_stats_dflt_tpl);
 VNET_DECLARE(int, tcp_perconn_stats_enable);
 #endif /* STATS */
-VNET_DECLARE(int, tcp_recvspace);
+VNET_DECLARE(u_int, tcp_recvspace);
 VNET_DECLARE(int, tcp_retries);
 VNET_DECLARE(int, tcp_sack_globalholes);
 VNET_DECLARE(int, tcp_sack_globalmaxholes);
 VNET_DECLARE(int, tcp_sack_maxholes);
 VNET_DECLARE(int, tcp_sack_tso);
 VNET_DECLARE(int, tcp_sc_rst_sock_fail);
-VNET_DECLARE(int, tcp_sendspace);
+VNET_DECLARE(u_int, tcp_sendspace);
 VNET_DECLARE(int, tcp_udp_tunneling_overhead);
 VNET_DECLARE(int, tcp_udp_tunneling_port);
 VNET_DECLARE(struct inpcbinfo, tcbinfo);
@@ -1396,6 +1403,8 @@ VNET_DECLARE(struct hhook_head *, tcp_hhh[HHOOK_TCP_LAST + 1]);
 #define	V_tcp_hhh		VNET(tcp_hhh)
 #endif
 
+void	tcp_autorcvbuf(struct tcpcb *, u_int);
+void	tcp_autosndbuf(struct tcpcb *, u_int);
 void	tcp_account_for_send(struct tcpcb *, uint32_t, uint8_t, uint8_t, bool);
 int	 tcp_addoptions(struct tcpopt *, u_char *);
 struct tcpcb *
@@ -1430,8 +1439,6 @@ void	hhook_run_tcp_est_in(struct tcpcb *tp,
 #endif
 
 int	 tcp_input(struct mbuf **, int *, int);
-int	 tcp_autorcvbuf(struct mbuf *, struct tcphdr *, struct socket *,
-	    struct tcpcb *, int);
 int	 tcp_input_with_port(struct mbuf **, int *, int, uint16_t);
 void	tcp_do_segment(struct tcpcb *, struct mbuf *, struct tcphdr *, int,
     int, uint8_t);
@@ -1547,7 +1554,6 @@ void	 tcp_sack_lost_retransmission(struct tcpcb *, struct tcphdr *);
 int	 tcp_newreno(struct tcpcb *, struct tcphdr *);
 int	 tcp_compute_pipe(struct tcpcb *);
 uint32_t tcp_compute_initwnd(uint32_t);
-void	 tcp_sndbuf_autoscale(struct tcpcb *, struct socket *, uint32_t);
 int	 tcp_stats_sample_rollthedice(struct tcpcb *tp, void *seed_bytes,
     size_t seed_len);
 int tcp_can_enable_pacing(void);

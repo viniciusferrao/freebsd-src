@@ -166,6 +166,12 @@ invalidate_local_icache(void)
 }
 
 static __inline void
+wfe(void)
+{
+	__asm __volatile("wfe");
+}
+
+static __inline void
 wfet(uint64_t val)
 {
 	__asm __volatile(
@@ -208,7 +214,9 @@ extern void (*arm64_icache_sync_range)(void *, vm_size_t);
 void arm64_nullop(void);
 void arm64_dic_idc_icache_sync_range(void *, vm_size_t);
 void arm64_idc_aliasing_icache_sync_range(void *, vm_size_t);
+void arm64_idc_pipt_icache_sync_range(void *, vm_size_t);
 void arm64_aliasing_icache_sync_range(void *, vm_size_t);
+void arm64_pipt_icache_sync_range(void *, vm_size_t);
 int arm64_icache_sync_range_checked(void *, vm_size_t);
 void arm64_dcache_wbinv_range(void *, vm_size_t);
 void arm64_dcache_inv_range(void *, vm_size_t);

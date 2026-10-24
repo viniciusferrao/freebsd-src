@@ -267,7 +267,8 @@ alschan_setblocksize(kobj_t obj, void *data, uint32_t blocksize)
 	if (blocksize > sc->bufsz / 2) {
 		blocksize = sc->bufsz / 2;
 	}
-	sndbuf_resize(ch->buffer, 2, blocksize);
+	if (sndbuf_resize(ch->buffer, 2, blocksize) != 0)
+		return 0;
 	return blocksize;
 }
 
@@ -832,12 +833,12 @@ als_pci_attach(device_t dev)
 		goto bad_attach;
 	}
 
+	pcm_init(dev, sc);
+
 	if (mixer_init(dev, &als_mixer_class, sc)) {
 		device_printf(dev, "failed to initialize mixer\n");
 		goto bad_attach;
 	}
-
-	pcm_init(dev, sc);
 
 	pcm_addchan(dev, PCMDIR_PLAY, &alspchan_class, sc);
 	pcm_addchan(dev, PCMDIR_REC,  &alsrchan_class, sc);
@@ -935,5 +936,5 @@ static driver_t als_driver = {
 };
 
 DRIVER_MODULE(snd_als4000, pci, als_driver, 0, 0);
-MODULE_DEPEND(snd_als4000, sound, SOUND_MINVER, SOUND_PREFVER, SOUND_MAXVER);
+MODULE_DEPEND(snd_als4000, sound, 1, 1, 1);
 MODULE_VERSION(snd_als4000, 1);

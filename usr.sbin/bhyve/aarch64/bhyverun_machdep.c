@@ -112,6 +112,7 @@ bhyve_usage(int code)
 	    "       -k: key=value flat config file\n"
 	    "       -M: monitor mode\n"
 	    "       -m: memory size\n"
+	    "       -N: don't reboot while in monitor mode\n"
 	    "       -o: set config 'var' to 'value'\n"
 	    "       -p: pin 'vcpu' to 'hostcpu'\n"
 	    "       -S: guest memory cannot be swapped\n"
@@ -129,7 +130,7 @@ bhyve_optparse(int argc, char **argv)
 	const char *optstr;
 	int c;
 
-	optstr = "hCDMSWk:f:o:p:G:c:s:m:U:";
+	optstr = "hCDMNSWk:f:o:p:G:c:s:m:U:";
 	while ((c = getopt(argc, argv, optstr)) != -1) {
 		switch (c) {
 		case 'c':
@@ -154,7 +155,10 @@ bhyve_optparse(int argc, char **argv)
 			set_config_value("memory.size", optarg);
 			break;
 		case 'M':
-			set_config_bool("monitor", true);
+			set_config_bool("monitor.enabled", true);
+			break;
+		case 'N':
+			set_config_bool("monitor.no_reboot", true);
 			break;
 		case 'o':
 			if (!bhyve_parse_config_option(optarg)) {
@@ -196,6 +200,7 @@ bhyve_optparse(int argc, char **argv)
 
 	/* Handle backwards compatibility aliases in config options. */
 	bhyve_cfg_warn("virtio_msix", "virtio.msix");
+	bhyve_cfg_warn("monitor", "monitor.enabled");
 }
 
 void
@@ -390,9 +395,9 @@ bhyve_init_platform(struct vmctx *ctx, struct vcpu *bsp)
 		error = vm_get_register(fbsdrun_vcpu(cpu), VM_REG_GUEST_MPIDR_EL1,
 		    &mpidr);
 		assert(error == 0);
-#define	MPIDR_AFF_MASK	(MPIDR_AFF0_MASK | MPIDR_AFF1_MASK | MPIDR_AFF2_MASK | MPIDR_AFF3_MASK)
-		cpu_to_mpidr[cpu] = mpidr & MPIDR_AFF_MASK;
-#undef MPIDR_AFF_MASK
+#define	MPIDR_Aff_MASK	(MPIDR_Aff0_MASK | MPIDR_Aff1_MASK | MPIDR_Aff2_MASK | MPIDR_Aff3_MASK)
+		cpu_to_mpidr[cpu] = mpidr & MPIDR_Aff_MASK;
+#undef MPIDR_Aff_MASK
 	}
 
 	bootrom = get_config_value("bootrom");

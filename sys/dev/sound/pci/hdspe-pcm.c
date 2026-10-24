@@ -941,6 +941,11 @@ hdspechan_setblocksize(kobj_t obj, void *data, uint32_t blocksize)
 		}
 	}
 
+	if (sndbuf_resize(ch->buffer,
+	    (HDSPE_CHANBUF_SIZE * AFMT_CHANNEL(ch->format)) / (hl->period * 4),
+	    (hl->period * 4)) != 0)
+		return (0);
+
 	mtx_lock(&sc->lock);
 	sc->ctrl_register &= ~HDSPE_LAT_MASK;
 	sc->ctrl_register |= hdspe_encode_latency(hl->n);
@@ -952,9 +957,6 @@ hdspechan_setblocksize(kobj_t obj, void *data, uint32_t blocksize)
 	device_printf(scp->dev, "New period=%d\n", sc->period);
 #endif
 
-	sndbuf_resize(ch->buffer,
-	    (HDSPE_CHANBUF_SIZE * AFMT_CHANNEL(ch->format)) / (sc->period * 4),
-	    (sc->period * 4));
 end:
 
 	return (ch->buffer->blksz);
@@ -1064,6 +1066,8 @@ hdspe_pcm_attach(device_t dev)
 
 	pcm_init(dev, scp);
 
+	mixer_init(dev, &hdspemixer_class, scp);
+
 	play = (hdspe_channel_play_ports(scp->hc)) ? 1 : 0;
 	rec = (hdspe_channel_rec_ports(scp->hc)) ? 1 : 0;
 
@@ -1087,8 +1091,6 @@ hdspe_pcm_attach(device_t dev)
 		device_printf(dev, "Can't register pcm.\n");
 		return (ENXIO);
 	}
-
-	mixer_init(dev, &hdspemixer_class, scp);
 
 	/* Register the PCM child for interrupt dispatch. */
 	mtx_lock(&sc->lock);
@@ -1180,5 +1182,5 @@ static driver_t hdspe_pcm_driver = {
 };
 
 DRIVER_MODULE(snd_hdspe_pcm, hdspe, hdspe_pcm_driver, 0, 0);
-MODULE_DEPEND(snd_hdspe, sound, SOUND_MINVER, SOUND_PREFVER, SOUND_MAXVER);
+MODULE_DEPEND(snd_hdspe, sound, 1, 1, 1);
 MODULE_VERSION(snd_hdspe, 1);

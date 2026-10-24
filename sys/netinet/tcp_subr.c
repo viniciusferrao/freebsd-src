@@ -292,8 +292,8 @@ static int	tcp_soreceive_stream;
 SYSCTL_INT(_net_inet_tcp, OID_AUTO, soreceive_stream, CTLFLAG_RDTUN,
     &tcp_soreceive_stream, 0, "Using soreceive_stream for TCP sockets");
 
-VNET_DEFINE(uma_zone_t, sack_hole_zone);
-#define	V_sack_hole_zone		VNET(sack_hole_zone)
+uma_zone_t tcp_sack_hole_zone;
+
 VNET_DEFINE(uint32_t, tcp_map_entries_limit) = 0;	/* unlimited */
 static int
 sysctl_net_inet_tcp_map_limit_check(SYSCTL_HANDLER_ARGS)
@@ -578,7 +578,7 @@ tcp_recv_udp_tunneled_packet(struct mbuf *m, int off, struct inpcb *inp,
 #endif
 	struct udphdr *uh;
 	struct tcphdr *th;
-	int len, thlen;
+	int len;
 	uint16_t port;
 
 	TCPSTAT_INC(tcps_tunneled_pkts);
@@ -588,27 +588,23 @@ tcp_recv_udp_tunneled_packet(struct mbuf *m, int off, struct inpcb *inp,
 		m_freem(m);
 		return (true);
 	}
-	thlen = sizeof(struct tcphdr);
-	if (m->m_len < off + sizeof(struct udphdr) + thlen &&
-	    (m =  m_pullup(m, off + sizeof(struct udphdr) + thlen)) == NULL) {
+	if ((m = m_pullup(m, off + sizeof(struct udphdr) +
+	    sizeof(struct tcphdr))) == NULL) {
 		TCPSTAT_INC(tcps_tunneled_errs);
 		return (true);
 	}
 	iph = mtod(m, struct ip *);
-	uh = (struct udphdr *)((caddr_t)iph + off);
+	uh = (struct udphdr *)((char *)iph + off);
 	th = (struct tcphdr *)(uh + 1);
-	thlen = th->th_off << 2;
-	if (m->m_len < off + sizeof(struct udphdr) + thlen) {
-		m =  m_pullup(m, off + sizeof(struct udphdr) + thlen);
-		if (m == NULL) {
-			TCPSTAT_INC(tcps_tunneled_errs);
-			return (true);
-		} else {
-			iph = mtod(m, struct ip *);
-			uh = (struct udphdr *)((caddr_t)iph + off);
-			th = (struct tcphdr *)(uh + 1);
-		}
+	if ((m = m_pullup(m, off + sizeof(struct udphdr) +
+	    (th->th_off << 2))) == NULL) {
+		TCPSTAT_INC(tcps_tunneled_errs);
+		return (true);
 	}
+	iph = mtod(m, struct ip *);
+	uh = (struct udphdr *)((char *)iph + off);
+	th = (struct tcphdr *)(uh + 1);
+
 	m->m_pkthdr.tcp_tun_port = port = uh->uh_sport;
 	bcopy(th, uh, m->m_len - off - sizeof(struct udphdr));
 	m->m_len -= sizeof(struct udphdr);
@@ -1460,10 +1456,8 @@ tcp_vnet_init(void *arg __unused)
 	tcp_hc_init();
 
 	TUNABLE_INT_FETCH("net.inet.tcp.sack.enable", &V_tcp_do_sack);
-	V_sack_hole_zone = uma_zcreate("sackhole", sizeof(struct sackhole),
-	    NULL, NULL, NULL, NULL, UMA_ALIGN_PTR, 0);
 
-	tcp_fastopen_init();
+	tcp_fastopen_vnet_init();
 
 	COUNTER_ARRAY_ALLOC(V_tcps_states, TCP_NSTATES, M_WAITOK);
 	VNET_PCPUSTAT_ALLOC(tcpstat, M_WAITOK);
@@ -1583,12 +1577,16 @@ tcp_init(void *arg __unused)
 #ifdef INET6
 	IP6PROTO_REGISTER(IPPROTO_TCP, tcp6_input, tcp6_ctlinput);
 #endif
+
+	tcp_fastopen_init();
+	tcp_sack_hole_zone = uma_zcreate("sackhole", sizeof(struct sackhole),
+	    NULL, NULL, NULL, NULL, UMA_ALIGN_PTR, 0);
 }
 SYSINIT(tcp_init, SI_SUB_PROTO_DOMAIN, SI_ORDER_THIRD, tcp_init, NULL);
 
 #ifdef VIMAGE
 static void
-tcp_destroy(void *unused __unused)
+tcp_vnet_destroy(void *unused __unused)
 {
 #ifdef TCP_HHOOK
 	int error;
@@ -1597,14 +1595,12 @@ tcp_destroy(void *unused __unused)
 	tcp_hc_destroy();
 	syncache_destroy();
 	in_pcbinfo_destroy(&V_tcbinfo);
-	/* tcp_discardcb() clears the sack_holes up. */
-	uma_zdestroy(V_sack_hole_zone);
 
 	/*
 	 * Cannot free the zone until all tcpcbs are released as we attach
 	 * the allocations to them.
 	 */
-	tcp_fastopen_destroy();
+	tcp_fastopen_vnet_destroy();
 
 	COUNTER_ARRAY_FREE(V_tcps_states, TCP_NSTATES);
 	VNET_PCPUSTAT_FREE(tcpstat);
@@ -1624,7 +1620,8 @@ tcp_destroy(void *unused __unused)
 	}
 #endif
 }
-VNET_SYSUNINIT(tcp, SI_SUB_PROTO_DOMAIN, SI_ORDER_FOURTH, tcp_destroy, NULL);
+VNET_SYSUNINIT(tcp, SI_SUB_PROTO_DOMAIN, SI_ORDER_FOURTH, tcp_vnet_destroy,
+    NULL);
 #endif
 
 /*
@@ -1795,8 +1792,7 @@ tcp_respond(struct tcpcb *tp, void *ipgen, struct tcphdr *th, struct mbuf *m,
 		m->m_data += max_linkhdr;
 #ifdef INET6
 		if (isipv6) {
-			bcopy((caddr_t)ip6, mtod(m, caddr_t),
-			      sizeof(struct ip6_hdr));
+			bcopy(ip6, mtod(m, char *), sizeof(struct ip6_hdr));
 			ip6 = mtod(m, struct ip6_hdr *);
 			nth = (struct tcphdr *)(ip6 + 1);
 			if (port) {
@@ -1809,7 +1805,7 @@ tcp_respond(struct tcpcb *tp, void *ipgen, struct tcphdr *th, struct mbuf *m,
 		} else
 #endif /* INET6 */
 		{
-			bcopy((caddr_t)ip, mtod(m, caddr_t), sizeof(struct ip));
+			bcopy(ip, mtod(m, char *), sizeof(struct ip));
 			ip = mtod(m, struct ip *);
 			nth = (struct tcphdr *)(ip + 1);
 			if (port) {
@@ -1820,7 +1816,7 @@ tcp_respond(struct tcpcb *tp, void *ipgen, struct tcphdr *th, struct mbuf *m,
 				nth = (struct tcphdr *)(uh + 1);
 			}
 		}
-		bcopy((caddr_t)th, (caddr_t)nth, sizeof(struct tcphdr));
+		bcopy(th, nth, sizeof(struct tcphdr));
 		flags = TH_ACK;
 	} else if ((!M_WRITABLE(m)) || (port != 0)) {
 		struct mbuf *n;
@@ -1843,8 +1839,7 @@ tcp_respond(struct tcpcb *tp, void *ipgen, struct tcphdr *th, struct mbuf *m,
 #define xchg(a,b,type) { type t; t=a; a=b; b=t; }
 #ifdef INET6
 		if (isipv6) {
-			bcopy((caddr_t)ip6, mtod(n, caddr_t),
-			      sizeof(struct ip6_hdr));
+			bcopy(ip6, mtod(n, char *), sizeof(struct ip6_hdr));
 			ip6 = mtod(n, struct ip6_hdr *);
 			xchg(ip6->ip6_dst, ip6->ip6_src, struct in6_addr);
 			nth = (struct tcphdr *)(ip6 + 1);
@@ -1858,7 +1853,7 @@ tcp_respond(struct tcpcb *tp, void *ipgen, struct tcphdr *th, struct mbuf *m,
 		} else
 #endif /* INET6 */
 		{
-			bcopy((caddr_t)ip, mtod(n, caddr_t), sizeof(struct ip));
+			bcopy(ip, mtod(n, char *), sizeof(struct ip));
 			ip = mtod(n, struct ip *);
 			xchg(ip->ip_dst.s_addr, ip->ip_src.s_addr, uint32_t);
 			nth = (struct tcphdr *)(ip + 1);
@@ -1870,7 +1865,7 @@ tcp_respond(struct tcpcb *tp, void *ipgen, struct tcphdr *th, struct mbuf *m,
 				nth = (struct tcphdr *)(uh + 1);
 			}
 		}
-		bcopy((caddr_t)th, (caddr_t)nth, sizeof(struct tcphdr));
+		bcopy(th, nth, sizeof(struct tcphdr));
 		xchg(nth->th_dport, nth->th_sport, uint16_t);
 		th = nth;
 		m_freem(m);
@@ -1882,7 +1877,7 @@ tcp_respond(struct tcpcb *tp, void *ipgen, struct tcphdr *th, struct mbuf *m,
 		 */
 		m_freem(m->m_next);
 		m->m_next = NULL;
-		m->m_data = (caddr_t)ipgen;
+		m->m_data = ipgen;
 		/* clear any receive flags for proper bpf timestamping */
 		m->m_flags &= ~(M_TSTMP | M_TSTMP_LRO);
 		/* m_len is set later */
@@ -2455,7 +2450,6 @@ tcp_discardcb(struct tcpcb *tp)
 		STAILQ_FOREACH_FROM_SAFE(m, &tp->t_inqueue, m_stailqpkt, prev)
 			m_freem(m);
 	}
-	TCPSTATES_DEC(tp->t_state);
 
 	if (tp->t_fb->tfb_tcp_fb_fini)
 		(*tp->t_fb->tfb_tcp_fb_fini)(tp, 1);
@@ -2479,10 +2473,8 @@ tcp_discardcb(struct tcpcb *tp)
 	 * say srtt etc into the general one used by other stacks.
 	 */
 	if (tp->t_rttupdated >= 4) {
-		struct tcp_hc_metrics metrics;
 		uint32_t ssthresh;
 
-		bzero(&metrics, sizeof(metrics));
 		/*
 		 * Update the ssthresh always when the conditions below
 		 * are satisfied. This gives us better new start value
@@ -2510,15 +2502,14 @@ tcp_discardcb(struct tcpcb *tp)
 			    );
 		} else
 			ssthresh = 0;
-		metrics.hc_ssthresh = ssthresh;
-
-		metrics.hc_rtt = tp->t_srtt;
-		metrics.hc_rttvar = tp->t_rttvar;
-		metrics.hc_cwnd = tp->snd_cwnd;
-		metrics.hc_sendpipe = 0;
-		metrics.hc_recvpipe = 0;
-
-		tcp_hc_update(&inp->inp_inc, &metrics);
+		tcp_hc_update(&inp->inp_inc, &(struct tcp_hc_metrics){
+		    .hc_ssthresh = ssthresh,
+		    .hc_rtt = tp->t_srtt,
+		    .hc_rttvar = tp->t_rttvar,
+		    .hc_cwnd = tp->snd_cwnd,
+		    .hc_sendpipe = so->so_snd.sb_hiwat,
+		    .hc_recvpipe = so->so_rcv.sb_hiwat,
+		    });
 	}
 
 	refcount_release(&tp->t_fb->tfb_refcnt);
@@ -3133,7 +3124,7 @@ tcp_ctlinput_with_port(struct icmp *icp, uint16_t port)
 	}
 
 	ip = &icp->icmp_ip;
-	th = (struct tcphdr *)((caddr_t)ip + (ip->ip_hl << 2));
+	th = (struct tcphdr *)((char *)ip + (ip->ip_hl << 2));
 	icmp_tcp_seq = th->th_seq;
 	inp = in_pcblookup(&V_tcbinfo, ip->ip_dst, th->th_dport, ip->ip_src,
 	    th->th_sport, INPLOOKUP_WLOCKPCB, NULL);
@@ -3207,7 +3198,7 @@ tcp_ctlinput_viaudp(udp_tun_icmp_param_t param)
 	int i_hlen, o_len;
 	uint16_t port;
 
-	outer_ip = (struct ip *)((caddr_t)icmp - sizeof(struct ip));
+	outer_ip = (struct ip *)((char *)icmp - sizeof(struct ip));
 	inner_ip = &icmp->icmp_ip;
 	i_hlen = inner_ip->ip_hl << 2;
 	o_len = ntohs(outer_ip->ip_len);
@@ -3217,7 +3208,7 @@ tcp_ctlinput_viaudp(udp_tun_icmp_param_t param)
 		return;
 	}
 	/* Ok lets strip out the inner udphdr header by copying up on top of it the tcp hdr */
-	udp = (struct udphdr *)(((caddr_t)inner_ip) + i_hlen);
+	udp = (struct udphdr *)(((char *)inner_ip) + i_hlen);
 	if (ntohs(udp->uh_sport) != V_tcp_udp_tunneling_port) {
 		return;
 	}
@@ -3318,14 +3309,14 @@ tcp6_ctlinput_with_port(struct ip6ctlparam *ip6cp, uint16_t port)
 		return;
 	}
 	bzero(&t_ports, sizeof(struct tcp_ports));
-	m_copydata(m, off, sizeof(struct tcp_ports), (caddr_t)&t_ports);
+	m_copydata(m, off, sizeof(struct tcp_ports), &t_ports);
 	inp = in6_pcblookup(&V_tcbinfo, &ip6->ip6_dst, t_ports.th_dport,
 	    &ip6->ip6_src, t_ports.th_sport, INPLOOKUP_WLOCKPCB, NULL);
 	off += sizeof(struct tcp_ports);
 	if (m->m_pkthdr.len < (int32_t) (off + sizeof(tcp_seq))) {
 		goto out;
 	}
-	m_copydata(m, off, sizeof(tcp_seq), (caddr_t)&icmp_tcp_seq);
+	m_copydata(m, off, sizeof(tcp_seq), &icmp_tcp_seq);
 	if (inp != NULL)  {
 		tp = intotcpcb(inp);
 #ifdef TCP_OFFLOAD
@@ -3395,25 +3386,20 @@ static void
 tcp6_ctlinput_viaudp(udp_tun_icmp_param_t param)
 {
 	struct ip6ctlparam *ip6cp = param.ip6cp;
-	struct mbuf *m;
-	struct udphdr *udp;
+	struct udphdr udp;
 	uint16_t port;
 
-	m = m_pulldown(ip6cp->ip6c_m, ip6cp->ip6c_off, sizeof(struct udphdr), NULL);
-	if (m == NULL) {
+	if (ip6cp->ip6c_m->m_pkthdr.len <
+	    ip6cp->ip6c_off + sizeof(struct udphdr))
 		return;
-	}
-	udp = mtod(m, struct udphdr *);
-	if (ntohs(udp->uh_sport) != V_tcp_udp_tunneling_port) {
+	m_copydata(ip6cp->ip6c_m, ip6cp->ip6c_off, sizeof(udp), &udp);
+	if (ntohs(udp.uh_sport) != V_tcp_udp_tunneling_port)
 		return;
-	}
-	port = udp->uh_dport;
-	m_adj(m, sizeof(struct udphdr));
-	if ((m->m_flags & M_PKTHDR) == 0) {
-		ip6cp->ip6c_m->m_pkthdr.len -= sizeof(struct udphdr);
-	}
+	port = udp.uh_dport;
+	ip6cp->ip6c_off += sizeof(struct udphdr);
 	/* Now call in to the normal handling code */
 	tcp6_ctlinput_with_port(ip6cp, port);
+	ip6cp->ip6c_off -= sizeof(struct udphdr);
 }
 
 #endif /* INET6 */

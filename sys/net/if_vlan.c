@@ -1569,8 +1569,7 @@ vlan_input(struct ifnet *ifp, struct mbuf *m)
 		 */
 		switch (ifp->if_type) {
 		case IFT_ETHER:
-			if (m->m_len < sizeof(*evl) &&
-			    (m = m_pullup(m, sizeof(*evl))) == NULL) {
+			if ((m = m_pullup(m, sizeof(*evl))) == NULL) {
 				if_printf(ifp, "cannot pullup VLAN header\n");
 				return;
 			}
@@ -1704,6 +1703,8 @@ vlan_config(struct ifvlan *ifv, struct ifnet *p, uint16_t vid,
 				/* Re-insert back where we found it. */
 				ret = vlan_inshash(trunk, ifv);
 				MPASS(ret == 0);
+			} else {
+				EVENTHANDLER_INVOKE(vlan_unconfig, p, oldvid);
 			}
 		}
 		/* Will unlock */

@@ -209,6 +209,7 @@ tcp_usr_detach(struct socket *so)
 	    tp->t_state < TCPS_SYN_SENT,
 	    ("%s: inp %p not disconnected or embryonic", __func__, inp));
 
+	TCPSTATES_DEC(tp->t_state);
 	tcp_discardcb(tp);
 	in_pcbfree(inp);
 }
@@ -1331,7 +1332,7 @@ tcp_usr_rcvoob(struct socket *so, struct mbuf *m, int flags)
 		goto out;
 	}
 	m->m_len = 1;
-	*mtod(m, caddr_t) = tp->t_iobc;
+	*mtod(m, char *) = tp->t_iobc;
 	if ((flags & MSG_PEEK) == 0)
 		tp->t_oobflags ^= (TCPOOB_HAVEDATA | TCPOOB_HADDATA);
 
@@ -2883,7 +2884,7 @@ db_print_tcpcb(struct tcpcb *tp, const char *name, int indent, bool show_bblog,
 	/* Skip sackblks, sackhint. */
 
 	db_print_indent(indent);
-	db_printf("t_rttlow: %d   rfbuf_ts: %u   rfbuf_cnt: %d\n",
+	db_printf("t_rttlow: %d   rfbuf_ts: %u   rfbuf_cnt: %u\n",
 	    tp->t_rttlow, tp->rfbuf_ts, tp->rfbuf_cnt);
 
 	db_print_indent(indent);

@@ -3,7 +3,7 @@
  *
  * Copyright (c) 2002 Orion Hodson <orion@freebsd.org>
  * Portions of this code derived from via82c686.c:
- * 	Copyright (c) 2000 David Jones <dej@ox.org>
+ *	Copyright (c) 2000 David Jones <dej@ox.org>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -565,6 +565,7 @@ via8233chan_setfragments(kobj_t obj, void *data,
 {
 	struct via_chinfo *ch = data;
 	struct via_info *via = ch->parent;
+	int error;
 
 	blksz &= VIA_BLK_ALIGN;
 
@@ -588,9 +589,11 @@ via8233chan_setfragments(kobj_t obj, void *data,
 
 	if ((ch->buffer->blksz != blksz ||
 	    ch->buffer->blkcnt != blkcnt) &&
-	    sndbuf_resize(ch->buffer, blkcnt, blksz) != 0)
+	    (error = sndbuf_resize(ch->buffer, blkcnt, blksz)) != 0) {
 		device_printf(via->dev, "%s: failed blksz=%u blkcnt=%u\n",
 		    __func__, blksz, blkcnt);
+		return (error);
+	}
 
 	ch->blksz = ch->buffer->blksz;
 	ch->blkcnt = ch->buffer->blkcnt;
@@ -604,7 +607,8 @@ via8233chan_setblocksize(kobj_t obj, void *data, uint32_t blksz)
 	struct via_chinfo *ch = data;
 	struct via_info *via = ch->parent;
 
-	via8233chan_setfragments(obj, data, blksz, via->blkcnt);
+	if (via8233chan_setfragments(obj, data, blksz, via->blkcnt) != 0)
+		return (0);
 
 	return (ch->blksz);
 }
@@ -907,7 +911,7 @@ via8233chan_trigger(kobj_t obj, void* data, int go)
 				pollticks = 1;
 			if (via_chan_active(via) == 0 ||
 			    pollticks < via->poll_ticks) {
-			    	if (bootverbose) {
+				if (bootverbose) {
 					if (via_chan_active(via) == 0)
 						printf("%s: pollticks=%d\n",
 						    __func__, pollticks);
@@ -1331,6 +1335,7 @@ via_attach(device_t dev)
 	if (!via->codec)
 		goto bad;
 
+	pcm_init(dev, via);
 	mixer_init(dev, ac97_getmixerclass(), via->codec);
 
 	via->codec_caps = ac97_getextcaps(via->codec);
@@ -1350,7 +1355,6 @@ via_attach(device_t dev)
 	    device_get_nameunit(device_get_parent(dev)));
 
 	/* Register */
-	pcm_init(dev, via);
 	for (i = 0; i < via_dxs_chnum; i++)
 	      pcm_addchan(dev, PCMDIR_PLAY, &via8233dxs_class, via);
 	for (i = 0; i < via_sgd_chnum; i++)
@@ -1435,5 +1439,5 @@ static driver_t via_driver = {
 };
 
 DRIVER_MODULE(snd_via8233, pci, via_driver, 0, 0);
-MODULE_DEPEND(snd_via8233, sound, SOUND_MINVER, SOUND_PREFVER, SOUND_MAXVER);
+MODULE_DEPEND(snd_via8233, sound, 1, 1, 1);
 MODULE_VERSION(snd_via8233, 1);

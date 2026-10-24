@@ -68,6 +68,10 @@
 
 #include <cam/ata/ata_all.h>
 
+/* SDT Probes */
+SDT_PROBE_DEFINE3(cam, , ada, error, "union ccb *", "uint32_t", "uint32_t");
+SDT_PROBE_DEFINE2(cam, , ada, recovery, "union ccb *", "int");
+
 #ifdef _KERNEL
 
 #define ATA_MAX_28BIT_LBA               268435455UL
@@ -2937,7 +2941,8 @@ adadone(struct cam_periph *periph, union ccb *done_ccb)
 	case ADA_CCB_BUFFER_IO:
 	case ADA_CCB_TRIM:
 	{
-		struct bio *bp;
+		struct bio *bp, *bp1;
+		struct bio_queue queue;
 		int error;
 
 		KASSERT(priority == CAM_PRIORITY_NORMAL,
@@ -3006,16 +3011,18 @@ adadone(struct cam_periph *periph, union ccb *done_ccb)
 		 * extensive.  Release the periph refcount taken in adastart()
 		 * for each CCB.
 		 */
-		cam_iosched_bio_complete(softc->cam_iosched, bp, done_ccb);
+		if (state == ADA_CCB_TRIM) {
+			TAILQ_INIT(&queue);
+			TAILQ_CONCAT(&queue, &softc->trim_req.bps, bio_queue);
+			cam_iosched_bio_queue_update_stats(softc->cam_iosched,
+			    &queue, done_ccb, error);
+		} else
+			cam_iosched_bio_update_stats(softc->cam_iosched, bp,
+			    done_ccb);
 		xpt_release_ccb(done_ccb);
 		KASSERT(softc->refcount >= 1, ("adadone softc %p refcount %d", softc, softc->refcount));
 		softc->refcount--;
 		if (state == ADA_CCB_TRIM) {
-			TAILQ_HEAD(, bio) queue;
-			struct bio *bp1;
-
-			TAILQ_INIT(&queue);
-			TAILQ_CONCAT(&queue, &softc->trim_req.bps, bio_queue);
 			/*
 			 * Normally, the xpt_release_ccb() above would make sure
 			 * that when we have more work to do, that work would
@@ -3031,12 +3038,6 @@ adadone(struct cam_periph *periph, union ccb *done_ccb)
 			cam_periph_unlock(periph);
 			while ((bp1 = TAILQ_FIRST(&queue)) != NULL) {
 				TAILQ_REMOVE(&queue, bp1, bio_queue);
-				bp1->bio_error = error;
-				if (error != 0) {
-					bp1->bio_flags |= BIO_ERROR;
-					bp1->bio_resid = bp1->bio_bcount;
-				} else
-					bp1->bio_resid = 0;
 				biodone(bp1);
 			}
 		} else {
@@ -3479,6 +3480,10 @@ adadone(struct cam_periph *periph, union ccb *done_ccb)
 static int
 adaerror(union ccb *ccb, uint32_t cam_flags, uint32_t sense_flags)
 {
+	int error;
+
+	CAM_PROBE3(ada, error, ccb, cam_flags, sense_flags);
+
 #ifdef CAM_IO_STATS
 	struct ada_softc *softc;
 	struct cam_periph *periph;
@@ -3503,7 +3508,9 @@ adaerror(union ccb *ccb, uint32_t cam_flags, uint32_t sense_flags)
 	}
 #endif
 
-	return(cam_periph_error(ccb, cam_flags, sense_flags));
+	error = cam_periph_error(ccb, cam_flags, sense_flags);
+	CAM_PROBE2(ada, recovery, ccb, error);
+	return (error);
 }
 
 static void

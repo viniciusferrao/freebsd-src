@@ -275,6 +275,7 @@ cpu_init_small_core(void)
 void
 initializecpu(void)
 {
+	uint64_t irperf1, irperf2;
 	uint64_t msr;
 	uint64_t cr4;
 
@@ -360,6 +361,40 @@ initializecpu(void)
 	    (cpu_stdext_feature2 & CPUID_STDEXT2_RDPID) != 0)
 		wrmsr(MSR_TSC_AUX, cpu_auxmsr());
 
+	/*
+	 * According to erratum #1054 "Instructions Retired Performance
+	 * Counter May Be Inaccurate", the IRPERF feature should be
+	 * enabled only for a subset of Zen 1 (Family 17h Models 30h and above)
+	 * and all later processors.
+	 *
+	 * Separately, verify IRPERF is actually incrementing across two
+	 * back-to-back reads. This only catches a dead/non-functional MSR
+	 * (e.g. a hypervisor or emulator exposing the CPUID feature bit
+	 * without real MSR support behind it) -- it cannot detect the
+	 * erratum's actual failure mode, a counter that increments but
+	 * returns inaccurate values. That case is handled entirely by the
+	 * family/model check above.
+	 *
+	 * Released versions of vmm erroneously advertise IRPERF support, so
+	 * ignore it when running under bhyve.
+	 *
+	 * This runs on every core (BSP and each AP) via initializecpu();
+	 * pmc_amd_initialize() later assumes IRPERF's enabled/disabled state
+	 * is consistent across all cores.
+	 */
+	if ((amd_extended_feature_extensions & AMDFEID_IRPERF) &&
+	    vm_guest != VM_GUEST_BHYVE &&
+	    ((CPUID_TO_FAMILY(cpu_id) > 0x17) ||
+	    (CPUID_TO_FAMILY(cpu_id) == 0x17 && CPUID_TO_MODEL(cpu_id) >= 0x30))) {
+		wrmsr(MSR_HWCR, rdmsr(MSR_HWCR) | HWCR_IRPERFEN);
+
+		irperf1 = rdmsr(MSR_IRPERF);
+		irperf2 = rdmsr(MSR_IRPERF);
+
+		if (irperf2 <= irperf1)
+			wrmsr(MSR_HWCR, rdmsr(MSR_HWCR) & ~HWCR_IRPERFEN);
+	}
+
 	if (!IS_BSP())
 		cpu_init_small_core();
 	TSEXIT();
@@ -439,4 +474,33 @@ amd64_cpu_init_fred(void)
 	if (IS_BSP() && bootverbose)
 		printf("FRED enabled\n");
 
+}
+
+void
+amd64_init_splitlock(void)
+{
+	uint64_t msr;
+
+	if ((cpu_stdext_feature3 & CPUID_STDEXT3_CORE_CAP) != 0) {
+		if (rdmsr_safe(MSR_IA32_CORE_CAP, &msr) == 0)
+			ia32_splitlock = (msr & IA32_CORE_CAP_SPLITLOCK) != 0;
+	}
+	if (ia32_splitlock) {
+		TUNABLE_INT_FETCH("hw.splitlock_force", &ia32_splitlock_force);
+		if (ia32_splitlock_force != 0)
+			ia32_splitlock_force = 1;
+	} else {
+		ia32_splitlock_force = 0;
+	}
+}
+
+void
+amd64_cpu_init_msr_memctl(void)
+{
+	uint64_t msr;
+
+	if ((cpu_stdext_feature3 & CPUID_STDEXT3_CORE_CAP) != 0 &&
+	    rdmsr_safe(MSR_IA32_CORE_CAP, &msr) == 0 &&
+	    (msr & IA32_CORE_CAP_SPLITLOCK) != 0)
+		PCPU_SET(msr_memctl, rdmsr(MSR_MEMORY_CTL));
 }

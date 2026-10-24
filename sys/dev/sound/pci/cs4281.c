@@ -112,7 +112,7 @@ static int       cs4281_init(struct sc_info *);
 
 /* talk to the card */
 static uint32_t cs4281_rd(struct sc_info *, int);
-static void 	 cs4281_wr(struct sc_info *, int, uint32_t);
+static void	 cs4281_wr(struct sc_info *, int, uint32_t);
 
 /* misc */
 static uint8_t  cs4281_rate_to_rv(uint32_t);
@@ -346,12 +346,14 @@ cs4281chan_setblocksize(kobj_t obj, void *data, uint32_t blocksize)
     struct sc_info *sc = ch->parent;
     uint32_t go;
 
-    go = adcdac_go(ch, 0);
-
     /* 2 interrupts are possible and used in buffer (half-empty,empty),
      * hence factor of 2. */
-    ch->blksz = min(blocksize, sc->bufsz / 2);
-    sndbuf_resize(ch->buffer, 2, ch->blksz);
+    blocksize = min(blocksize, sc->bufsz / 2);
+    if (sndbuf_resize(ch->buffer, 2, blocksize) != 0)
+	return 0;
+    ch->blksz = blocksize;
+
+    go = adcdac_go(ch, 0);
     ch->dma_setup = 0;
     adcdac_prog(ch);
     adcdac_go(ch, go);
@@ -449,13 +451,13 @@ cs4281chan_getcaps(kobj_t obj, void *data)
 }
 
 static kobj_method_t cs4281chan_methods[] = {
-    	KOBJMETHOD(channel_init,		cs4281chan_init),
-    	KOBJMETHOD(channel_setformat,		cs4281chan_setformat),
-    	KOBJMETHOD(channel_setspeed,		cs4281chan_setspeed),
-    	KOBJMETHOD(channel_setblocksize,	cs4281chan_setblocksize),
-    	KOBJMETHOD(channel_trigger,		cs4281chan_trigger),
-    	KOBJMETHOD(channel_getptr,		cs4281chan_getptr),
-    	KOBJMETHOD(channel_getcaps,		cs4281chan_getcaps),
+	KOBJMETHOD(channel_init,		cs4281chan_init),
+	KOBJMETHOD(channel_setformat,		cs4281chan_setformat),
+	KOBJMETHOD(channel_setspeed,		cs4281chan_setspeed),
+	KOBJMETHOD(channel_setblocksize,	cs4281chan_setblocksize),
+	KOBJMETHOD(channel_trigger,		cs4281chan_trigger),
+	KOBJMETHOD(channel_getptr,		cs4281chan_getptr),
+	KOBJMETHOD(channel_getcaps,		cs4281chan_getcaps),
 	KOBJMETHOD_END
 };
 CHANNEL_DECLARE(cs4281chan);
@@ -543,9 +545,9 @@ cs4281_power(struct sc_info *sc, int state)
         cs4281_clr4(sc, CS4281PCI_EPPMC, CS4281PCI_EPPMC_FPDN);
         break;
     case 3:
-    	/* Power off card and codec */
-    	cs4281_set4(sc, CS4281PCI_EPPMC, CS4281PCI_EPPMC_FPDN);
-    	cs4281_clr4(sc, CS4281PCI_SPMC, CS4281PCI_SPMC_RSTN);
+	/* Power off card and codec */
+	cs4281_set4(sc, CS4281PCI_EPPMC, CS4281PCI_EPPMC_FPDN);
+	cs4281_clr4(sc, CS4281PCI_SPMC, CS4281PCI_SPMC_RSTN);
         break;
     }
 
@@ -837,9 +839,9 @@ cs4281_pci_attach(device_t dev)
     if (codec == NULL)
         goto bad;
 
-    mixer_init(dev, ac97_getmixerclass(), codec);
-
     pcm_init(dev, sc);
+
+    mixer_init(dev, ac97_getmixerclass(), codec);
 
     pcm_addchan(dev, PCMDIR_PLAY, &cs4281chan_class, sc);
     pcm_addchan(dev, PCMDIR_REC, &cs4281chan_class, sc);
@@ -964,5 +966,5 @@ static driver_t cs4281_driver = {
 };
 
 DRIVER_MODULE(snd_cs4281, pci, cs4281_driver, 0, 0);
-MODULE_DEPEND(snd_cs4281, sound, SOUND_MINVER, SOUND_PREFVER, SOUND_MAXVER);
+MODULE_DEPEND(snd_cs4281, sound, 1, 1, 1);
 MODULE_VERSION(snd_cs4281, 1);

@@ -91,12 +91,6 @@ struct snd_mixer;
 
 #define SND_STATUSLEN	64
 
-#define SOUND_MODVER	5
-
-#define SOUND_MINVER	SOUND_MODVER
-#define SOUND_PREFVER	SOUND_MODVER
-#define SOUND_MAXVER	SOUND_MODVER
-
 #define SD_F_SIMPLEX		0x00000001
 /* unused			0x00000002 */
 #define SD_F_SOFTPCMVOL		0x00000004
@@ -162,12 +156,6 @@ void *pcm_getdevinfo(device_t dev);
 int snd_setup_intr(device_t dev, struct resource *res, int flags,
 		   driver_intr_t hand, void *param, void **cookiep);
 
-/*
- * this is rather kludgey- we need to duplicate these struct def'ns from sound.c
- * so that the macro versions of pcm_{,un}lock can dereference them.
- * we also have to do this now makedev() has gone away.
- */
-
 struct snddev_info {
 	struct {
 		struct {
@@ -189,8 +177,8 @@ struct snddev_info {
 	device_t dev;
 	char status[SND_STATUSLEN];
 	struct mtx lock;
-	struct cdev *mixer_dev;
 	struct cdev *dsp_dev;
+	struct snd_mixer *mixer;
 	uint32_t pvchanrate, pvchanformat, pvchanmode;
 	uint32_t rvchanrate, rvchanformat, rvchanmode;
 	int32_t eqpreamp;

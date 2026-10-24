@@ -532,6 +532,7 @@ atiixp_chan_setfragments(kobj_t obj, void *data,
 {
 	struct atiixp_chinfo *ch = data;
 	struct atiixp_info *sc = ch->parent;
+	int error;
 
 	blksz &= ATI_IXP_BLK_ALIGN;
 
@@ -555,9 +556,11 @@ atiixp_chan_setfragments(kobj_t obj, void *data,
 
 	if ((ch->buffer->blksz != blksz ||
 	    ch->buffer->blkcnt != blkcnt) &&
-	    sndbuf_resize(ch->buffer, blkcnt, blksz) != 0)
+	    (error = sndbuf_resize(ch->buffer, blkcnt, blksz)) != 0) {
 		device_printf(sc->dev, "%s: failed blksz=%u blkcnt=%u\n",
 		    __func__, blksz, blkcnt);
+		return (error);
+	}
 
 	ch->blksz = ch->buffer->blksz;
 	ch->blkcnt = ch->buffer->blkcnt;
@@ -571,7 +574,8 @@ atiixp_chan_setblocksize(kobj_t obj, void *data, uint32_t blksz)
 	struct atiixp_chinfo *ch = data;
 	struct atiixp_info *sc = ch->parent;
 
-	atiixp_chan_setfragments(obj, data, blksz, sc->blkcnt);
+	if (atiixp_chan_setfragments(obj, data, blksz, sc->blkcnt) != 0)
+		return (0);
 
 	return (ch->blksz);
 }
@@ -747,7 +751,7 @@ atiixp_chan_trigger(kobj_t obj, void *data, int go)
 				pollticks = 1;
 			if (atiixp_chan_active(sc) == 0 ||
 			    pollticks < sc->poll_ticks) {
-			    	if (bootverbose) {
+				if (bootverbose) {
 					if (atiixp_chan_active(sc) == 0)
 						device_printf(sc->dev,
 						    "%s: pollticks=%d\n",
@@ -1080,9 +1084,9 @@ atiixp_chip_post_init(void *arg)
 		break;
 	}
 
-	mixer_init(sc->dev, ac97_getmixerclass(), sc->codec);
-
 	pcm_init(sc->dev, sc);
+
+	mixer_init(sc->dev, ac97_getmixerclass(), sc->codec);
 
 	for (i = 0; i < ATI_IXP_NPCHAN; i++)
 		pcm_addchan(sc->dev, PCMDIR_PLAY, &atiixp_chan_class, sc);
@@ -1412,5 +1416,5 @@ static driver_t atiixp_driver = {
 };
 
 DRIVER_MODULE(snd_atiixp, pci, atiixp_driver, 0, 0);
-MODULE_DEPEND(snd_atiixp, sound, SOUND_MINVER, SOUND_PREFVER, SOUND_MAXVER);
+MODULE_DEPEND(snd_atiixp, sound, 1, 1, 1);
 MODULE_VERSION(snd_atiixp, 1);

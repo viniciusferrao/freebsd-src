@@ -186,7 +186,7 @@ fabient [label="Fabien Thomas\nfabient@FreeBSD.org\n2009/03/16"]
 fanf [label="Tony Finch\nfanf@FreeBSD.org\n2002/05/05"]
 fjoe [label="Max Khon\nfjoe@FreeBSD.org\n2001/08/06"]
 flz [label="Florent Thoumie\nflz@FreeBSD.org\n2006/03/30"]
-freqlabs [label="Ryan Moeller\nfreqlabs@FreeBSD.org\n2020/02/10"]
+freqlabs [label="Ryan Moeller\nfreqlabs@FreeBSD.org\n2020/02/10\n2024/01/09"]
 fsu [label="Fedor Uporov\nfsu@FreeBSD.org\n2017/08/28"]
 fuz [label="Robert Clausecker\nfuz@FreeBSD.org\n2025/10/21"]
 gabor [label="Gabor Kovesdan\ngabor@FreeBSD.org\n2010/02/02"]
@@ -271,6 +271,7 @@ lidl [label="Kurt Lidl\nlidl@FreeBSD.org\n2015/10/21"]
 loos [label="Luiz Otavio O Souza\nloos@FreeBSD.org\n2013/07/03"]
 lstewart [label="Lawrence Stewart\nlstewart@FreeBSD.org\n2008/10/06"]
 luporl [label="Leandro Lupori\nluporl@FreeBSD.org\n2018/05/21"]
+lytboris [label="Boris Lytochkin\nlytboris@FreeBSD.org\n2026/10/02"]
 lwhsu [label="Li-Wen Hsu\nlwhsu@FreeBSD.org\n2018/08/09"]
 manu [label="Emmanuel Vadot\nmanu@FreeBSD.org\n2016/04/24"]
 marcel [label="Marcel Moolenaar\nmarcel@FreeBSD.org\n1999/07/03"]
@@ -303,6 +304,7 @@ ngie [label="Enji Cooper\nngie@FreeBSD.org\n2014/07/27"]
 nick [label="Nick O'Brien\nnick@FreeBSD.org\n2020/03/09"]
 nork [label="Norikatsu Shigemura\nnork@FreeBSD.org\n2009/06/09"]
 np [label="Navdeep Parhar\nnp@FreeBSD.org\n2009/06/05"]
+nprice [label="Nick Price\nnprice@FreeBSD.org\n2026/08/07"]
 nwhitehorn [label="Nathan Whitehorn\nnwhitehorn@FreeBSD.org\n2008/07/03"]
 n_hibma [label="Nick Hibma\nn_hibma@FreeBSD.org\n1998/11/26"]
 obiwac [label="Aymeric Wibo\nobiwac@FreeBSD.org\n2025/07/15"]
@@ -338,6 +340,7 @@ rik [label="Roman Kurakin\nrik@FreeBSD.org\n2003/12/18"]
 rlibby [label="Ryan Libby\nrlibby@FreeBSD.org\n2017/06/07"]
 rmacklem [label="Rick Macklem\nrmacklem@FreeBSD.org\n2009/03/27"]
 rmh [label="Robert Millan\nrmh@FreeBSD.org\n2011/09/18"]
+rmoeller [label="Ryan Moeller\nrmoeller@FreeBSD.org\n2026/10/09"]
 rnoland [label="Robert Noland\nrnoland@FreeBSD.org\n2008/09/15"]
 roberto [label="Ollivier Robert\nroberto@FreeBSD.org\n1995/02/22"]
 rodrigc [label="Craig Rodrigues\nrodrigc@FreeBSD.org\n2005/05/14"]
@@ -360,7 +363,9 @@ scottph [label="D Scott Phillips\nscottph@FreeBSD.org\n2019/05/28"]
 se [label="Stefan Esser\nse@FreeBSD.org\n1994/08/26"]
 sephe [label="Sepherosa Ziehau\nsephe@FreeBSD.org\n2007/03/28"]
 sepotvin [label="Stephane E. Potvin\nsepotvin@FreeBSD.org\n2007/02/15"]
+seuros [label="Abdelkader Boudih\nseuros@FreeBSD.org\n2026/08/23"]
 sgalabov [label="Stanislav Galabov\nsgalabov@FreeBSD.org\n2016/02/24"]
+sheda [label="Stéphane Rochoy\nsheda@FreeBSD.org\n2026/07/10"]
 shurd [label="Stephen Hurd\nshurd@FreeBSD.org\n2017/09/02"]
 simon [label="Simon L. Nielsen\nsimon@FreeBSD.org\n2006/03/07"]
 siva [label="Siva Mahadevan\nsiva@FreeBSD.org\n2026/01/16"]
@@ -384,10 +389,10 @@ ticso [label="Bernd Walter\nticso@FreeBSD.org\n2002/01/31"]
 tijl [label="Tijl Coosemans\ntijl@FreeBSD.org\n2010/07/16"]
 tmunro [label="Thomas Munro\ntmunro@FreeBSD.org\n2018/10/15"]
 tpearson [label="Timothy Pearson\ntpearson@FreeBSD.org\n2025/12/02"]
-tsoome [label="Toomas Soome\ntsoome@FreeBSD.org\n2016/08/10"]
 trasz [label="Edward Tomasz Napierala\ntrasz@FreeBSD.org\n2008/08/22"]
 trhodes [label="Tom Rhodes\ntrhodes@FreeBSD.org\n2002/05/28"]
 trociny [label="Mikolaj Golub\ntrociny@FreeBSD.org\n2011/03/10"]
+tsoome [label="Toomas Soome\ntsoome@FreeBSD.org\n2016/08/10"]
 tuexen [label="Michael Tuexen\ntuexen@FreeBSD.org\n2009/06/06"]
 tychon [label="Tycho Nightingale\ntychon@FreeBSD.org\n2014/01/21"]
 ume [label="Hajimu UMEMOTO\nume@FreeBSD.org\n2000/02/26"]
@@ -435,12 +440,15 @@ adrian -> lidl
 adrian -> loos
 adrian -> mizhka
 adrian -> monthadar
+adrian -> nprice
 adrian -> ray
 adrian -> rmh
 adrian -> sephe
+adrian -> seuros
 adrian -> sgalabov
 
 ae -> melifaro
+ae -> lytboris
 
 akiyano -> osamaabb
 
@@ -532,12 +540,13 @@ delphij -> rafan
 delphij -> sephe
 
 des -> anholt
+des -> bapt
 des -> hmp
 des -> ivy
 des -> mike
 des -> olli
 des -> ru
-des -> bapt
+des -> sheda
 
 dds -> versus
 
@@ -637,6 +646,7 @@ imp -> chuck
 imp -> dmlb
 imp -> emax
 imp -> furuta
+imp -> jaeyoon
 imp -> jfree
 imp -> joe
 imp -> johalun
@@ -654,13 +664,13 @@ imp -> remko
 imp -> rik
 imp -> rink
 imp -> sanpei
+imp -> sheda
 imp -> shiba
 imp -> takawata
 imp -> toshi
 imp -> tsoome
 imp -> uch
 imp -> vexeduxr
-imp -> jaeyoon
 
 jake -> bms
 jake -> gordon
@@ -754,6 +764,7 @@ ken -> will
 
 kevans -> ivy
 kevans -> rew
+kevans -> rmoeller
 
 kib -> ae
 kib -> badger

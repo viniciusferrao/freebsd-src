@@ -355,6 +355,29 @@ typedef enum bp_embedded_type {
 #define	SPA_SYNC_MIN_VDEVS 3		/* min vdevs to update during sync */
 
 /*
+ * Get number of data block pointers an indirect block could point to (given
+ * the block level and block size shift).
+ *
+ * For example, an L1 block with a blocksize of 128kb could point to:
+ *
+ * BP_SPANB(17, 1) = 1024 L0 block pointers
+ */
+#define	BP_SPANB(indblkshift, level) \
+	(((uint64_t)1) << ((level) * ((indblkshift) - SPA_BLKPTRSHIFT)))
+
+/*
+ * Helper function to lookup the byte range covered by a block pointer of any
+ * level (L0, L1, L2 ... etc).
+ *
+ * For example if you have an L1 block, and your blocksize is 128kb (shift 17),
+ * then your block can cover this many bytes:
+ *
+ * BP_BYTE_RANGE(17, 1) = 134217728 bytes
+ */
+#define	BP_BYTE_RANGE(indblkshift, level) \
+	(BP_SPANB(indblkshift, level) * ((uint64_t)1 << indblkshift))
+
+/*
  * A block is a hole when it has either 1) never been written to, or
  * 2) is zero-filled. In both cases, ZFS can return all zeroes for all reads
  * without physically allocating disk space. Holes are represented in the
@@ -807,6 +830,7 @@ extern int bpobj_enqueue_free_cb(void *arg, const blkptr_t *bp, dmu_tx_t *tx);
 #define	SPA_ASYNC_REBUILD_DONE			0x2000
 #define	SPA_ASYNC_DETACH_SPARE			0x4000
 #define	SPA_ASYNC_REMOVE_BY_USER		0x8000
+#define	SPA_ASYNC_DEFER_DESTROY			0x10000
 
 /* device manipulation */
 extern int spa_vdev_add(spa_t *spa, nvlist_t *nvroot, boolean_t ashift_check);

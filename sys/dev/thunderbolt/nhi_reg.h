@@ -28,8 +28,6 @@
  * Thunderbolt 3 register definitions
  */
 
-/* $FreeBSD$ */
-
 #ifndef _NHI_REG_H
 #define _NHI_REG_H
 
@@ -53,6 +51,11 @@
 #define VENDOR_AMD		0x1022
 #define DEVICE_PINK_SARDINE_0	0x1668
 #define DEVICE_PINK_SARDINE_1	0x1669
+
+/* Timings */
+#define NHI_SLPR_WAIT_US	50000 /* 50 ms, tSetSR */
+#define NHI_SLPR_POLL_TRIES	100
+#define NHI_SLPR_POLL_US	(NHI_SLPR_WAIT_US / NHI_SLPR_POLL_TRIES)
 
 /* * * MMIO Registers
  * * Ring buffer registers

@@ -194,7 +194,7 @@ static int m3_chan_active(struct sc_info *);
 /* talk to the codec - called from ac97.c */
 static uint32_t m3_initcd(kobj_t, void *);
 static int	 m3_rdcd(kobj_t, void *, int);
-static int  	 m3_wrcd(kobj_t, void *, int, uint32_t);
+static int	 m3_wrcd(kobj_t, void *, int, uint32_t);
 
 /* stuff */
 static void      m3_intr(void *);
@@ -661,9 +661,9 @@ m3_pchan_trigger_locked(kobj_t kobj, void *chdata, int go)
 		/*[[inc_timer_users]]*/
 		if (m3_chan_active(sc) == 1) {
 	                m3_wr_assp_data(sc, KDATA_TIMER_COUNT_RELOAD, 240);
-        	        m3_wr_assp_data(sc, KDATA_TIMER_COUNT_CURRENT, 240);
+		        m3_wr_assp_data(sc, KDATA_TIMER_COUNT_CURRENT, 240);
 	                data = m3_rd_2(sc, HOST_INT_CTRL);
-        	        m3_wr_2(sc, HOST_INT_CTRL, data | CLKRUN_GEN_ENABLE);
+		        m3_wr_2(sc, HOST_INT_CTRL, data | CLKRUN_GEN_ENABLE);
 		}
 
                 m3_wr_assp_data(sc, ch->dac_data + CDATA_INSTANCE_READY, 1);
@@ -683,8 +683,8 @@ m3_pchan_trigger_locked(kobj_t kobj, void *chdata, int go)
 		/*[[dec_timer_users]]*/
 		if (m3_chan_active(sc) == 0) {
 	                m3_wr_assp_data(sc, KDATA_TIMER_COUNT_RELOAD, 0);
-        	        m3_wr_assp_data(sc, KDATA_TIMER_COUNT_CURRENT, 0);
-                	data = m3_rd_2(sc, HOST_INT_CTRL);
+		        m3_wr_assp_data(sc, KDATA_TIMER_COUNT_CURRENT, 0);
+			data = m3_rd_2(sc, HOST_INT_CTRL);
 	                m3_wr_2(sc, HOST_INT_CTRL, data & ~CLKRUN_GEN_ENABLE);
 		}
 
@@ -755,7 +755,7 @@ m3_rchan_init(kobj_t kobj, void *devinfo, struct snd_dbuf *b, struct pcm_channel
 	uint32_t bus_addr, i;
 
 	int idx, data_bytes, adc_data;
-	int dsp_in_size, dsp_out_size, dsp_in_buf, dsp_out_buf; 
+	int dsp_in_size, dsp_out_size, dsp_in_buf, dsp_out_buf;
 
 	struct data_word {
 	uint16_t addr, val;
@@ -1017,8 +1017,8 @@ m3_rchan_trigger_locked(kobj_t kobj, void *chdata, int go)
 		/*[[inc_timer_users]]*/
 		if (m3_chan_active(sc) == 1) {
 	                m3_wr_assp_data(sc, KDATA_TIMER_COUNT_RELOAD, 240);
-        	        m3_wr_assp_data(sc, KDATA_TIMER_COUNT_CURRENT, 240);
-                	data = m3_rd_2(sc, HOST_INT_CTRL);
+		        m3_wr_assp_data(sc, KDATA_TIMER_COUNT_CURRENT, 240);
+			data = m3_rd_2(sc, HOST_INT_CTRL);
 	                m3_wr_2(sc, HOST_INT_CTRL, data | CLKRUN_GEN_ENABLE);
 		}
 
@@ -1036,8 +1036,8 @@ m3_rchan_trigger_locked(kobj_t kobj, void *chdata, int go)
 		/*[[dec_timer_users]]*/
 		if (m3_chan_active(sc) == 0) {
 	                m3_wr_assp_data(sc, KDATA_TIMER_COUNT_RELOAD, 0);
-        	        m3_wr_assp_data(sc, KDATA_TIMER_COUNT_CURRENT, 0);
-                	data = m3_rd_2(sc, HOST_INT_CTRL);
+		        m3_wr_assp_data(sc, KDATA_TIMER_COUNT_CURRENT, 0);
+			data = m3_rd_2(sc, HOST_INT_CTRL);
 	                m3_wr_2(sc, HOST_INT_CTRL, data & ~CLKRUN_GEN_ENABLE);
 		}
 
@@ -1338,7 +1338,7 @@ m3_pci_attach(device_t dev)
 
 	if (resource_int_value(device_get_name(dev), device_get_unit(dev),
 	    "dac", &i) == 0) {
-	    	if (i < 1)
+		if (i < 1)
 			dacn = 1;
 		else if (i > M3_PCHANS)
 			dacn = M3_PCHANS;
@@ -1416,6 +1416,7 @@ m3_pci_attach(device_t dev)
 		device_printf(dev, "ac97_create error\n");
 		goto bad;
 	}
+	pcm_init(dev, sc);
 	if (mixer_init(dev, ac97_getmixerclass(), codec)) {
 		device_printf(dev, "mixer_init error\n");
 		goto bad;
@@ -1423,7 +1424,6 @@ m3_pci_attach(device_t dev)
 
 	m3_enable_ints(sc);
 
-	pcm_init(dev, sc);
 	for (i=0 ; i<dacn ; i++) {
 		if (pcm_addchan(dev, PCMDIR_PLAY, &m3_pch_class, sc)) {
 			device_printf(dev, "pcm_addchan (play) error\n");
@@ -1789,5 +1789,5 @@ static driver_t m3_driver = {
 };
 
 DRIVER_MODULE(snd_maestro3, pci, m3_driver, 0, 0);
-MODULE_DEPEND(snd_maestro3, sound, SOUND_MINVER, SOUND_PREFVER, SOUND_MAXVER);
+MODULE_DEPEND(snd_maestro3, sound, 1, 1, 1);
 MODULE_VERSION(snd_maestro3, 1);

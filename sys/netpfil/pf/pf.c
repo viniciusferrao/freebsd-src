@@ -286,6 +286,31 @@ MTX_SYSINIT(pf_overloadqueue_mtx, &pf_overloadqueue_mtx,
 #define	PF_OVERLOADQ_LOCK()	mtx_lock(&pf_overloadqueue_mtx)
 #define	PF_OVERLOADQ_UNLOCK()	mtx_unlock(&pf_overloadqueue_mtx)
 
+/*
+ * Source limiter overload table changes, applied by pf_source_table_task().
+ * Tables can only be modified with the rules lock held exclusively, which
+ * packet processing does not hold.
+ */
+struct pf_source_table_entry {
+	STAILQ_ENTRY(pf_source_table_entry)	next;
+	struct pfr_addr				addr;
+	struct pfr_ktable			*table;	/* compared only */
+	uint32_t				id;
+	bool					insert;
+};
+
+STAILQ_HEAD(pf_source_table_head, pf_source_table_entry);
+VNET_DEFINE_STATIC(struct pf_source_table_head, pf_source_tablequeue);
+#define	V_pf_source_tablequeue	VNET(pf_source_tablequeue)
+VNET_DEFINE_STATIC(struct task, pf_source_tabletask);
+#define	V_pf_source_tabletask	VNET(pf_source_tabletask)
+
+static struct mtx_padalign pf_source_tablequeue_mtx;
+MTX_SYSINIT(pf_source_tablequeue_mtx, &pf_source_tablequeue_mtx,
+    "pf source limiter table queue", MTX_DEF);
+#define	PF_SOURCE_TABLEQ_LOCK()		mtx_lock(&pf_source_tablequeue_mtx)
+#define	PF_SOURCE_TABLEQ_UNLOCK()	mtx_unlock(&pf_source_tablequeue_mtx)
+
 VNET_DEFINE(struct pf_krulequeue, pf_unlinked_rules);
 struct mtx_padalign pf_unlnkdrules_mtx;
 MTX_SYSINIT(pf_unlnkdrules_mtx, &pf_unlnkdrules_mtx, "pf unlinked rules",
@@ -402,6 +427,9 @@ static void		 pf_log_matches(struct pf_pdesc *, struct pf_krule *,
 			    struct pf_krule *, struct pf_kruleset *,
 			    struct pf_krule_slist *);
 static void		 pf_overload_task(void *v, int pending);
+static void		 pf_source_table_task(void *v, int pending);
+static bool		 pf_source_table_enqueue(struct pf_source *sr,
+			    bool insert);
 static u_short		 pf_insert_src_node(struct pf_ksrc_node *[PF_SN_MAX],
 			    struct pf_srchash *[PF_SN_MAX], struct pf_krule *,
 			    struct pf_addr *, sa_family_t, struct pf_addr *,
@@ -571,6 +599,15 @@ pf_source_purge(void)
 		    srlim->pfsrlim_rate.seconds + 1)
 			continue;
 
+		/* Retry a removal pf_source_rele() failed to queue. */
+		if (sr->pfsr_intable &&
+		    srlim->pfsrlim_overload.table != NULL &&
+		    srlim->pfsrlim_overload.lwm > 0) {
+			if (!pf_source_table_enqueue(sr, false))
+				continue;
+			sr->pfsr_intable = 0;
+		}
+
 		TAILQ_REMOVE(&pf_source_gc, sr, pfsr_empty_gc);
 
 		RB_REMOVE(pf_source_tree, &srlim->pfsrlim_sources, sr);
@@ -603,11 +640,79 @@ pf_source_pfr_addr(struct pfr_addr *p, const struct pf_source *sr)
 	}
 }
 
+/*
+ * Queue an overload table change for pf_source_table_task().  The entry
+ * identifies the limiter by id and remembers its table: either may be gone
+ * or replaced by the time the task runs, in which case the change is
+ * dropped.
+ */
+static bool
+pf_source_table_enqueue(struct pf_source *sr, bool insert)
+{
+	struct pf_source_table_entry *pfste;
+
+	pfste = malloc(sizeof(*pfste), M_PFTEMP, M_NOWAIT);
+	if (pfste == NULL)
+		return (false);
+
+	pf_source_pfr_addr(&pfste->addr, sr);
+	pfste->table = sr->pfsr_parent->pfsrlim_overload.table;
+	pfste->id = sr->pfsr_parent->pfsrlim_id;
+	pfste->insert = insert;
+
+	PF_SOURCE_TABLEQ_LOCK();
+	STAILQ_INSERT_TAIL(&V_pf_source_tablequeue, pfste, next);
+	PF_SOURCE_TABLEQ_UNLOCK();
+	taskqueue_enqueue(taskqueue_swi, &V_pf_source_tabletask);
+
+	return (true);
+}
+
+static void
+pf_source_table_task(void *v, int pending __unused)
+{
+	struct pf_source_table_head queue = STAILQ_HEAD_INITIALIZER(queue);
+	struct pf_source_table_entry *pfste, *npfste;
+	struct pf_sourcelim *srlim;
+	struct pfr_ktable *t;
+
+	CURVNET_SET((struct vnet *)v);
+
+	PF_SOURCE_TABLEQ_LOCK();
+	STAILQ_CONCAT(&queue, &V_pf_source_tablequeue);
+	PF_SOURCE_TABLEQ_UNLOCK();
+
+	/* A previous run may already have processed the queue. */
+	if (STAILQ_EMPTY(&queue)) {
+		CURVNET_RESTORE();
+		return;
+	}
+
+	PF_RULES_WLOCK();
+	STAILQ_FOREACH(pfste, &queue, next) {
+		srlim = pf_sourcelim_find(pfste->id);
+		if (srlim == NULL ||
+		    (t = srlim->pfsrlim_overload.table) == NULL ||
+		    t != pfste->table)
+			continue;
+
+		if (pfste->insert)
+			pfr_insert_kentry(t, &pfste->addr, time_second);
+		else
+			pfr_remove_kentry(t, &pfste->addr);
+	}
+	PF_RULES_WUNLOCK();
+
+	STAILQ_FOREACH_SAFE(pfste, &queue, next, npfste)
+		free(pfste, M_PFTEMP);
+
+	CURVNET_RESTORE();
+}
+
 static void
 pf_source_used(struct pf_source *sr)
 {
 	struct pf_sourcelim *srlim = sr->pfsr_parent;
-	struct pfr_ktable *t;
 	unsigned int used;
 
 	used = sr->pfsr_inuse++;
@@ -615,14 +720,10 @@ pf_source_used(struct pf_source *sr)
 
 	if (used == 0)
 		TAILQ_REMOVE(&pf_source_gc, sr, pfsr_empty_gc);
-	else if ((t = srlim->pfsrlim_overload.table) != NULL &&
+	else if (srlim->pfsrlim_overload.table != NULL &&
 	    used >= srlim->pfsrlim_overload.hwm && !sr->pfsr_intable) {
-		struct pfr_addr p;
-
-		pf_source_pfr_addr(&p, sr);
-
-		pfr_insert_kentry(t, &p, time_second);
-		sr->pfsr_intable = 1;
+		if (pf_source_table_enqueue(sr, true))
+			sr->pfsr_intable = 1;
 	}
 }
 
@@ -630,20 +731,14 @@ static void
 pf_source_rele(struct pf_source *sr)
 {
 	struct pf_sourcelim *srlim = sr->pfsr_parent;
-	struct pfr_ktable *t;
 	unsigned int used;
 
 	used = --sr->pfsr_inuse;
 
-	t = srlim->pfsrlim_overload.table;
-	if (t != NULL && sr->pfsr_intable &&
+	if (srlim->pfsrlim_overload.table != NULL && sr->pfsr_intable &&
 	    used < srlim->pfsrlim_overload.lwm) {
-		struct pfr_addr p;
-
-		pf_source_pfr_addr(&p, sr);
-
-		pfr_remove_kentry(t, &p);
-		sr->pfsr_intable = 0;
+		if (pf_source_table_enqueue(sr, false))
+			sr->pfsr_intable = 0;
 	}
 
 	if (used == 0) {
@@ -1543,6 +1638,8 @@ retry_waitok3:
 	STAILQ_INIT(&V_pf_sendqueue);
 	SLIST_INIT(&V_pf_overloadqueue);
 	TASK_INIT(&V_pf_overloadtask, 0, pf_overload_task, curvnet);
+	STAILQ_INIT(&V_pf_source_tablequeue);
+	TASK_INIT(&V_pf_source_tabletask, 0, pf_source_table_task, curvnet);
 
 	/* Unlinked, but may be referenced rules. */
 	TAILQ_INIT(&V_pf_unlinked_rules);
@@ -2935,7 +3032,13 @@ pf_purge_thread(void *unused __unused)
 				 */
 				pf_purge_expired_fragments();
 				pf_purge_expired_src_nodes();
+				/*
+				 * Takes the config lock, and may have to
+				 * sleep for it.
+				 */
+				NET_EPOCH_EXIT(et);
 				pf_purge_unlinked_rules();
+				NET_EPOCH_ENTER(et);
 				pf_source_purge();
 				pfi_kkif_purge();
 			}
@@ -2954,6 +3057,9 @@ void
 pf_unload_vnet_purge(void)
 {
 
+	/* Overload entries reference rules: apply them before rules are freed. */
+	taskqueue_drain(taskqueue_swi, &V_pf_overloadtask);
+
 	/*
 	 * To cleanse up all kifs and rules we need
 	 * two runs: first one clears reference flags,
@@ -2970,6 +3076,9 @@ pf_unload_vnet_purge(void)
 	pf_purge_fragments(UINT_MAX);
 	pf_purge_expired_src_nodes();
 	pf_source_purge();
+
+	/* All states are gone, so no more table changes can be queued. */
+	taskqueue_drain(taskqueue_swi, &V_pf_source_tabletask);
 
 	/*
 	 * Now all kifs & rules should be unreferenced,
@@ -3223,6 +3332,14 @@ pf_free_state(struct pf_kstate *cur)
 	pf_counter_u64_add(&V_pf_status.fcounters[FCNT_STATE_REMOVALS], 1);
 }
 
+static inline void
+pf_kkif_mark(struct pfi_kkif *kif)
+{
+
+	if ((atomic_load_int(&kif->pfik_flags) & PFI_IFLAG_REFS) == 0)
+		atomic_set_int(&kif->pfik_flags, PFI_IFLAG_REFS);
+}
+
 /*
  * Called only from pf_purge_thread(), thus serialized.
  */
@@ -3258,11 +3375,11 @@ relock:
 					s->nat_rule->rule_ref |= PFRULE_REFS;
 				if (s->anchor != NULL)
 					s->anchor->rule_ref |= PFRULE_REFS;
-				s->kif->pfik_flags |= PFI_IFLAG_REFS;
+				pf_kkif_mark(s->kif);
 				SLIST_FOREACH(mrm, &s->match_rules, entry)
 					mrm->r->rule_ref |= PFRULE_REFS;
 				if (s->act.rt_kif)
-					s->act.rt_kif->pfik_flags |= PFI_IFLAG_REFS;
+					pf_kkif_mark(s->act.rt_kif);
 				count++;
 			}
 			PF_HASHROW_UNLOCK(ih);
@@ -5678,8 +5795,7 @@ pf_test_eth_rule(int dir, struct pfi_kkif *kif, struct mbuf **m0)
 		return (PF_PASS);
 	}
 
-	if (__predict_false(m->m_len < sizeof(struct ether_header)) &&
-	    (m = *m0 = m_pullup(*m0, sizeof(struct ether_header))) == NULL) {
+	if ((m = *m0 = m_pullup(*m0, sizeof(struct ether_header))) == NULL) {
 		DPFPRINTF(PF_DEBUG_URGENT,
 		    "%s: m_len < sizeof(struct ether_header)"
 		     ", pullup failed", __func__);
@@ -7290,7 +7406,7 @@ pf_tcp_track_full(struct pf_kstate *state, struct pf_pdesc *pd,
 {
 	struct tcphdr		*th = &pd->hdr.tcp;
 	u_int16_t		 win = ntohs(th->th_win);
-	u_int32_t		 ack, end, data_end, seq, orig_seq;
+	u_int32_t		 ack, orig_ack, end, data_end, seq, orig_seq;
 	u_int8_t		 sws, dws;
 	int			 ackskew;
 
@@ -7389,6 +7505,7 @@ pf_tcp_track_full(struct pf_kstate *state, struct pf_pdesc *pd,
 		if (tcp_get_flags(th) & TH_FIN)
 			end++;
 	}
+	orig_ack = ack;
 
 	if ((tcp_get_flags(th) & TH_ACK) == 0) {
 		/* Let it pass through the ack skew check */
@@ -7442,7 +7559,7 @@ pf_tcp_track_full(struct pf_kstate *state, struct pf_pdesc *pd,
 	    (orig_seq == src->seqlo + 1) || (orig_seq + 1 == src->seqlo) ||
 	    /* Require an exact/+1 sequence match on resets when possible */
 	    (SEQ_GEQ(orig_seq, src->seqlo - (dst->max_win << dws)) &&
-	    SEQ_LEQ(orig_seq, src->seqlo + 1) && ackskew == 0 &&
+	    SEQ_LEQ(orig_seq, src->seqlo + 1) && orig_ack == dst->seqlo &&
 	    (th->th_flags & (TH_ACK|TH_RST)) == (TH_ACK|TH_RST)))) {
 		/* Allow resets to match sequence window if ack is perfect match */
 
@@ -8738,9 +8855,21 @@ pf_test_state_icmp(struct pf_kstate **state, struct pf_pdesc *pd,
 					    &pd->hdr.icmp6.icmp6_cksum,
 					    &nk->addr[didx], 0);
 
-				if (nk->port[iidx] != pd->hdr.icmp6.icmp6_id)
+				/*
+				 * Only echo has an identifier.  Other
+				 * types use a virtual id of 0 and keep
+				 * other fields here (e.g. the NA flags).
+				 */
+				if (virtual_type == htons(ICMP6_ECHO_REQUEST) &&
+				    nk->port[iidx] != pd->hdr.icmp6.icmp6_id) {
+					pd->hdr.icmp6.icmp6_cksum =
+					    pf_cksum_fixup(
+					    pd->hdr.icmp6.icmp6_cksum,
+					    pd->hdr.icmp6.icmp6_id,
+					    nk->port[iidx], 0);
 					pd->hdr.icmp6.icmp6_id =
 					    nk->port[iidx];
+				}
 
 				m_copyback(pd->m, pd->off, sizeof(struct icmp6_hdr),
 				    (caddr_t )&pd->hdr.icmp6);
@@ -10807,7 +10936,7 @@ static int
 pf_walk_header(struct pf_pdesc *pd, struct ip *h, u_short *reason)
 {
 	struct ah	 ext;
-	u_int32_t	 hlen, end;
+	u_int32_t	 hlen, end, extlen;
 	int		 hdr_cnt;
 
 	hlen = h->ip_hl << 2;
@@ -10855,7 +10984,16 @@ pf_walk_header(struct pf_pdesc *pd, struct ip *h, u_short *reason)
 				DPFPRINTF(PF_DEBUG_MISC, "IP short exthdr");
 				return (PF_DROP);
 			}
-			pd->off += (ext.ah_len + 2) * 4;
+			extlen = (ext.ah_len + 2) * 4;
+			if (end < pd->off + extlen) {
+				if ((h->ip_off & htons(IP_MF | IP_OFFMASK))
+				    != 0)
+					return (PF_PASS);
+				DPFPRINTF(PF_DEBUG_MISC, "IP long exthdr");
+				REASON_SET(reason, PFRES_SHORT);
+				return (PF_DROP);
+			}
+			pd->off += extlen;
 			pd->proto = ext.ah_nxt;
 			break;
 		default:
@@ -10944,7 +11082,7 @@ pf_walk_header6(struct pf_pdesc *pd, struct ip6_hdr *h, u_short *reason)
 	struct ip6_ext		 ext;
 	struct icmp6_hdr	 icmp6;
 	struct ip6_rthdr	 rthdr;
-	uint32_t		 end;
+	uint32_t		 end, extlen;
 	int			 hdr_cnt, fraghdr_cnt = 0, rthdr_cnt = 0;
 
 	pd->off += sizeof(struct ip6_hdr);
@@ -11055,9 +11193,20 @@ pf_walk_header6(struct pf_pdesc *pd, struct ip6_hdr *h, u_short *reason)
 				return (PF_DROP);
 			}
 			if (pd->proto == IPPROTO_AH)
-				pd->off += (ext.ip6e_len + 2) * 4;
+				extlen = (ext.ip6e_len + 2) * 4;
 			else
-				pd->off += (ext.ip6e_len + 1) * 8;
+				extlen = (ext.ip6e_len + 1) * 8;
+			if (end < pd->off + extlen) {
+				if (pd->fragoff != 0) {
+					pd->off = pd->fragoff;
+					pd->proto = IPPROTO_FRAGMENT;
+					return (PF_PASS);
+				}
+				DPFPRINTF(PF_DEBUG_MISC, "IPv6 long exthdr");
+				REASON_SET(reason, PFRES_SHORT);
+				return (PF_DROP);
+			}
+			pd->off += extlen;
 			pd->proto = ext.ip6e_nxt;
 			break;
 		case IPPROTO_ICMPV6:
@@ -11085,9 +11234,17 @@ pf_walk_header6(struct pf_pdesc *pd, struct ip6_hdr *h, u_short *reason)
 				 * local source address.  If either one is
 				 * missing then MLD message is invalid and
 				 * should be discarded.
+				 * RFC 3590 clarifies that during initial
+				 * duplicate address detection nodes may not
+				 * have an address, so are permitted to use
+				 * the unspecified address, but only for Report
+				 * and Done messages.
 				 */
 				if ((h->ip6_hlim != 1) ||
-				    !IN6_IS_ADDR_LINKLOCAL(&h->ip6_src)) {
+				    (!IN6_IS_ADDR_LINKLOCAL(&h->ip6_src) &&
+				     icmp6.icmp6_type == MLD_LISTENER_QUERY) ||
+				    (!IN6_IS_ADDR_LINKLOCAL(&h->ip6_src) &&
+				    !IN6_IS_ADDR_UNSPECIFIED(&h->ip6_src))) {
 					DPFPRINTF(PF_DEBUG_MISC, "Invalid MLD");
 					REASON_SET(reason, PFRES_IPOPTIONS);
 					return (PF_DROP);
@@ -11155,8 +11312,7 @@ pf_setup_pdesc(sa_family_t af, int dir, struct pf_pdesc *pd, struct mbuf **m0,
 	case AF_INET: {
 		struct ip *h;
 
-		if (__predict_false((*m0)->m_len < sizeof(struct ip)) &&
-		    (pd->m = *m0 = m_pullup(*m0, sizeof(struct ip))) == NULL) {
+		if ((pd->m = *m0 = m_pullup(*m0, sizeof(struct ip))) == NULL) {
 			DPFPRINTF(PF_DEBUG_URGENT,
 			    "%s: m_len < sizeof(struct ip), pullup failed",
 			    __func__);
@@ -11206,8 +11362,7 @@ pf_setup_pdesc(sa_family_t af, int dir, struct pf_pdesc *pd, struct mbuf **m0,
 	case AF_INET6: {
 		struct ip6_hdr *h;
 
-		if (__predict_false((*m0)->m_len < sizeof(struct ip6_hdr)) &&
-		    (pd->m = *m0 = m_pullup(*m0, sizeof(struct ip6_hdr))) == NULL) {
+		if ((pd->m = *m0 = m_pullup(*m0, sizeof(struct ip6_hdr))) == NULL) {
 			DPFPRINTF(PF_DEBUG_URGENT,
 			    "%s: m_len < sizeof(struct ip6_hdr)"
 			     ", pullup failed", __func__);

@@ -395,11 +395,11 @@ static const pci_vendor_info_t igbv_vendor_info_array[] = {
 	PVID(0x8086, E1000_DEV_ID_82576_VF,
 	    "Intel(R) PRO/1000 82576 Virtual Function"),
 	PVID(0x8086, E1000_DEV_ID_82576_VF_HV,
-	    "Intel(R) PRO/1000 82576 Virtual Function"),
+	    "Intel(R) PRO/1000 82576 Hyper-V Virtual Function"),
 	PVID(0x8086, E1000_DEV_ID_I350_VF,
 	    "Intel(R) I350 Virtual Function"),
 	PVID(0x8086, E1000_DEV_ID_I350_VF_HV,
-	    "Intel(R) I350 Virtual Function"),
+	    "Intel(R) I350 Hyper-V Virtual Function"),
 	PVID_END
 };
 
@@ -544,6 +544,7 @@ static void	em_handle_link(void *);
 
 static void	em_enable_vectors_82574(if_ctx_t);
 
+static void	em_sysctl_request_reinit(struct e1000_softc *);
 static int	em_set_flowcntl(SYSCTL_HANDLER_ARGS);
 static int	em_sysctl_eee(SYSCTL_HANDLER_ARGS);
 static int	igb_sysctl_dmac(SYSCTL_HANDLER_ARGS);
@@ -1223,6 +1224,7 @@ em_add_device_sysctls(struct e1000_softc *sc)
 	    CTLTYPE_STRING | CTLFLAG_RD, sc, 0,
 	    em_sysctl_print_fw_version, "A",
 	    "Prints FW/NVM Versions");
+	sc->fc = e1000_fc_full;
 	SYSCTL_ADD_PROC(ctx_list, child, OID_AUTO, "fc",
 	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_NEEDGIANT, sc, 0,
 	    em_set_flowcntl, "I", "Flow Control");
@@ -1323,6 +1325,12 @@ em_if_attach_pre(if_ctx_t ctx)
 		scctx->isc_tx_tso_segsize_max = EM_TSO_SEG_SIZE;
 		scctx->isc_capabilities = scctx->isc_capenable =
 		    sc->vf_ifp ? IGBV_CAPS : IGB_CAPS;
+		if (igbv_is_hyperv(sc)) {
+			/* The host owns VLAN filters and the receive-frame limit. */
+			scctx->isc_capabilities &=
+			    ~(IFCAP_VLAN_HWFILTER | IFCAP_JUMBO_MTU);
+			scctx->isc_capenable = scctx->isc_capabilities;
+		}
 		scctx->isc_tx_csum_flags = CSUM_TCP | CSUM_UDP | CSUM_TSO |
 		     CSUM_IP6_TCP | CSUM_IP6_UDP;
 		if (hw->mac.type != e1000_82575)
@@ -1500,6 +1508,9 @@ em_if_attach_pre(if_ctx_t ctx)
 		goto err_pci;
 	}
 
+	if (igbv_is_hyperv(sc))
+		igbv_init_hv_ops(hw);
+
 	em_setup_msix(ctx);
 	e1000_get_bus_info(hw);
 
@@ -1637,7 +1648,7 @@ em_if_attach_pre(if_ctx_t ctx)
 	/* Copy the permanent MAC address out of the EEPROM */
 	if (e1000_read_mac_addr(hw) < 0) {
 		device_printf(dev,
-		    "EEPROM read error while reading MAC address\n");
+		    "Unable to read MAC address\n");
 		error = EIO;
 		goto err_late;
 	}
@@ -1855,6 +1866,10 @@ em_if_mtu_set(if_ctx_t ctx, uint32_t mtu)
 
 	IOCTL_DEBUGOUT("ioctl rcv'd: SIOCSIFMTU (Set Interface MTU)");
 
+	/* No native SET_LPE exchange is available with a Hyper-V PF. */
+	if (igbv_is_hyperv(sc) && mtu > ETHERMTU)
+		return (EINVAL);
+
 	switch (sc->hw.mac.type) {
 	case e1000_82571:
 	case e1000_82572:
@@ -1930,7 +1945,7 @@ em_if_init(if_ctx_t ctx)
 
 	/*
 	 * A VF restores its address only after its reset handshake establishes
-	 * CTS.  The PF path programs RAR[0] directly here.
+	 * its PF-assigned state.  The PF path programs RAR[0] directly here.
 	 */
 	if (!sc->vf_ifp)
 		e1000_rar_set(&sc->hw, sc->hw.mac.addr, 0);
@@ -1953,6 +1968,7 @@ em_if_init(if_ctx_t ctx)
 		(void)igbv_reset(ctx);
 		em_rebase_vf_stats(sc);
 	} else if (em_reset(ctx) != E1000_SUCCESS) {
+		em_fence_pci_busmaster(sc);
 		iflib_init_failed(ctx);
 		return;
 	}
@@ -1976,7 +1992,7 @@ em_if_init(if_ctx_t ctx)
 	 * Keep a fail-closed device fenced until reset and VF queue
 	 * sanitization have removed every stale DMA address.
 	 */
-	if (sc->vf_ifp && em_enable_pci_busmaster(sc) != 0) {
+	if (em_enable_pci_busmaster(sc) != 0) {
 		device_printf(sc->dev,
 		    "Unable to enable PCI bus mastering\n");
 		iflib_init_failed(ctx);
@@ -3695,6 +3711,10 @@ em_if_set_promisc_impl(if_ctx_t ctx, int flags)
 	u32 reg_rctl;
 	int mcnt = 0;
 
+	/* Hyper-V receive-mode policy is configured through the host. */
+	if (igbv_is_hyperv(sc))
+		return (0);
+
 	if (sc->vf_ifp) {
 		if (flags & IFF_PROMISC)
 			type = e1000_promisc_enabled;
@@ -4141,6 +4161,7 @@ em_if_stop(if_ctx_t ctx)
 		if (!sc->vf_ifp && error != E1000_SUCCESS) {
 			device_printf(sc->dev, "Hardware reset failed while "
 			    "stopping: %d\n", error);
+			em_fence_pci_busmaster(sc);
 			return;
 		}
 	}
@@ -5076,10 +5097,7 @@ em_reset(if_ctx_t ctx)
 	    roundup2(hw->mac.max_frame_size, 1024);
 	hw->fc.low_water = hw->fc.high_water - 1500;
 
-	if (sc->fc) /* locally set flow control value? */
-		hw->fc.requested_mode = sc->fc;
-	else
-		hw->fc.requested_mode = e1000_fc_full;
+	hw->fc.requested_mode = sc->fc;
 
 	if (hw->mac.type == e1000_80003es2lan)
 		hw->fc.pause_time = 0xFFFF;
@@ -5092,7 +5110,10 @@ em_reset(if_ctx_t ctx)
 	switch (hw->mac.type) {
 	case e1000_pchlan:
 		/* Workaround: no TX flow ctrl for PCH */
-		hw->fc.requested_mode = e1000_fc_rx_pause;
+		if (hw->fc.requested_mode == e1000_fc_full)
+			hw->fc.requested_mode = e1000_fc_rx_pause;
+		else if (hw->fc.requested_mode == e1000_fc_tx_pause)
+			hw->fc.requested_mode = e1000_fc_none;
 		hw->fc.pause_time = 0xFFFF; /* override */
 		if (if_getmtu(ifp) > ETHERMTU) {
 			hw->fc.high_water = 0x3500;
@@ -5212,11 +5233,13 @@ em_initialize_rss_mapping(struct e1000_softc *sc)
 	/*
 	 * Configure RSS key
 	 */
-	arc4rand(rss_key, sizeof(rss_key), 0);
+	_Static_assert(sizeof(rss_key) == RSS_KEYSIZE,
+	    "RSS key size mismatch");
+	rss_getkey(rss_key);
 	for (i = 0; i < RSSKEYLEN; ++i) {
 		uint32_t rssrk = 0;
 
-		rssrk = EM_RSSRK_VAL(rss_key, i);
+		rssrk = le32dec(rss_key + i * sizeof(rssrk));
 		E1000_WRITE_REG(hw,E1000_RSSRK(i), rssrk);
 	}
 
@@ -6139,6 +6162,10 @@ em_if_vlan_register(if_ctx_t ctx, u16 vtag)
 	bool present;
 	u32 index, mask;
 
+	/* Hyper-V supports host-assigned access VLANs, not guest VLANs. */
+	if (igbv_is_hyperv(sc))
+		return;
+
 	index = (vtag >> 5) & 0x7F;
 	mask = 1U << (vtag & 0x1F);
 	present = (sc->shadow_vfta[index] & mask) != 0;
@@ -6171,6 +6198,9 @@ em_if_vlan_unregister(if_ctx_t ctx, u16 vtag)
 	struct e1000_softc *sc = iflib_get_softc(ctx);
 	bool present;
 	u32 index, mask;
+
+	if (igbv_is_hyperv(sc))
+		return;
 
 	index = (vtag >> 5) & 0x7F;
 	mask = 1U << (vtag & 0x1F);
@@ -6285,6 +6315,10 @@ em_setup_vlan_hw_support(if_ctx_t ctx)
 	u32 max_frame_size, reg;
 	u16 vid;
 	int restore_failures;
+
+	/* Hyper-V programs the VF's receive limit and VLAN membership. */
+	if (igbv_is_hyperv(sc))
+		return;
 
 	/*
 	 * Only PFs have control over VLAN HW filtering
@@ -6569,7 +6603,6 @@ em_automask_tso(if_ctx_t ctx)
 	if_softc_ctx_t scctx = iflib_get_softc_ctx(ctx);
 	if_t ifp = iflib_get_ifp(ctx);
 	bool reset_needed;
-	int drvflags;
 
 	if (!em_unsupported_tso && sc->link_speed &&
 	    sc->link_speed != SPEED_1000 &&
@@ -6589,16 +6622,13 @@ em_automask_tso(if_ctx_t ctx)
 	}
 
 	/*
-	 * Reset a running interface, or one being initialized while
-	 * administratively up.  OACTIVE remains set after iflib_stop(), so
-	 * it alone cannot distinguish initialization from an interface that
-	 * is down.  In other states, the next initialization will apply the
-	 * updated capabilities.
+	 * Apply the new capabilities to a running or administratively-up
+	 * interface, including one whose initialization has not completed.
+	 * A stopped, administratively-down interface will apply them at the
+	 * next initialization; driver flags do not describe that intent.
 	 */
-	drvflags = if_getdrvflags(ifp);
-	reset_needed = (drvflags & IFF_DRV_RUNNING) != 0 ||
-	    ((drvflags & IFF_DRV_OACTIVE) != 0 &&
-	    (if_getflags(ifp) & IFF_UP) != 0);
+	reset_needed = iflib_is_running(ctx) ||
+	    (if_getflags(ifp) & IFF_UP) != 0;
 	if (!reset_needed)
 		return (false);
 
@@ -7439,6 +7469,11 @@ static void
 em_rebase_vf_stats(struct e1000_softc *sc)
 {
 	struct e1000_vf_stats *stats;
+	bool hyperv = igbv_is_hyperv(sc);
+
+	sc->vf_stats_valid = false;
+	if (hyperv && E1000_READ_REG(&sc->hw, E1000_STATUS) == 0xffffffff)
+		return;
 
 	/*
 	 * A PF reset starts a new VF counter epoch.  Preserve the accumulated
@@ -7467,14 +7502,30 @@ em_rebase_vf_stats(struct e1000_softc *sc)
 	INIT_VF_REG(E1000_VFGORLBC, gorlbc);
 	INIT_VF_REG(E1000_VFGPRLBC, gprlbc);
 #undef INIT_VF_REG
+	sc->vf_stats_valid = !hyperv ||
+	    E1000_READ_REG(&sc->hw, E1000_STATUS) != 0xffffffff;
 }
 
 static void
 em_update_vf_stats_counters(struct e1000_softc *sc)
 {
+	struct e1000_vf_stats sample;
 	struct e1000_vf_stats *stats;
+	bool hyperv, reset;
 
-	stats = &sc->ustats.vf_stats;
+	hyperv = igbv_is_hyperv(sc);
+	if (hyperv && E1000_READ_REG(&sc->hw, E1000_STATUS) == 0xffffffff) {
+		sc->vf_stats_valid = false;
+		return;
+	}
+	reset = hyperv && e1000_check_for_rst(&sc->hw, 0) == E1000_SUCCESS;
+	if (hyperv && !sc->vf_stats_valid)
+		reset = true;
+	if (hyperv && (E1000_READ_REG(&sc->hw, E1000_TXDCTL(0)) &
+	    E1000_TXDCTL_QUEUE_ENABLE) == 0)
+		reset = true;
+	sample = sc->ustats.vf_stats;
+	stats = &sample;
 
 	/*
 	 * Internal VF loopback traffic can continue without physical link,
@@ -7499,6 +7550,29 @@ em_update_vf_stats_counters(struct e1000_softc *sc)
 	    stats->last_gorlbc, stats->gorlbc);
 	UPDATE_VF_REG(E1000_VFGPRLBC,
 	    stats->last_gprlbc, stats->gprlbc);
+	/*
+	 * Hyper-V can reset the VF without a native mailbox handshake.  Do not
+	 * count that counter clear as a 32-bit wrap, including a reset during
+	 * this sweep.  The PF can also clear counters while blocking a queue
+	 * for MDD without leaving a reset indication.  Hyper-V has one queue;
+	 * a disabled queue cannot supply a valid running counter epoch.
+	 */
+	if (hyperv) {
+		if (e1000_check_for_rst(&sc->hw, 0) == E1000_SUCCESS)
+			reset = true;
+		if ((E1000_READ_REG(&sc->hw, E1000_TXDCTL(0)) &
+		    E1000_TXDCTL_QUEUE_ENABLE) == 0)
+			reset = true;
+		if (E1000_READ_REG(&sc->hw, E1000_STATUS) == 0xffffffff) {
+			/* Rebase on a good sample before accounting further deltas. */
+			sc->vf_stats_valid = false;
+			return;
+		}
+	}
+	if (reset)
+		em_rebase_vf_stats(sc);
+	else
+		sc->ustats.vf_stats = sample;
 }
 
 static uint64_t
@@ -8461,16 +8535,13 @@ em_add_int_delay_sysctl(struct e1000_softc *sc, const char *name,
 static int
 em_set_flowcntl(SYSCTL_HANDLER_ARGS)
 {
-	int error;
-	static int input = 3; /* default is full */
+	int error, input;
 	struct e1000_softc *sc = (struct e1000_softc *) arg1;
 
+	input = sc->fc;
 	error = sysctl_handle_int(oidp, &input, 0, req);
 
 	if ((error) || (req->newptr == NULL))
-		return (error);
-
-	if (input == sc->fc) /* no change? */
 		return (error);
 
 	switch (input) {
@@ -8478,17 +8549,21 @@ em_set_flowcntl(SYSCTL_HANDLER_ARGS)
 	case e1000_fc_tx_pause:
 	case e1000_fc_full:
 	case e1000_fc_none:
-		sc->hw.fc.requested_mode = input;
-		sc->fc = input;
 		break;
 	default:
-		/* Do nothing */
-		return (error);
+		return (EINVAL);
 	}
 
-	sc->hw.fc.current_mode = sc->hw.fc.requested_mode;
-	e1000_force_mac_fc(&sc->hw);
-	return (error);
+	if (input == sc->fc) /* no change? */
+		return (0);
+
+	/*
+	 * The mode is advertised to the link partner and also decides the
+	 * pause thresholds and per-queue drop, so it takes a reinit to apply.
+	 */
+	sc->fc = input;
+	em_sysctl_request_reinit(sc);
+	return (0);
 }
 
 static void
@@ -8629,7 +8704,6 @@ static void
 em_print_debug_info(struct e1000_softc *sc)
 {
 	device_t dev = iflib_get_dev(sc->ctx);
-	if_t ifp = iflib_get_ifp(sc->ctx);
 	struct tx_ring *txr;
 	struct rx_ring *rxr;
 
@@ -8637,15 +8711,8 @@ em_print_debug_info(struct e1000_softc *sc)
 		device_printf(dev, "queue state is unavailable\n");
 		return;
 	}
-	if (if_getdrvflags(ifp) & IFF_DRV_RUNNING)
-		printf("Interface is RUNNING ");
-	else
-		printf("Interface is NOT RUNNING\n");
-
-	if (if_getdrvflags(ifp) & IFF_DRV_OACTIVE)
-		printf("and INACTIVE\n");
-	else
-		printf("and ACTIVE\n");
+	device_printf(dev, "iflib software admission: %s\n",
+	    iflib_is_running(sc->ctx) ? "open" : "closed");
 
 	for (int i = 0; i < sc->tx_num_queues; i++) {
 		txr = &sc->tx_queues[i].txr;

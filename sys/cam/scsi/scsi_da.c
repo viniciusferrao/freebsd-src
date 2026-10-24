@@ -72,6 +72,10 @@
 #include <cam/scsi/scsi_da.h>
 
 #ifdef _KERNEL
+/* SDT Probes */
+SDT_PROBE_DEFINE3(cam, , da, error, "union ccb *", "uint32_t", "uint32_t");
+SDT_PROBE_DEFINE2(cam, , da, recovery, "union ccb *", "int");
+
 /*
  * Note that there are probe ordering dependencies here.  The order isn't
  * controlled by this enumeration, but by explicit state transitions in
@@ -4654,6 +4658,7 @@ static void
 dadone(struct cam_periph *periph, union ccb *done_ccb)
 {
 	struct bio *bp, *bp1;
+	struct bio_queue queue;
 	struct da_softc *softc;
 	struct ccb_scsiio *csio;
 	da_ccb_state state;
@@ -4784,16 +4789,21 @@ dadone(struct cam_periph *periph, union ccb *done_ccb)
 	 * the case of sendfile can be quite extensive. Release the periph
 	 * refcount taken in dastart() for each CCB.
 	 */
-	cam_iosched_bio_complete(softc->cam_iosched, bp, done_ccb);
+	if (state == DA_CCB_DELETE) {
+		TAILQ_INIT(&queue);
+		TAILQ_INSERT_HEAD(&queue, bp, bio_queue);
+		TAILQ_CONCAT(&queue, &softc->delete_run_queue.queue,
+		    bio_queue);
+		softc->delete_run_queue.insert_point = NULL;
+		cam_iosched_bio_queue_update_stats(softc->cam_iosched, &queue,
+		    done_ccb, bp->bio_error);
+	} else {
+		cam_iosched_bio_update_stats(softc->cam_iosched, bp, done_ccb);
+	}
 	xpt_release_ccb(done_ccb);
 	KASSERT(softc->refcount >= 1, ("dadone softc %p refcount %d", softc, softc->refcount));
 	softc->refcount--;
 	if (state == DA_CCB_DELETE) {
-		TAILQ_HEAD(, bio) queue;
-
-		TAILQ_INIT(&queue);
-		TAILQ_CONCAT(&queue, &softc->delete_run_queue.queue, bio_queue);
-		softc->delete_run_queue.insert_point = NULL;
 		/*
 		 * Normally, the xpt_release_ccb() above would make sure
 		 * that when we have more work to do, that work would
@@ -4809,20 +4819,14 @@ dadone(struct cam_periph *periph, union ccb *done_ccb)
 		cam_periph_unlock(periph);
 		while ((bp1 = TAILQ_FIRST(&queue)) != NULL) {
 			TAILQ_REMOVE(&queue, bp1, bio_queue);
-			bp1->bio_error = bp->bio_error;
-			if (bp->bio_flags & BIO_ERROR) {
-				bp1->bio_flags |= BIO_ERROR;
-				bp1->bio_resid = bp1->bio_bcount;
-			} else
-				bp1->bio_resid = 0;
 			biodone(bp1);
 		}
 	} else {
 		daschedule(periph);
 		cam_periph_unlock(periph);
+		if (bp != NULL)
+			biodone(bp);
 	}
-	if (bp != NULL)
-		biodone(bp);
 	return;
 }
 
@@ -5106,7 +5110,7 @@ dadone_proberc(struct cam_periph *periph, union ccb *done_ccb)
 			 */
 			if ((have_sense)
 			 && (asc != 0x25) && (asc != 0x44)
-			 && (asc != 0x04 && ascq != 0x02)
+			 && (asc != 0x04 || ascq != 0x02)
 			 && (error_code == SSD_CURRENT_ERROR
 			  || error_code == SSD_DESC_CURRENT_ERROR)) {
 				const char *sense_key_desc;
@@ -5140,6 +5144,12 @@ dadone_proberc(struct cam_periph *periph, union ccb *done_ccb)
 		}
 	}
 	free(csio->data_ptr, M_SCSIDA);
+
+	if ((periph->flags & CAM_PERIPH_INVALID) != 0) {
+		daprobedone(periph, done_ccb);
+		return;
+	}
+
 	if (announce_buf != NULL &&
 	    ((softc->flags & DA_FLAG_ANNOUNCED) == 0)) {
 		struct sbuf sb;
@@ -6249,6 +6259,8 @@ daerror(union ccb *ccb, uint32_t cam_flags, uint32_t sense_flags)
 	struct cam_periph *periph;
 	int error, error_code, sense_key, asc, ascq;
 
+	CAM_PROBE3(da, error, ccb, cam_flags, sense_flags);
+
 #if defined(BUF_TRACKING) || defined(FULL_BUF_TRACKING)
 	if (ccb->csio.bio != NULL)
 		biotrack(ccb->csio.bio, __func__);
@@ -6314,8 +6326,10 @@ daerror(union ccb *ccb, uint32_t cam_flags, uint32_t sense_flags)
 			disk_media_gone(softc->disk, M_NOWAIT);
 		}
 	}
-	if (error == ERESTART)
+	if (error == ERESTART) {
+		CAM_PROBE2(da, recovery, ccb, error);
 		return (ERESTART);
+	}
 
 #ifdef CAM_IO_STATS
 	switch (ccb->ccb_h.status & CAM_STATUS_MASK) {
@@ -6345,7 +6359,9 @@ daerror(union ccb *ccb, uint32_t cam_flags, uint32_t sense_flags)
 
 	if (softc->quirks & DA_Q_RETRY_BUSY)
 		sense_flags |= SF_RETRY_BUSY;
-	return(cam_periph_error(ccb, cam_flags, sense_flags));
+	error = cam_periph_error(ccb, cam_flags, sense_flags);
+	CAM_PROBE2(da, recovery, ccb, error);
+	return (error);
 }
 
 static void

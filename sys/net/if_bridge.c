@@ -2520,11 +2520,8 @@ bridge_output(struct ifnet *ifp, struct mbuf *m, struct sockaddr *sa,
 
 	NET_EPOCH_ASSERT();
 
-	if (m->m_len < ETHER_HDR_LEN) {
-		m = m_pullup(m, ETHER_HDR_LEN);
-		if (m == NULL)
-			return (0);
-	}
+	if ((m = m_pullup(m, ETHER_HDR_LEN)) == NULL)
+		return (0);
 
 	sbif = ifp->if_bridge;
 	sc = sbif->bif_sc;
@@ -2855,11 +2852,8 @@ bridge_input(struct ifnet *ifp, struct mbuf *m)
 	NET_EPOCH_ASSERT();
 
 	/* We need the Ethernet header later, so make sure we have it now. */
-	if (m->m_len < ETHER_HDR_LEN) {
-		m = m_pullup(m, ETHER_HDR_LEN);
-		if (m == NULL)
-			return (NULL);
-	}
+	if ((m = m_pullup(m, ETHER_HDR_LEN)) == NULL)
+		return (NULL);
 
 	eh = mtod(m, struct ether_header *);
 	vlan = VLANTAGOF(m);
@@ -3943,6 +3937,7 @@ bridge_pfil(struct mbuf **mp, struct ifnet *bifp, struct ifnet *ifp, int dir)
 #ifdef INET
 	struct ip *ip = NULL;
 	int hlen = 0;
+	struct ifnet *errifp = (bifp != NULL) ? bifp : ifp;
 #endif
 
 	snap = 0;
@@ -3956,13 +3951,9 @@ bridge_pfil(struct mbuf **mp, struct ifnet *bifp, struct ifnet *ifp, int dir)
 	if (V_pfil_bridge == 0 && V_pfil_member == 0 && V_pfil_ipfw == 0)
 		return (0); /* filtering is disabled */
 
-	i = min((*mp)->m_pkthdr.len, max_protohdr);
-	if ((*mp)->m_len < i) {
-	    *mp = m_pullup(*mp, i);
-	    if (*mp == NULL) {
+	if ((*mp = m_pullup(*mp, ETHER_HDR_LEN)) == NULL) {
 		printf("%s: m_pullup failed\n", __func__);
 		return (-1);
-	    }
 	}
 
 	eh1 = mtod(*mp, struct ether_header *);
@@ -3972,14 +3963,25 @@ bridge_pfil(struct mbuf **mp, struct ifnet *bifp, struct ifnet *ifp, int dir)
 	 * Check for SNAP/LLC.
 	 */
 	if (ether_type < ETHERMTU) {
-		struct llc *llc2 = (struct llc *)(eh1 + 1);
+		struct llc *llc2;
 
-		if ((*mp)->m_len >= ETHER_HDR_LEN + 8 &&
-		    llc2->llc_dsap == LLC_SNAP_LSAP &&
-		    llc2->llc_ssap == LLC_SNAP_LSAP &&
-		    llc2->llc_control == LLC_UI) {
-			ether_type = htons(llc2->llc_un.type_snap.ether_type);
-			snap = 1;
+		i = min((*mp)->m_pkthdr.len,
+		    ETHER_HDR_LEN + sizeof(struct llc));
+		if ((*mp = m_pullup(*mp, i)) == NULL) {
+			printf("%s: m_pullup failed\n", __func__);
+			return (-1);
+		}
+		eh1 = mtod(*mp, struct ether_header *);
+
+		if ((*mp)->m_len >= ETHER_HDR_LEN + sizeof(struct llc)) {
+			llc2 = (struct llc *)(eh1 + 1);
+			if (llc2->llc_dsap == LLC_SNAP_LSAP &&
+			    llc2->llc_ssap == LLC_SNAP_LSAP &&
+			    llc2->llc_control == LLC_UI) {
+				ether_type =
+				    htons(llc2->llc_un.type_snap.ether_type);
+				snap = 1;
+			}
 		}
 	}
 
@@ -4031,12 +4033,12 @@ bridge_pfil(struct mbuf **mp, struct ifnet *bifp, struct ifnet *ifp, int dir)
 	}
 
 	/* Strip off the Ethernet header and keep a copy. */
-	m_copydata(*mp, 0, ETHER_HDR_LEN, (caddr_t) &eh2);
+	m_copydata(*mp, 0, ETHER_HDR_LEN, &eh2);
 	m_adj(*mp, ETHER_HDR_LEN);
 
 	/* Strip off snap header, if present */
 	if (snap) {
-		m_copydata(*mp, 0, sizeof(struct llc), (caddr_t) &llc1);
+		m_copydata(*mp, 0, sizeof(struct llc), &llc1);
 		m_adj(*mp, sizeof(struct llc));
 	}
 
@@ -4104,6 +4106,9 @@ bridge_pfil(struct mbuf **mp, struct ifnet *bifp, struct ifnet *ifp, int dir)
 			if (i > ifp->if_mtu) {
 				error = bridge_fragment(ifp, mp, &eh2, snap,
 					    &llc1);
+				if (error != 0)
+					if_inc_counter(errifp,
+					    IFCOUNTER_OERRORS, 1);
 				return (error);
 			}
 		}
@@ -4113,13 +4118,9 @@ bridge_pfil(struct mbuf **mp, struct ifnet *bifp, struct ifnet *ifp, int dir)
 		hlen = ip->ip_hl << 2;
 		if (hlen < sizeof(struct ip))
 			goto bad;
-		if (hlen > (*mp)->m_len) {
-			if ((*mp = m_pullup(*mp, hlen)) == NULL)
-				goto bad;
-			ip = mtod(*mp, struct ip *);
-			if (ip == NULL)
-				goto bad;
-		}
+		if ((*mp = m_pullup(*mp, hlen)) == NULL)
+			goto bad;
+		ip = mtod(*mp, struct ip *);
 		ip->ip_sum = 0;
 		if (hlen == sizeof(struct ip))
 			ip->ip_sum = in_cksum_hdr(ip);
@@ -4169,13 +4170,13 @@ bridge_pfil(struct mbuf **mp, struct ifnet *bifp, struct ifnet *ifp, int dir)
 		M_PREPEND(*mp, sizeof(struct llc), M_NOWAIT);
 		if (*mp == NULL)
 			return (error);
-		bcopy(&llc1, mtod(*mp, caddr_t), sizeof(struct llc));
+		bcopy(&llc1, mtod(*mp, void *), sizeof(struct llc));
 	}
 
 	M_PREPEND(*mp, ETHER_HDR_LEN, M_NOWAIT);
 	if (*mp == NULL)
 		return (error);
-	bcopy(&eh2, mtod(*mp, caddr_t), ETHER_HDR_LEN);
+	bcopy(&eh2, mtod(*mp, void *), ETHER_HDR_LEN);
 
 	return (0);
 
@@ -4209,18 +4210,16 @@ bridge_ip_checkbasic(struct mbuf **mp)
 	if (*mp == NULL)
 		return (-1);
 
-	if (IP_HDR_ALIGNED_P(mtod(m, caddr_t)) == 0) {
+	if (IP_HDR_ALIGNED_P(mtod(m, char *)) == 0) {
 		if ((m = m_copyup(m, sizeof(struct ip),
 			(max_linkhdr + 3) & ~3)) == NULL) {
 			/* XXXJRT new stat, please */
 			KMOD_IPSTAT_INC(ips_toosmall);
 			goto bad;
 		}
-	} else if (__predict_false(m->m_len < sizeof (struct ip))) {
-		if ((m = m_pullup(m, sizeof (struct ip))) == NULL) {
-			KMOD_IPSTAT_INC(ips_toosmall);
-			goto bad;
-		}
+	} else if ((m = m_pullup(m, sizeof (struct ip))) == NULL) {
+		KMOD_IPSTAT_INC(ips_toosmall);
+		goto bad;
 	}
 	ip = mtod(m, struct ip *);
 	if (ip == NULL) goto bad;
@@ -4234,14 +4233,11 @@ bridge_ip_checkbasic(struct mbuf **mp)
 		KMOD_IPSTAT_INC(ips_badhlen);
 		goto bad;
 	}
-	if (hlen > m->m_len) {
-		if ((m = m_pullup(m, hlen)) == NULL) {
-			KMOD_IPSTAT_INC(ips_badhlen);
-			goto bad;
-		}
-		ip = mtod(m, struct ip *);
-		if (ip == NULL) goto bad;
+	if ((m = m_pullup(m, hlen)) == NULL) {
+		KMOD_IPSTAT_INC(ips_badhlen);
+		goto bad;
 	}
+	ip = mtod(m, struct ip *);
 
 	if (m->m_pkthdr.csum_flags & CSUM_IP_CHECKED) {
 		sum = !(m->m_pkthdr.csum_flags & CSUM_IP_VALID);
@@ -4298,6 +4294,7 @@ static int
 bridge_ip6_checkbasic(struct mbuf **mp)
 {
 	struct mbuf *m = *mp;
+	struct ifnet *inifp = m->m_pkthdr.rcvif;
 	struct ip6_hdr *ip6;
 
 	/*
@@ -4306,8 +4303,7 @@ bridge_ip6_checkbasic(struct mbuf **mp)
 	 * it.  Otherwise, if it is aligned, make sure the entire base
 	 * IPv6 header is in the first mbuf of the chain.
 	 */
-	if (IP6_HDR_ALIGNED_P(mtod(m, caddr_t)) == 0) {
-		struct ifnet *inifp = m->m_pkthdr.rcvif;
+	if (IP6_HDR_ALIGNED_P(mtod(m, char *)) == 0) {
 		if ((m = m_copyup(m, sizeof(struct ip6_hdr),
 			    (max_linkhdr + 3) & ~3)) == NULL) {
 			/* XXXJRT new stat, please */
@@ -4315,13 +4311,10 @@ bridge_ip6_checkbasic(struct mbuf **mp)
 			in6_ifstat_inc(inifp, ifs6_in_hdrerr);
 			goto bad;
 		}
-	} else if (__predict_false(m->m_len < sizeof(struct ip6_hdr))) {
-		struct ifnet *inifp = m->m_pkthdr.rcvif;
-		if ((m = m_pullup(m, sizeof(struct ip6_hdr))) == NULL) {
-			IP6STAT_INC(ip6s_toosmall);
-			in6_ifstat_inc(inifp, ifs6_in_hdrerr);
-			goto bad;
-		}
+	} else if ((m = m_pullup(m, sizeof(struct ip6_hdr))) == NULL) {
+		IP6STAT_INC(ip6s_toosmall);
+		in6_ifstat_inc(inifp, ifs6_in_hdrerr);
+		goto bad;
 	}
 
 	ip6 = mtod(m, struct ip6_hdr *);
@@ -4356,9 +4349,10 @@ bridge_fragment(struct ifnet *ifp, struct mbuf **mp, struct ether_header *eh,
 	struct ip *ip;
 	int error = -1;
 
-	if (m->m_len < sizeof(struct ip) &&
-	    (m = m_pullup(m, sizeof(struct ip))) == NULL)
+	if ((m = m_pullup(m, sizeof(struct ip))) == NULL) {
+		KMOD_IPSTAT_INC(ips_odropped);
 		goto dropit;
+	}
 	ip = mtod(m, struct ip *);
 
 	m->m_pkthdr.csum_flags |= CSUM_IP;
@@ -4377,21 +4371,23 @@ bridge_fragment(struct ifnet *ifp, struct mbuf **mp, struct ether_header *eh,
 			M_PREPEND(mcur, sizeof(struct llc), M_NOWAIT);
 			if (mcur == NULL) {
 				error = ENOBUFS;
+				KMOD_IPSTAT_INC(ips_odropped);
 				if (mprev != NULL)
 					mprev->m_nextpkt = nextpkt;
 				goto dropit;
 			}
-			bcopy(llc, mtod(mcur, caddr_t),sizeof(struct llc));
+			bcopy(llc, mtod(mcur, void *), sizeof(struct llc));
 		}
 
 		M_PREPEND(mcur, ETHER_HDR_LEN, M_NOWAIT);
 		if (mcur == NULL) {
 			error = ENOBUFS;
+			KMOD_IPSTAT_INC(ips_odropped);
 			if (mprev != NULL)
 				mprev->m_nextpkt = nextpkt;
 			goto dropit;
 		}
-		bcopy(eh, mtod(mcur, caddr_t), ETHER_HDR_LEN);
+		bcopy(eh, mtod(mcur, void *), ETHER_HDR_LEN);
 
 		/*
 		 * The previous two M_PREPEND could have inserted one or two

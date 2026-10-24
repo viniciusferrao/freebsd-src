@@ -1044,7 +1044,7 @@ vfs_busyfs(fsid_t *fsid)
 	if (fsidcmp(&mp->mnt_stat.f_fsid, fsid) == 0)
 		return (mp);
 	else
-	    vfs_unbusy(mp);
+		vfs_unbusy(mp);
 
 slow:
 	mtx_lock(&mountlist_mtx);
@@ -5152,7 +5152,7 @@ vfs_unmountall(void)
 			continue;
 
 		if (bootverbose) {
-			printf("\tUnmounting %d/%d %s\n", ++n, nmountpoints,
+			printf("Unmounting %d/%d %s\n", ++n, nmountpoints,
 				mp->mnt_stat.f_mntonname);
 		}
 		unmount_or_warn(mp);
@@ -5160,7 +5160,7 @@ vfs_unmountall(void)
 
 	if (rootdevmp != NULL) {
 		if (bootverbose) {
-			printf("\tUnmounting %d/%d %s\n", ++n, nmountpoints,
+			printf("Unmounting %d/%d %s\n", ++n, nmountpoints,
 				rootdevmp->mnt_stat.f_mntonname);
 		}
 		unmount_or_warn(rootdevmp);
@@ -5374,7 +5374,7 @@ vn_pollrecord(struct vnode *vp, struct thread *td, int events)
 /*
  * Routine to create and manage a filesystem syncer vnode.
  */
-#define sync_close ((int (*)(struct  vop_close_args *))nullop)
+static int	sync_close(struct vop_close_args *);
 static int	sync_fsync(struct  vop_fsync_args *);
 static int	sync_inactive(struct  vop_inactive_args *);
 static int	sync_reclaim(struct  vop_reclaim_args *);
@@ -5466,6 +5466,12 @@ vfs_deallocate_syncvnode(struct mount *mp)
 	mtx_unlock(&sync_mtx);
 	if (vp != NULL)
 		vrele(vp);
+}
+
+static int
+sync_close(struct vop_close_args *ap __unused)
+{
+	return (0);
 }
 
 /*
@@ -5962,8 +5968,6 @@ vop_fsync_debugprepost(struct vnode *vp, const char *name)
 {
 	struct mount *mp;
 
-	if (vp->v_type == VCHR)
-		;
 	/*
 	 * The shared vs. exclusive locking policy for fsync()
 	 * is actually determined by vp's write mount as indicated
@@ -5979,16 +5983,14 @@ vop_fsync_debugprepost(struct vnode *vp, const char *name)
 	 * should still be caught when the stacked filesystem
 	 * invokes VOP_FSYNC() on the underlying filesystem.
 	 */
-	else {
-		mp = NULL;
-		VOP_GETWRITEMOUNT(vp, &mp);
-		if (vn_lktype_write(mp, vp) == LK_SHARED)
-			ASSERT_VOP_LOCKED(vp, name);
-		else
-			ASSERT_VOP_ELOCKED(vp, name);
-		if (mp != NULL)
-			vfs_rel(mp);
-	}
+	mp = NULL;
+	VOP_GETWRITEMOUNT(vp, &mp);
+	if (vn_lktype_write(mp, vp) == LK_SHARED)
+		ASSERT_VOP_LOCKED(vp, name);
+	else
+		ASSERT_VOP_ELOCKED(vp, name);
+	if (mp != NULL)
+		vfs_rel(mp);
 }
 
 void

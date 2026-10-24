@@ -785,6 +785,14 @@ vn_inotify_add_watch(struct vnode *vp, struct inotify_softc *sc, uint32_t mask,
 		size_t buflen, len;
 		int eof, error;
 
+		/*
+		 * Some filesystems, at least fuse, require that the directory
+		 * be opened before reading it.
+		 */
+		error = VOP_OPEN(vp, FREAD, td->td_ucred, td, NULL);
+		if (error != 0)
+			return (error);
+
 		buflen = 128 * sizeof(struct dirent);
 		buf = malloc(buflen, M_TEMP, M_WAITOK);
 
@@ -821,6 +829,7 @@ vn_inotify_add_watch(struct vnode *vp, struct inotify_softc *sc, uint32_t mask,
 			vrele(nd.ni_vp);
 		}
 		free(buf, M_TEMP);
+		VOP_CLOSE(vp, FREAD, td->td_ucred, td);
 		if (error != 0)
 			return (error);
 	}
@@ -921,8 +930,8 @@ fget_inotify(struct thread *td, int fd, const cap_rights_t *needrightsp,
 }
 
 int
-kern_inotify_add_watch(int fd, int dfd, const char *path, uint32_t mask,
-    struct thread *td)
+kern_inotify_add_watch(struct thread *td, int fd, int dfd, const char *path,
+    uint32_t mask)
 {
 	struct nameidata nd;
 	struct file *fp;
@@ -1002,12 +1011,12 @@ int
 sys_inotify_add_watch_at(struct thread *td,
     struct inotify_add_watch_at_args *uap)
 {
-	return (kern_inotify_add_watch(uap->fd, uap->dfd, uap->path,
-	    uap->mask, td));
+	return (kern_inotify_add_watch(td, uap->fd, uap->dfd, uap->path,
+	    uap->mask));
 }
 
 int
-kern_inotify_rm_watch(int fd, uint32_t wd, struct thread *td)
+kern_inotify_rm_watch(struct thread *td, int fd, uint32_t wd)
 {
 	struct file *fp;
 	struct inotify_softc *sc;
@@ -1052,5 +1061,5 @@ kern_inotify_rm_watch(int fd, uint32_t wd, struct thread *td)
 int
 sys_inotify_rm_watch(struct thread *td, struct inotify_rm_watch_args *uap)
 {
-	return (kern_inotify_rm_watch(uap->fd, uap->wd, td));
+	return (kern_inotify_rm_watch(td, uap->fd, uap->wd));
 }

@@ -1501,7 +1501,7 @@ vt_flush(struct vt_device *vd)
 	if (vw == NULL)
 		return (0);
 
-	if (vd->vd_flags & VDF_SPLASH || vw->vw_flags & VWF_BUSY)
+	if (vw->vw_flags & VWF_BUSY)
 		return (0);
 
 	vf = vw->vw_font;
@@ -1511,6 +1511,13 @@ vt_flush(struct vt_device *vd)
 	VT_FLUSH_LOCK(vd);
 
 	vtbuf_lock(&vw->vw_buf);
+
+	if (vd->vd_flags & VDF_SPLASH) {
+		vtbuf_unlock(&vw->vw_buf);
+		VT_FLUSH_UNLOCK(vd);
+		return (0);
+	}
+
 	inside_vt_flush = true;
 
 #ifndef SC_NO_CUTPASTE
@@ -1697,17 +1704,21 @@ vtterm_splash(struct vt_device *vd)
 
 	si = MD_FETCH(preload_kmdp, rebooting == 1 ? MODINFOMD_SHTDWNSPLASH :
 	    MODINFOMD_SPLASH, struct splash_info *);
+	/* Quit before taking the lock if the backend lacks something. */
 	if (si == NULL) {
 		if (vd->vd_driver->vd_bitblt_bmp == NULL)
 			return;
-	} else if (vd->vd_driver->vd_bitblt_argb == NULL)
+	} else if (vd->vd_driver->vd_bitblt_argb == NULL || si->si_depth != 4)
+		return;
+	if (rebooting == 1 && vd->vd_driver->vd_blank == NULL)
 		return;
 
-	if (rebooting == 1) {
-		if (vd->vd_driver->vd_blank == NULL)
-			return;
+	vtbuf_lock(&vd->vd_curwindow->vw_buf);
+	vd->vd_flags |= VDF_SPLASH;
+	vtbuf_unlock(&vd->vd_curwindow->vw_buf);
+
+	if (rebooting == 1)
 		vd->vd_driver->vd_blank(vd, TC_BLACK);
-	}
 
 	if (si == NULL) {
 		top = (vd->vd_height - vt_logo_height) / 2;
@@ -1716,8 +1727,6 @@ vtterm_splash(struct vt_device *vd)
 		    vd->vd_curwindow, vt_logo_image, NULL, vt_logo_width,
 		    vt_logo_height, left, top, TC_WHITE, TC_BLACK);
 	} else {
-		if (si->si_depth != 4)
-			return;
 		image = (uintptr_t)si + sizeof(struct splash_info);
 		image = roundup2(image, 8);
 		top = (vd->vd_height - si->si_height) / 2;
@@ -1726,7 +1735,6 @@ vtterm_splash(struct vt_device *vd)
 		    (unsigned char *)image, si->si_width, si->si_height,
 		    left, top);
 	}
-	vd->vd_flags |= VDF_SPLASH;
 }
 #endif
 
@@ -2923,9 +2931,31 @@ skip_thunk:
 		switch (*(int *)data) {
 		case KD_TEXT:
 		case KD_TEXT1:
-		case KD_PIXEL:
+		case KD_PIXEL: {
+			bool restore = false;
+			VT_LOCK(vd);
+			if ((vw->vw_flags & VWF_GRAPHICS) &&
+			    vw == vd->vd_curwindow) {
+				/*
+				 * When leaving graphics mode on the currently
+				 * active window, reprogram the display
+				 * controller back to text mode immediately.
+				 * Without this, the CRTC retains the graphical
+				 * state and the console stays invisible until
+				 * the next VT switch.
+				 */
+				restore = true;
+				vd->vd_flags |= VDF_INVALID;
+			}
 			vw->vw_flags &= ~VWF_GRAPHICS;
+			VT_UNLOCK(vd);
+			if (restore) {
+				if (vd->vd_driver->vd_postswitch)
+					vd->vd_driver->vd_postswitch(vd);
+				vt_resume_flush_timer(vw, 0);
+			}
 			break;
+		}
 		case KD_GRAPHICS:
 			vw->vw_flags |= VWF_GRAPHICS;
 			break;

@@ -68,6 +68,7 @@
 #include <netinet/in_var.h>
 #include <netinet/in_pcb.h>
 #include <netinet/ip.h>
+#include <netinet/ip_encap.h>
 #include <netinet/ip_var.h>
 #include <netinet/ip6.h>
 #include <netinet6/ip6_var.h>
@@ -2488,7 +2489,7 @@ geneve_inherit_l3_hdr(struct mbuf *m, struct geneve_softc *sc, uint16_t proto,
 	switch (proto) {
 	case ETHERTYPE_IP:
 		if (__predict_false(m->m_len < offset + sizeof(struct ip))) {
-			m_copydata(m, offset, sizeof(struct ip), (caddr_t)&iphdr);
+			m_copydata(m, offset, sizeof(struct ip), &iphdr);
 			ip_inner = &iphdr;
 		} else
 			ip_inner = mtodo(m, offset);
@@ -2502,7 +2503,7 @@ geneve_inherit_l3_hdr(struct mbuf *m, struct geneve_softc *sc, uint16_t proto,
 
 	case ETHERTYPE_IPV6:
 		if (__predict_false(m->m_len < offset + sizeof(struct ip6_hdr))) {
-			m_copydata(m, offset, sizeof(struct ip6_hdr), (caddr_t)&ip6hdr);
+			m_copydata(m, offset, sizeof(struct ip6_hdr), &ip6hdr);
 			ip6_inner = &ip6hdr;
 		} else
 			ip6_inner = mtodo(m, offset);
@@ -2995,7 +2996,7 @@ geneve_udp_input(struct mbuf *m, int offset, struct inpcb *inpcb,
 	/* Get geneve header */
 	offset += sizeof(struct udphdr);
 	if (__predict_false(m->m_len < offset + sizeof(struct genevehdr))) {
-		m_copydata(m, offset, sizeof(struct genevehdr), (caddr_t)&gnvhdr);
+		m_copydata(m, offset, sizeof(struct genevehdr), &gnvhdr);
 		gnvh = &gnvhdr;
 	} else
 		gnvh = mtodo(m, offset);
@@ -3063,6 +3064,8 @@ geneve_udp_input(struct mbuf *m, int offset, struct inpcb *inpcb,
 	if (proto == GENEVE_PROTO_ETHER)
 		(*ifp->if_input)(ifp, m);
 	else {
+		if (V_encap_hash_inbound)
+			encap_set_flowid(m, af);
 		BPF_MTAP2(ifp, &af, sizeof(af), m);
 		netisr_dispatch_src(info.isr, (uintptr_t)xgnvso, m);
 	}
@@ -3093,18 +3096,14 @@ geneve_input_ether(struct geneve_softc *sc, struct mbuf **m0,
 	if (m->m_pkthdr.len < ETHER_HDR_LEN)
 		return (EINVAL);
 
-	if (m->m_len < ETHER_HDR_LEN &&
-	    (m = m_pullup(m, ETHER_HDR_LEN)) == NULL) {
-		*m0 = NULL;
+	if ((*m0 = m = m_pullup(m, ETHER_HDR_LEN)) == NULL)
 		return (ENOBUFS);
-	}
 
 	eh = mtod(m, struct ether_header *);
 	info->ethertype = ntohs(eh->ether_type);
 	if (sc->gnv_flags & GENEVE_FLAG_LEARN)
 		geneve_ftable_learn(sc, sa, eh->ether_shost);
 
-	*m0 = m;
 	return (0);
 }
 
@@ -3125,8 +3124,7 @@ geneve_input_inherit(struct geneve_softc *sc, struct mbuf **m0,
 		if (m->m_pkthdr.len < offset)
 			return (EINVAL);
 
-		if (m->m_len < offset &&
-		    (*m0 = m = m_pullup(m, offset)) == NULL)
+		if ((*m0 = m = m_pullup(m, offset)) == NULL)
 			return (ENOBUFS);
 		iphdr = mtodo(m, offset - sizeof(struct ip));
 
@@ -3144,8 +3142,7 @@ geneve_input_inherit(struct geneve_softc *sc, struct mbuf **m0,
 		if (m->m_pkthdr.len < offset)
 			return (EINVAL);
 
-		if (m->m_len < offset &&
-		    (*m0 = m = m_pullup(m, offset)) == NULL)
+		if ((*m0 = m = m_pullup(m, offset)) == NULL)
 			return (ENOBUFS);
 		ip6hdr = mtodo(m, offset - sizeof(struct ip6_hdr));
 
@@ -3168,8 +3165,7 @@ geneve_input_inherit(struct geneve_softc *sc, struct mbuf **m0,
 		if (m->m_pkthdr.len < offset)
 			return (EINVAL);
 
-		if (m->m_len < offset &&
-		    (*m0 = m = m_pullup(m, offset)) == NULL)
+		if ((*m0 = m = m_pullup(m, offset)) == NULL)
 			return (ENOBUFS);
 		info->isr = NETISR_ARP;
 		break;

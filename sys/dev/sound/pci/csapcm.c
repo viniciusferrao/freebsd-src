@@ -164,8 +164,8 @@ csa_wrcd(kobj_t obj, void *devinfo, int regno, uint32_t data)
 }
 
 static kobj_method_t csa_ac97_methods[] = {
-    	KOBJMETHOD(ac97_read,		csa_rdcd),
-    	KOBJMETHOD(ac97_write,		csa_wrcd),
+	KOBJMETHOD(ac97_read,		csa_rdcd),
+	KOBJMETHOD(ac97_write,		csa_wrcd),
 	KOBJMETHOD_END
 };
 AC97_DECLARE(csa_ac97);
@@ -623,13 +623,13 @@ csachan_getcaps(kobj_t obj, void *data)
 }
 
 static kobj_method_t csachan_methods[] = {
-    	KOBJMETHOD(channel_init,		csachan_init),
-    	KOBJMETHOD(channel_setformat,		csachan_setformat),
-    	KOBJMETHOD(channel_setspeed,		csachan_setspeed),
-    	KOBJMETHOD(channel_setblocksize,	csachan_setblocksize),
-    	KOBJMETHOD(channel_trigger,		csachan_trigger),
-    	KOBJMETHOD(channel_getptr,		csachan_getptr),
-    	KOBJMETHOD(channel_getcaps,		csachan_getcaps),
+	KOBJMETHOD(channel_init,		csachan_init),
+	KOBJMETHOD(channel_setformat,		csachan_setformat),
+	KOBJMETHOD(channel_setspeed,		csachan_setspeed),
+	KOBJMETHOD(channel_setblocksize,	csachan_setblocksize),
+	KOBJMETHOD(channel_trigger,		csachan_trigger),
+	KOBJMETHOD(channel_getptr,		csachan_getptr),
+	KOBJMETHOD(channel_getcaps,		csachan_getcaps),
 	KOBJMETHOD_END
 };
 CHANNEL_DECLARE(csachan);
@@ -676,7 +676,7 @@ csa_init(struct csa_info *csa)
 	/* Power up amplifier */
 	csa_writeio(resp, BA0_EGPIODR, csa_readio(resp, BA0_EGPIODR) |
 		EGPIODR_GPOE2);
-	csa_writeio(resp, BA0_EGPIOPTR, csa_readio(resp, BA0_EGPIOPTR) | 
+	csa_writeio(resp, BA0_EGPIOPTR, csa_readio(resp, BA0_EGPIOPTR) |
 		EGPIOPTR_GPPT2);
 
 	return 0;
@@ -809,6 +809,7 @@ pcmcsa_attach(device_t dev)
 	}
 	if (csa->card->inv_eapd)
 		ac97_setflags(codec, AC97_F_EAPD_INV);
+	pcm_init(dev, csa);
 	if (mixer_init(dev, ac97_getmixerclass(), codec) == -1) {
 		ac97_destroy(codec);
 		csa_releaseres(csa, dev);
@@ -829,7 +830,6 @@ pcmcsa_attach(device_t dev)
 	csa_writemem(resp, BA1_CIE, (csa_readmem(resp, BA1_CIE) & ~0x0000003f) | 0x00000001);
 	csa_active(csa, -1);
 
-	pcm_init(dev, csa);
 	pcm_addchan(dev, PCMDIR_REC, &csachan_class, csa);
 	pcm_addchan(dev, PCMDIR_PLAY, &csachan_class, csa);
 	if (pcm_register(dev, status)) {
@@ -1031,6 +1031,6 @@ static driver_t pcmcsa_driver = {
 };
 
 DRIVER_MODULE(snd_csapcm, csa, pcmcsa_driver, 0, 0);
-MODULE_DEPEND(snd_csapcm, sound, SOUND_MINVER, SOUND_PREFVER, SOUND_MAXVER);
+MODULE_DEPEND(snd_csapcm, sound, 1, 1, 1);
 MODULE_DEPEND(snd_csapcm, snd_csa, 1, 1, 1);
 MODULE_VERSION(snd_csapcm, 1);

@@ -334,16 +334,16 @@ static struct cfg_info cfg_table[] = {
         },
         {
                 "Envy24HT audio (AudioTrak Prodigy 7.1 LT)",
-                0x3132, 0x4154,   
+                0x3132, 0x4154,
                 0x4b, 0x80, 0xfc, 0xc3,
                 0x7ff8ff, 0x7fffff, 0x700,
                 0x400, 0x200, 0x100, 0x00, 0x02,
                 0,
-                &spi_codec, 
+                &spi_codec,
         },
         {
                 "Envy24HT audio (AudioTrak Prodigy 7.1 XT)",
-                0x3136, 0x4154,  
+                0x3136, 0x4154,
                 0x4b, 0x80, 0xfc, 0xc3,
                 0x7ff8ff, 0x7fffff, 0x700,
                 0x400, 0x200, 0x100, 0x00, 0x02,
@@ -826,7 +826,7 @@ AC97_DECLARE(envy24ht_ac97);
 static uint32_t
 envy24ht_gpiord(struct sc_info *sc)
 {
-	if (sc->cfg->subvendor == 0x153b  && sc->cfg->subdevice == 0x1150) 
+	if (sc->cfg->subvendor == 0x153b  && sc->cfg->subdevice == 0x1150)
 	return envy24ht_rdcs(sc, ENVY24HT_CCS_GPIO_LDATA, 2);
 	else
 	return (envy24ht_rdcs(sc, ENVY24HT_CCS_GPIO_HDATA, 1) << 16 | envy24ht_rdcs(sc, ENVY24HT_CCS_GPIO_LDATA, 2));
@@ -875,7 +875,7 @@ envy24ht_gpiosetdir(struct sc_info *sc, uint32_t dir)
 {
 	if (sc->cfg->subvendor == 0x153b  && sc->cfg->subdevice == 0x1150)
 	envy24ht_wrcs(sc, ENVY24HT_CCS_GPIO_CTLDIR, dir, 2);
-	else 
+	else
 	envy24ht_wrcs(sc, ENVY24HT_CCS_GPIO_CTLDIR, dir, 4);
 	return;
 }
@@ -1224,7 +1224,7 @@ envy24ht_checkintr(struct sc_info *sc, int dir)
 		if ((rtn = intr & ENVY24HT_MT_INT_PSTAT) != 0) {
 			mask = ~ENVY24HT_MT_INT_RSTAT;
 			envy24ht_wrmt(sc, 0x1a, 0x01, 1);
-			envy24ht_wrmt(sc, ENVY24HT_MT_INT_STAT, (intr & mask) | ENVY24HT_MT_INT_PSTAT | 0x08, 1);	
+			envy24ht_wrmt(sc, ENVY24HT_MT_INT_STAT, (intr & mask) | ENVY24HT_MT_INT_PSTAT | 0x08, 1);
 			stat = envy24ht_rdmt(sc, ENVY24HT_MT_INT_MASK, 1);
 			envy24ht_wrmt(sc, ENVY24HT_MT_INT_MASK, stat | ENVY24HT_MT_INT_PMASK, 1);
 		}
@@ -1625,7 +1625,7 @@ envy24htchan_setblocksize(kobj_t obj, void *data, uint32_t blocksize)
 {
 	struct sc_chinfo *ch = data;
 	/* struct sc_info *sc = ch->parent; */
-	uint32_t size, prev;
+	uint32_t blk, size, prev;
 	unsigned int bcnt, bsize;
 
 #if(0)
@@ -1640,20 +1640,22 @@ envy24htchan_setblocksize(kobj_t obj, void *data, uint32_t blocksize)
 			break;
 	}
 
-	ch->blk = prev / ch->unit;
+	blk = prev / ch->unit;
 	if (ch->dir == PCMDIR_PLAY)
-		ch->blk *= ENVY24HT_PLAY_BUFUNIT / 4;
+		blk *= ENVY24HT_PLAY_BUFUNIT / 4;
 	else
-		ch->blk *= ENVY24HT_REC_BUFUNIT / 4;
+		blk *= ENVY24HT_REC_BUFUNIT / 4;
         /* set channel buffer information */
         /* ch->size = ch->unit * ENVY24HT_SAMPLE_NUM; */
         if (ch->dir == PCMDIR_PLAY)
-                bsize = ch->blk * 4 / ENVY24HT_PLAY_BUFUNIT;
+                bsize = blk * 4 / ENVY24HT_PLAY_BUFUNIT;
         else
-                bsize = ch->blk * 4 / ENVY24HT_REC_BUFUNIT;
+                bsize = blk * 4 / ENVY24HT_REC_BUFUNIT;
         bsize *= ch->unit;
         bcnt = ch->size / bsize;
-        sndbuf_resize(ch->buffer, bcnt, bsize);
+        if (sndbuf_resize(ch->buffer, bcnt, bsize) != 0)
+		return 0;
+	ch->blk = blk;
 	/* mtx_unlock(&sc->lock); */
 
 #if(0)
@@ -1986,7 +1988,7 @@ envy24ht_intr(void *p)
 		device_printf(sc->dev, "envy24ht_intr(): ptr = %d-->", ptr);
 #endif
 		ptr -= ptr % sc->blk[0];
-		feed = (ptr + dsize - sc->intr[0]) % dsize; 
+		feed = (ptr + dsize - sc->intr[0]) % dsize;
 #if(0)
 		printf("%d intr = %d feed = %d\n", ptr, sc->intr[0], feed);
 #endif
@@ -2012,7 +2014,7 @@ envy24ht_intr(void *p)
 		dsize = sc->rsize / 4;
 		ptr = dsize - envy24ht_rdmt(sc, ENVY24HT_MT_RCNT, 2) - 1;
 		ptr -= ptr % sc->blk[1];
-		feed = (ptr + dsize - sc->intr[1]) % dsize; 
+		feed = (ptr + dsize - sc->intr[1]) % dsize;
 		for (i = ENVY24HT_CHAN_REC_ADC1; i <= ENVY24HT_CHAN_REC_SPDIF; i++) {
 			ch = &sc->chan[i];
 			if (ch->run && ch->blk <= feed) {
@@ -2438,8 +2440,8 @@ envy24ht_alloc_resource(struct sc_info *sc)
 static int
 envy24ht_pci_attach(device_t dev)
 {
-	struct sc_info 		*sc;
-	char 			status[SND_STATUSLEN];
+	struct sc_info		*sc;
+	char			status[SND_STATUSLEN];
 	int			err = 0;
 	int			i;
 
@@ -2474,11 +2476,12 @@ envy24ht_pci_attach(device_t dev)
 		goto bad;
 	}
 
+	pcm_init(dev, sc);
+
 	/* set multi track mixer */
 	mixer_init(dev, &envy24htmixer_class, sc);
 
 	/* set channel information */
-	pcm_init(dev, sc);
 	sc->chnum = 0;
 	/* for (i = 0; i < 5; i++) { */
 		pcm_addchan(dev, PCMDIR_PLAY, &envy24htchan_class, sc);
@@ -2577,6 +2580,6 @@ static driver_t envy24ht_driver = {
 };
 
 DRIVER_MODULE(snd_envy24ht, pci, envy24ht_driver, 0, 0);
-MODULE_DEPEND(snd_envy24ht, sound, SOUND_MINVER, SOUND_PREFVER, SOUND_MAXVER);
+MODULE_DEPEND(snd_envy24ht, sound, 1, 1, 1);
 MODULE_DEPEND(snd_envy24ht, snd_spicds, 1, 1, 1);
 MODULE_VERSION(snd_envy24ht, 1);

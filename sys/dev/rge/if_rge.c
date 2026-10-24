@@ -49,6 +49,7 @@
 #include <net/if_media.h>
 #include <net/if_types.h>
 #include <net/if_vlan_var.h>
+#include <net/debugnet.h>
 
 #include <machine/bus.h>
 #include <machine/resource.h>
@@ -104,6 +105,10 @@ static void	rge_txq_flush_mbufs(struct rge_softc *sc);
 static void	rge_tick(void *);
 static void	rge_link_state(struct rge_softc *);
 static void	rge_setwol(struct rge_softc *);
+
+#ifdef DEBUGNET
+DEBUGNET_DEFINE(rge);
+#endif
 
 struct rge_matchid {
 	uint16_t vendor;
@@ -180,6 +185,10 @@ rge_attach_if(struct rge_softc *sc, const char *eaddr)
 	/* TODO: is this needed for iftransmit? */
 	if_setsendqlen(sc->sc_ifp, RGE_TX_LIST_CNT - 1);
 	if_setsendqready(sc->sc_ifp);
+
+#ifdef DEBUGNET
+	DEBUGNET_SET(sc->sc_ifp, rge);
+#endif
 }
 
 static int
@@ -766,18 +775,20 @@ rge_tx_list_sync(struct rge_softc *sc, struct rge_queues *q,
  *
  * @param sc	driver softc
  * @param q	TX queue ring
- * @param m	mbuf to enqueue
+ * @param mp	mbuf to enqueue, updated if defragmentation replaces it
  * @returns	if the mbuf is enqueued, it's consumed here and the number of
  * 		TX descriptors used is returned; if there's no space then 0 is
- *		returned; if the mbuf couldn't be defragged and the caller
- *		should free it then -1 is returned.
+ *		returned; if the mbuf couldn't be mapped and the caller should
+ *		free it then -1 is returned.
  */
 static int
-rge_encap(struct rge_softc *sc, struct rge_queues *q, struct mbuf *m, int idx)
+rge_encap(struct rge_softc *sc, struct rge_queues *q, struct mbuf **mp,
+    int idx)
 {
 	struct rge_tx_desc *d = NULL;
 	struct rge_txq *txq;
 	bus_dmamap_t txmap;
+	struct mbuf *m;
 	uint32_t cmdsts, cflags = 0;
 	int cur, error, i;
 	bus_dma_segment_t seg[RGE_TX_NSEGS];
@@ -785,6 +796,7 @@ rge_encap(struct rge_softc *sc, struct rge_queues *q, struct mbuf *m, int idx)
 
 	RGE_ASSERT_LOCKED(sc);
 
+	m = *mp;
 	txq = &q->q_tx.rge_txq[idx];
 	txmap = txq->txq_dmamap;
 
@@ -800,10 +812,13 @@ rge_encap(struct rge_softc *sc, struct rge_queues *q, struct mbuf *m, int idx)
 	case EFBIG: /* mbuf chain is too fragmented */
 		sc->sc_drv_stats.tx_encap_refrag_cnt++;
 		nsegs = RGE_TX_NSEGS;
-		if (m_defrag(m, M_NOWAIT) == 0 &&
-		    bus_dmamap_load_mbuf_sg(sc->sc_dmat_tx_buf, txmap, m,
-		    seg, &nsegs, BUS_DMA_NOWAIT) == 0)
-			break;
+		m = m_defrag(m, M_NOWAIT);
+		if (m != NULL) {
+			*mp = m;
+			if (bus_dmamap_load_mbuf_sg(sc->sc_dmat_tx_buf, txmap,
+			    m, seg, &nsegs, BUS_DMA_NOWAIT) == 0)
+				break;
+		}
 		/* FALLTHROUGH */
 	default:
 		sc->sc_drv_stats.tx_encap_err_toofrag++;
@@ -2498,8 +2513,8 @@ rge_tx_task(void *arg, int npending)
 		if (m == NULL)
 			break;
 
-		/* Attempt to encap */
-		used = rge_encap(sc, q, m, idx);
+		/* Attempt to encap, m might change due to defrag */
+		used = rge_encap(sc, q, &m, idx);
 		if (used < 0) {
 			if_inc_counter(sc->sc_ifp, IFCOUNTER_OQDROPS, 1);
 			m_freem(m);
@@ -2667,6 +2682,84 @@ rge_shutdown(device_t dev)
 
 	return (0);
 }
+
+#ifdef DEBUGNET
+static void
+rge_debugnet_init(if_t ifp, int *nrxr, int *ncl, int *clsize)
+{
+	struct rge_softc *sc;
+
+	sc = if_getsoftc(ifp);
+	RGE_LOCK(sc);
+	*nrxr = RGE_RX_LIST_CNT;
+	*ncl = DEBUGNET_MAX_IN_FLIGHT;
+	*clsize = MCLBYTES;
+	RGE_UNLOCK(sc);
+}
+
+static void
+rge_debugnet_event(if_t ifp __unused, enum debugnet_ev event __unused)
+{
+}
+
+static int
+rge_debugnet_transmit(if_t ifp, struct mbuf *m)
+{
+	struct rge_softc *sc;
+	struct rge_queues *q;
+	int idx, free, used;
+
+	sc = if_getsoftc(ifp);
+	if ((if_getdrvflags(ifp) & IFF_DRV_RUNNING) == 0 ||
+	    sc->sc_stopped)
+		return (EBUSY);
+
+	q = sc->sc_queues;
+	idx = q->q_tx.rge_txq_prodidx;
+	free = q->q_tx.rge_txq_considx;
+	if (free <= idx)
+		free += RGE_TX_LIST_CNT;
+	free -= idx;
+	if (free < RGE_TX_NSEGS + 2)
+		return (ENOBUFS);
+
+	used = rge_encap(sc, q, &m, idx);
+	if (used <= 0) {
+		m_freem(m);
+		return (ENOBUFS);
+	}
+
+	idx += used;
+	if (idx >= RGE_TX_LIST_CNT)
+		idx -= RGE_TX_LIST_CNT;
+	q->q_tx.rge_txq_prodidx = idx;
+
+	RGE_WRITE_2(sc, RGE_TXSTART, RGE_TXSTART_START);
+	return (0);
+}
+
+static int
+rge_debugnet_poll(if_t ifp, int count __unused)
+{
+	struct rge_softc *sc;
+	struct rge_queues *q;
+	struct mbufq rx_mq;
+	struct mbuf *m;
+
+	sc = if_getsoftc(ifp);
+	if ((if_getdrvflags(ifp) & IFF_DRV_RUNNING) == 0 ||
+	    sc->sc_stopped)
+		return (EBUSY);
+
+	q = sc->sc_queues;
+	rge_txeof(q);
+	mbufq_init(&rx_mq, RGE_RX_LIST_CNT);
+	(void)rge_rxeof(q, &rx_mq);
+	while ((m = mbufq_dequeue(&rx_mq)) != NULL)
+		if_input(ifp, m);
+	return (0);
+}
+#endif /* DEBUGNET */
 
 static device_method_t rge_methods[] = {
 	DEVMETHOD(device_probe,			rge_probe),

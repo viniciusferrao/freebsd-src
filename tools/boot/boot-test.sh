@@ -20,7 +20,9 @@
 #   -a ARCH	Architecture to test; repeat -a to test several
 #		(default: host arch)
 #		Supported: amd64, aarch64, armv7, riscv64, powerpc, powerpc64,
-#		powerpc64le
+#		powerpc64le, loongarch64
+#		(loongarch64 is disabled/excluded from -A until the LoongArch
+#		port lands in-tree; usable directly via -a once it has)
 #   -A		Test every supported architecture
 #   -b		Skip build/install phase (reuse existing tree)
 #   -B		Skip build/install and image creation (reuse existing images)
@@ -49,6 +51,7 @@ pkg_for() {
     *ipxe*)		echo sysutils/ipxe ;;
     *syslinux*|*memdisk*) echo sysutils/syslinux ;;
     *edk2*)		echo emulators/qemu ;;	# edk2-*.fd ship with qemu
+    python3)		echo lang/python3 ;;
     *)			echo "" ;;		# makefs/mkimg etc. = base
     esac
 }
@@ -81,6 +84,9 @@ have_file() {
 # --------------------------------------------------------------------------
 
 # Test whether the current arch declares a capability, e.g. "has efi".
+# "no_release" is special: it means the arch has never had a FreeBSD
+# release, so there's no ISO to pull a minimal userland from -- see
+# install_minimal_userland_world().
 has() {
     case " ${ARCH_CAPS} " in
 	*" $1 "*) return 0 ;;
@@ -198,6 +204,10 @@ fi
 # The smallest FAT32 filesystem is 33292 KB
 espsize=33292
 
+# GPT attribute bit that marks the partition to boot, from
+# sys/sys/disk/gpt.h (GPT_ENT_ATTR_BOOTME).  Used for the A/B test.
+GPT_ATTR_BOOTME=59
+
 # Linux kernel version for linuxboot tests
 LINUX_VERSION=6.18.2
 
@@ -277,6 +287,9 @@ qemu_netboot() {
 # we don't use the ipxe USB path we use here. We use that because Tianocore
 # expects http/https booting when the obvious '-boot n' sort of things
 # are used.
+#
+# -device virtio-rng-pci: EDK II's network stack has required an RNG
+# device since CVE-2023-45237.
 qemu_netboot_ramdisk() {
     netif=$1
     echo "$(param qemu_bin) -M q35 -cpu max -m 2g \
@@ -285,6 +298,7 @@ qemu_netboot_ramdisk() {
 	-hda ${OUTDIR}/netboot-ipxe.img \
 	-device virtio-net,netdev=net0 \
 	-netdev tap,id=net0,ifname=${netif},script=no,downscript=no \
+	-device virtio-rng-pci \
 	-fw_cfg name=opt/org.tianocore/IPv4PXESupport,string=no \
 	-fw_cfg name=opt/org.tianocore/IPv6PXESupport,string=no \
 	-nographic -monitor none -serial stdio"
@@ -308,39 +322,81 @@ find_iso() {
     die "No ISO found for ${ARCH}: ${isoname} not found"
 }
 
-install_minimal_userland() {
+# Paths (binaries + their libraries + rtld) to pull into DESTDIR for a minimal
+# userland. Library *names* are discovered via ldd on the HOST's own copies of
+# USERLAND_BINS: those paths (e.g. /lib/libc.so.7) are the same across
+# architectures, only the file contents differ, so this works even when the
+# files themselves are about to come from a foreign-arch source.
+userland_extract_list() {
+    local host_bins=""
+    for b in ${USERLAND_BINS}; do
+	host_bins="${host_bins} /${b}"
+    done
+    local lib_paths=$(ldd ${host_bins} 2>/dev/null \
+	| awk 'NF == 4 { print $3 }' | sort -u)
+
+    local list=""
+    for b in ${USERLAND_BINS}; do
+	list="${list} ./${b}"
+    done
+    for l in ${lib_paths}; do
+	list="${list} .${l}"
+    done
+    list="${list} ./libexec/ld-elf.so.1"
+
+    # Some architectures (e.g., armv7) need libgcc_s.so.1 even though the host
+    # binaries don't. Always try to extract it. We'll ignore it if not there.
+    list="${list} ./lib/libgcc_s.so.1"
+    echo "${list}"
+}
+
+# Extract the minimal userland from a release ISO -- the normal path for any
+# arch that has actually shipped a FreeBSD release.
+install_minimal_userland_iso() {
     # Split the declaration from the assignment: `local iso=$(find_iso)` would
     # swallow find_iso's exit status (local returns 0), so its die() -- which
     # runs in the $() subshell -- would not stop this script.
     local iso
     iso=$(find_iso) || exit 1
     echo "  Extracting minimal userland from release ISO ${iso}..."
-
-    # Determine library paths from host equivalents of our binaries
-    local host_bins=""
-    for b in ${USERLAND_BINS}; do
-	host_bins="${host_bins} /${b}"
-    done
-    lib_paths=$(ldd ${host_bins} 2>/dev/null \
-	| awk 'NF == 4 { print $3 }' | sort -u)
-
-    # Build the list of paths to extract: binaries + libraries + rtld
-    local extract_list=""
-    for b in ${USERLAND_BINS}; do
-	extract_list="${extract_list} ./${b}"
-    done
-    for l in ${lib_paths}; do
-	extract_list="${extract_list} .${l}"
-    done
-    extract_list="${extract_list} ./libexec/ld-elf.so.1"
-
-    # Some architectures (e.g., armv7) need libgcc_s.so.1 even though the host
-    # binaries don't. Always try to extract it. We'll ignore it if not there.
-    extract_list="${extract_list} ./lib/libgcc_s.so.1"
-
-    # Extract the files from the tarball.
-    tar -C ${DESTDIR} -xf ${iso} ${extract_list} \
+    tar -C ${DESTDIR} -xf ${iso} $(userland_extract_list) \
 	>> ${LOGDIR}/installuserland.log 2>&1 || true
+}
+
+# Cross-build the minimal userland via installworld instead of an ISO -- for
+# architectures that have never had a FreeBSD release (no_release cap), so no
+# ISO exists or ever will for the current version. Assumes buildworld has
+# already been done for TARGET/TARGET_ARCH, same precondition build_tree
+# already has for buildkernel.
+install_minimal_userland_world() {
+    echo "  Cross-installing minimal userland via installworld (no release for ${ARCH})..."
+    local worlddir=${OUTDIR}/world
+    rm -rf ${worlddir}
+    mkdir -p ${worlddir}
+    (cd ${SRCTOP} && ${MK} installworld \
+	DESTDIR=${worlddir} \
+	MK_MAN=no \
+	MK_TESTS=no \
+	MK_DEBUG_FILES=no \
+	MK_INSTALL_AS_USER=yes) > ${LOGDIR}/installworld.log 2>&1 \
+	|| die "installworld failed (see ${LOGDIR}/installworld.log)"
+
+    local item src
+    for item in $(userland_extract_list); do
+	src=${worlddir}/${item#.}
+	[ -f "${src}" ] || continue
+	mkdir -p ${DESTDIR}/$(dirname ${item#.})
+	cp -p ${src} ${DESTDIR}/${item#.}
+    done
+    rm -rf ${worlddir}
+}
+
+install_minimal_userland() {
+    if has no_release; then
+	install_minimal_userland_world
+    else
+	install_minimal_userland_iso
+    fi
 }
 
 # --------------------------------------------------------------------------
@@ -487,6 +543,84 @@ make_one_zfs() {
     makefs -t zfs -s 100m \
 	-o poolname=ztestroot -o bootfs=ztestroot -o rootpath=/ \
 	${img} ${mt} ${DESTDIR} >> ${LOGDIR}/imagebuild.log 2>&1
+    rm -f ${mt}
+}
+
+# --------------------------------------------------------------------------
+# A/B (dual root) images
+#
+# gptboot.efi is the only FreeBSD EFI component that reads the GPT bootme
+# attribute, so it is the only way to test that the loader it chainloads
+# honours the partition that was selected for it, rather than picking a root
+# of its own.
+#
+# The failure being tested for is "boots fine, wrong root", not "fails to
+# boot": a loader that ignores the selected partition still reaches /etc/rc
+# and still looks healthy.  So the two roots have to differ in what they
+# print, and only the bootme one may print the string run_one_test greps for.
+# Two identical roots (what mkimg writes if handed the same image twice)
+# would make this test permanently green.
+# --------------------------------------------------------------------------
+
+# Create one of the two A/B root images.  ${1} is the slice letter: each slice
+# gets its own UFS label, an fstab pointing at that label, and an /etc/rc that
+# names the slice it booted from.  Only slice B -- the one set bootme in
+# assemble_efi_gpt_ab -- prints SUCCESS; booting A prints WRONG SLICE instead
+# and the test fails on timeout.
+make_one_ufs_ab() {
+    slice=$1
+    img=${IMGDIR}/bootable-ufs-ab-${slice}.img
+    mt=$(mktemp ${OUTDIR}/ufs-ab-mtree.XXXXXX)
+    fstab=${OUTDIR}/fstab.ufs.ab-${slice}
+    rc=${OUTDIR}/rc.ab-${slice}
+
+    echo "  Creating UFS image for A/B slice ${slice}..."
+    echo "/dev/ufs/root${slice}	/	ufs	rw	1	1" > ${fstab}
+
+    # Both roots report which one got mounted, so a failing log says what
+    # happened; only B counts as a pass.  vfs.root.mountfrom is the direct
+    # readout of the loader's choice.
+    if [ "${slice}" = "B" ]; then
+	verdict='echo "RC COMMAND RUNNING -- SUCCESS!!!!!"'
+    else
+	verdict='echo "WRONG SLICE -- booted A, expected B"'
+    fi
+    cat > ${rc} <<RCEOF
+#!/bin/sh
+
+sysctl machdep.bootmethod
+kenv vfs.root.mountfrom
+${verdict}
+halt -p
+RCEOF
+
+    echo "./etc/fstab type=file mode=0644 contents=${fstab}" > ${mt}
+    echo "./etc/rc type=file mode=0755 contents=${rc}" >> ${mt}
+    echo "./boot/loader.efi type=file mode=0755 contents=${DESTDIR}/boot/loader_lua.efi" >> ${mt}
+    makefs -t ffs -B $(param byte_order) -M 10m -o label=root${slice} -o version=2 \
+	${img} ${mt} ${DESTDIR} >> ${LOGDIR}/imagebuild.log 2>&1
+    rm -f ${mt}
+}
+
+# Create an ESP holding gptboot.efi rather than a loader variant.  gptboot.efi
+# is a boot1 flavour: it reads the GPT, picks the bootme partition, and
+# chainloads /boot/loader.efi from it.
+make_gptboot_esp() {
+    esp=${IMGDIR}/gptboot.esp
+    mt=$(mktemp ${OUTDIR}/esp-mtree.XXXXXX)
+
+    echo "  Creating ESP with gptboot.efi..."
+    cat > ${mt} <<EOF
+./efi type=dir uname=root gname=wheel mode=0755
+./efi/boot type=dir uname=root gname=wheel mode=0755
+./efi/boot/$(param efi_bootname).efi type=file uname=root gname=wheel mode=0755 contents=${DESTDIR}/boot/gptboot.efi
+EOF
+    makefs -t msdos \
+	-o fat_type=32 \
+	-o sectors_per_cluster=1 \
+	-o volume_label=EFISYS \
+	-s ${espsize}k \
+	${esp} ${mt} >> ${LOGDIR}/imagebuild.log 2>&1
     rm -f ${mt}
 }
 
@@ -661,6 +795,12 @@ make_base_images() {
 	for l in $(param efi_loaders); do
 	    make_one_esp $l
 	done
+	# A/B: gptboot.efi on the ESP, plus two tellable-apart roots.
+	if [ -f "${DESTDIR}/boot/gptboot.efi" ]; then
+	    make_gptboot_esp
+	    make_one_ufs_ab A
+	    make_one_ufs_ab B
+	fi
     fi
 
     # Linuxboot initrd + ESP (if supported and Linux kernel is available)
@@ -741,6 +881,30 @@ assemble_efi_gpt() {
 	    register_test ${name} $(qemu_efi ${img})
 	done
     done
+}
+
+# Build the A/B disk and register its test.  Layout mirrors an A/B upgrade
+# scheme: one ESP holding gptboot.efi, then two interchangeable root slices.
+#
+# bootme is set on p3 (slice B, the second root) on purpose.  With no bootme
+# anywhere gptboot.efi falls back to the first UFS partition, which is slice
+# A, so marking p2 instead would pass even if the attribute were ignored
+# entirely.  Marking the second root means only a loader that honours the
+# selected partition can reach slice B and print SUCCESS.
+assemble_efi_gpt_ab() {
+    echo "  Assembling EFI+GPT A/B image..."
+    name="efi-gpt-ufs-ab"
+    img=${IMGDIR}/${name}.img
+
+    mkimg -s gpt \
+	-p efi:=${IMGDIR}/gptboot.esp \
+	-p freebsd-ufs:=${IMGDIR}/bootable-ufs-ab-A.img \
+	-p freebsd-ufs:=${IMGDIR}/bootable-ufs-ab-B.img \
+	-o ${img} >> ${LOGDIR}/imagebuild.log 2>&1
+
+    ${GPTATTR} ${img} 3 ${GPT_ATTR_BOOTME} >> ${LOGDIR}/imagebuild.log 2>&1
+
+    register_test ${name} $(qemu_efi ${img})
 }
 
 assemble_efi_mbr() {
@@ -1193,6 +1357,15 @@ EOF
 chain tftp://\${next-server}/loader.efi
 EOF
 	    register_netboot_test netboot-efi ${tftp} /boot-efi.ipxe "" qemu_netboot_ramdisk
+
+	    # Same idea as netboot-efi, but rootdev= forces currdev to an
+	    # http:// URL so the root fetch exercises the loader's own EFI
+	    # HTTP devspec (efi/libefi/efihttp.c) instead of tftp/NFS.
+	    cat > ${tftp}/boot-http.ipxe <<EOF
+#!ipxe
+chain tftp://\${next-server}/loader.efi rootdev=http://\${next-server}/
+EOF
+	    register_netboot_test netboot-http-efi ${tftp} /boot-http.ipxe "" qemu_netboot_ramdisk
 	fi
 
 	cat > ${tftp}/boot.ipxe <<EOF
@@ -1318,6 +1491,21 @@ netboot_network_setup() {
 	done < "${resolved}"
     fi
 
+    # Each vmnet also gets its own python3 http.server (see netboot_helper),
+    # so http:// fetches (netboot-http-efi) have something to hit at
+    # ${next-server} alongside dnsmasq's tftp-root. Confirm the pid count
+    # still matches the plan and every one of them is still alive.
+    if ${converged}; then
+	if [ -s "${NETBOOT_STATE_DIR}/httpd.pids" ] && \
+		[ "$(wc -l < "${NETBOOT_STATE_DIR}/httpd.pids")" -eq "$(wc -l < "${resolved}")" ]; then
+	    while read pid; do
+		ps -p "${pid}" > /dev/null 2>&1 || { converged=false; break; }
+	    done < "${NETBOOT_STATE_DIR}/httpd.pids"
+	else
+	    converged=false
+	fi
+    fi
+
     if ${converged}; then
 	echo "  Existing vmnet(4)/dnsmasq setup already matches -- no sudo needed."
     else
@@ -1338,6 +1526,7 @@ netboot_network_setup() {
 netboot_helper() {
     planfile=$1
     [ -r "${planfile}" ] || die "netboot helper: cannot read plan ${planfile}"
+    need_cmd python3
     invoker=${SUDO_UID:-$(id -u)}
     mkdir -p "${NETBOOT_STATE_DIR}"
 
@@ -1347,6 +1536,12 @@ netboot_helper() {
 	kill "$(cat ${NETBOOT_STATE_DIR}/dnsmasq.pid)" 2>/dev/null || true
 	rm -f "${NETBOOT_STATE_DIR}/dnsmasq.pid"
     fi
+    if [ -s "${NETBOOT_STATE_DIR}/httpd.pids" ]; then
+	while read pid; do
+	    kill "${pid}" 2>/dev/null || true
+	done < "${NETBOOT_STATE_DIR}/httpd.pids"
+    fi
+    : > "${NETBOOT_STATE_DIR}/httpd.pids"
     for vmnet in $(ifconfig -g boot-test 2>/dev/null); do
 	ifconfig "${vmnet}" destroy
     done
@@ -1376,6 +1571,16 @@ EOF
 	ifconfig "${vmnet}" create group boot-test
 	ifconfig "${vmnet}" inet "${gw}/${prefix}" up
 	chown "${invoker}" "/dev/${vmnet}"
+
+	# One http.server per subnet, bound only to that subnet's own gw
+	# address (not 0.0.0.0), so concurrently-running tests never collide
+	# on port 80. Serves the exact same tree as dnsmasq's tftp-root above
+	# -- http:// and tftp:// fetches of the same path see identical bytes.
+	# Harmless for tests that never issue an http:// fetch; only
+	# netboot-http-efi actually relies on it today.
+	python3 -m http.server 80 --bind "${gw}" --directory "${tftpdir}" \
+	    > "${NETBOOT_STATE_DIR}/httpd-${vmnet}.log" 2>&1 &
+	echo $! >> "${NETBOOT_STATE_DIR}/httpd.pids"
 
 	# dnsmasq's dhcp-boot only sets DHCP option 67 (bootfile-name), never
 	# the classic fixed-length BOOTP "file" field -- confirmed by comparing
@@ -1413,7 +1618,8 @@ EOF
 
     md5 -q "${planfile}" > "${NETBOOT_STATE_DIR}/state.hash"
     chown "${invoker}" "${NETBOOT_STATE_DIR}" "${conf}" "${planfile}" \
-	"${NETBOOT_STATE_DIR}/dnsmasq.pid" "${NETBOOT_STATE_DIR}/state.hash"
+	"${NETBOOT_STATE_DIR}/dnsmasq.pid" "${NETBOOT_STATE_DIR}/state.hash" \
+	"${NETBOOT_STATE_DIR}"/httpd.pids "${NETBOOT_STATE_DIR}"/httpd-*.log
 }
 
 # Manual cleanup: `sudo sh boot-test.sh --netboot-teardown`. Not run
@@ -1422,6 +1628,11 @@ EOF
 netboot_teardown() {
     if [ -s "${NETBOOT_STATE_DIR}/dnsmasq.pid" ]; then
 	kill "$(cat ${NETBOOT_STATE_DIR}/dnsmasq.pid)" 2>/dev/null || true
+    fi
+    if [ -s "${NETBOOT_STATE_DIR}/httpd.pids" ]; then
+	while read pid; do
+	    kill "${pid}" 2>/dev/null || true
+	done < "${NETBOOT_STATE_DIR}/httpd.pids"
     fi
     for vmnet in $(ifconfig -g boot-test 2>/dev/null); do
 	ifconfig "${vmnet}" destroy
@@ -1436,6 +1647,9 @@ assemble_all_images() {
     if has efi; then
 	if [ -r "$(param efi_firmware)" ]; then
 	    assemble_efi_gpt
+	    if [ -f "${IMGDIR}/gptboot.esp" ]; then
+		assemble_efi_gpt_ab
+	    fi
 	    if has mbr; then
 		assemble_efi_mbr
 	    fi
@@ -1641,9 +1855,17 @@ case "${NETBOOT_MODE}" in
 esac
 
 # Preflight: universal tools (per-arch qemu binaries are checked in build_all).
-for prog in jq expect makefs mkimg; do
+for prog in jq expect makefs mkimg cc; do
     need_cmd "${prog}"
 done
+
+# gptattr sets the GPT bootme attribute for the A/B test; see
+# assemble_efi_gpt_ab.  It is a host tool and independent of the target
+# architecture, so build it once here rather than per-arch.
+GPTATTR=$(mktemp -t boot-test-gptattr)
+if ! cc -o ${GPTATTR} ${SRCTOP}/tools/boot/gptattr.c -lz 2>/dev/null; then
+    die "Failed to build ${SRCTOP}/tools/boot/gptattr.c"
+fi
 
 echo "FreeBSD boot loader test suite: ${ARCHES}"
 echo ""

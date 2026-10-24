@@ -1483,9 +1483,10 @@ ixl_handle_lan_overflow_event(struct ixl_pf *pf, struct i40e_arq_event_info *e)
 	device_t dev = pf->dev;
 	u32 rxq_idx, qtx_ctl;
 
-	rxq_idx = (e->desc.params.external.param0 & I40E_PRTDCB_RUPTQ_RXQNUM_MASK) >>
+	rxq_idx = (le32toh(e->desc.params.external.param0) &
+	    I40E_PRTDCB_RUPTQ_RXQNUM_MASK) >>
 	    I40E_PRTDCB_RUPTQ_RXQNUM_SHIFT;
-	qtx_ctl = e->desc.params.external.param1;
+	qtx_ctl = le32toh(e->desc.params.external.param1);
 
 	device_printf(dev, "LAN overflow event: global rxq_idx %d\n", rxq_idx);
 	device_printf(dev, "LAN overflow event: QTX_CTL 0x%08x\n", qtx_ctl);
@@ -1982,7 +1983,8 @@ ixl_if_priv_ioctl(if_ctx_t ctx, u_long command, caddr_t data)
 	case SIOCGDRVSPEC:
 	case SIOCSDRVSPEC:
 		/* NVM update command */
-		if (ifd->ifd_cmd == I40E_NVM_ACCESS) {
+		if (ifd->ifd_cmd == I40E_NVM_ACCESS ||
+		    ifd->ifd_cmd == I40E_NVM_ACCESS2) {
 			error = priv_check(curthread, PRIV_DRIVER);
 			if (error)
 				break;

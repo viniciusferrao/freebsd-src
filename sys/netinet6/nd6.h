@@ -288,7 +288,7 @@ VNET_DECLARE(int, ip6_temp_regen_advance); /* seconds */
 #define	V_ip6_temp_regen_advance	VNET(ip6_temp_regen_advance)
 
 union nd_opts {
-	struct nd_opt_hdr *nd_opt_array[24];	/* max = ND_OPT_ROUTE_INFO */
+	struct nd_opt_hdr *nd_opt_array[25];	/* max = ND_OPT_ROUTE_INFO */
 	struct {
 		struct nd_opt_hdr *zero;
 		struct nd_opt_hdr *src_lladdr;
@@ -380,7 +380,7 @@ void nd6_na_output(struct ifnet *, const struct in6_addr *,
 void nd6_ns_input(struct mbuf *, int, int);
 void nd6_ns_output(struct ifnet *, const struct in6_addr *,
 	const struct in6_addr *, const struct in6_addr *, uint8_t *);
-caddr_t nd6_ifptomac(struct ifnet *);
+char *nd6_ifptomac(struct ifnet *);
 u_int nd6_lladdr_opt_pad(struct ifnet *);
 void nd6_dad_init(void);
 void nd6_dad_start(struct ifaddr *, int);

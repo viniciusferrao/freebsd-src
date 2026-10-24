@@ -239,7 +239,7 @@ typedef struct if_softc_ctx {
 	uint32_t __spare6__;
 	uint32_t __spare7__;
 	uint32_t __spare8__;
-	caddr_t __spare9__;
+	void *__spare9__;
 	int isc_disable_msix;
 	if_txrx_t isc_txrx;
 	struct ifmedia *isc_media;
@@ -411,6 +411,13 @@ typedef enum {
  */
 #define IFLIB_FEATURE_SUB_INTERFACES	1500014
 
+/* Power transitions for ifdi_power_prepare(). */
+enum iflib_power_event {
+	IFLIB_POWER_DETACH,
+	IFLIB_POWER_SUSPEND,
+	IFLIB_POWER_SHUTDOWN,
+};
+
 /*
  * These enum values are used in iflib_needs_restart to indicate to iflib
  * functions whether or not the interface needs restarting when certain events
@@ -428,6 +435,13 @@ void *iflib_get_softc(if_ctx_t ctx);
 device_t iflib_get_dev(if_ctx_t ctx);
 
 if_t iflib_get_ifp(if_ctx_t ctx);
+
+/*
+ * Lockless software admission snapshot.  This neither pins the context nor
+ * establishes that queue DMA has stopped; callers retain their usual lifetime
+ * and queue synchronization requirements.
+ */
+bool iflib_is_running(if_ctx_t ctx);
 
 struct ifmedia *iflib_get_media(if_ctx_t ctx);
 

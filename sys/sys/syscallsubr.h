@@ -82,6 +82,29 @@ struct mmap_req {
 	mmap_check_fp_fn	mr_check_fp_fn;
 };
 
+/*
+ * A copyin_hdtr_t takes a pointer to a sendfile header/trailer in
+ * userspace and storage for on in the kernel and copies it in.
+ */
+typedef int (copyin_hdtr_t)(const void *hdtrp, struct sf_hdtr *hdtr);
+
+/*
+ * A copyinuio_t takes a pointer to an iovec in userspace along with a
+ * count and allocates a struct uio containing a copy of the iovec.
+ * The uio should be freed with freeuio().
+ */
+typedef int (copyinuio_t)(const void *iovp, unsigned int iovcnt,
+    struct uio **iov);
+
+/*
+ * An updateiov_t takes a pointer to a struct uio previously created with
+ * copyinuio_t and a pointer to the corresponding iovec in userspace.
+ * They update all lengths in userspace to match those in the uio.
+ * They are a helper for non-standard uio use (not using uiomove) such
+ * as that in the jail_get(2) system call implementation.
+ */
+typedef int (updateiov_t)(const struct uio *uiop, void *iovp);
+
 uint64_t at2cnpflags(u_int at_flags, u_int mask);
 int	kern___getcwd(struct thread *td, char *buf, enum uio_seg bufseg,
 	    size_t buflen, size_t path_max);
@@ -334,13 +357,18 @@ int	kern_sched_rr_get_interval_td(struct thread *td, struct thread *targettd,
 	    struct timespec *ts);
 int	kern_semctl(struct thread *td, int semid, int semnum, int cmd,
 	    union semun *arg, register_t *rval);
+int	kern_sendfile(struct thread *td, int fd, int s, off_t offset,
+	    size_t nbytes, struct sf_hdtr *hdtr, off_t *sbytes, int flags,
+	    bool compat, copyin_hdtr_t *copyin_hdtr_f,
+	    copyinuio_t *copyinuio_f);
 int	kern_select(struct thread *td, int nd, fd_set *fd_in, fd_set *fd_ou,
 	    fd_set *fd_ex, struct timeval *tvp, int abi_nfdbits);
 int	kern_sendit(struct thread *td, int s, struct msghdr *mp, int flags,
 	    struct mbuf *control, enum uio_seg segflg);
 int	kern_setcred(struct thread *const td, const u_int flags,
 	    struct setcred *const wcred);
-int	kern_setgroups(struct thread *td, int *ngrpp, gid_t *groups);
+int	kern_setgroups(struct thread *td, int *ngrpp, gid_t *groups,
+	    bool includes_egid);
 int	kern_setitimer(struct thread *, u_int, struct itimerval *,
 	    struct itimerval *);
 int	kern_setpriority(struct thread *td, int which, int who, int prio);
@@ -420,6 +448,11 @@ int	user_cpuset_getaffinity(struct thread *td, cpulevel_t level,
 int	user_cpuset_setaffinity(struct thread *td, cpulevel_t level,
 	    cpuwhich_t which, id_t id, size_t cpusetsize,
 	    const cpuset_t *maskp, const struct cpuset_copy_cb *cb);
+int	user_jail_get(struct thread *td, struct iovec *iovp,
+	    unsigned int iovcnt, int flags, copyinuio_t *copyinuio_f,
+	    updateiov_t *updateiov_f);
+int	user_jail_set(struct thread *td, struct iovec *iovp,
+	    unsigned int iovcnt, int flags, copyinuio_t *copyinuio_f);
 
 /* flags for kern_sigaction */
 #define	KSA_OSIGSET	0x0001	/* uses osigact_t */

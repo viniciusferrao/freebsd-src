@@ -172,15 +172,12 @@ nd6_ns_input(struct mbuf *m, int off, int icmp6len)
 		goto bads;
 	}
 
-	if (m->m_len < off + icmp6len) {
-		m = m_pullup(m, off + icmp6len);
-		if (m == NULL) {
-			IP6STAT_INC(ip6s_exthdrtoolong);
-			return;
-		}
+	if ((m = m_pullup(m, off + icmp6len)) == NULL) {
+		IP6STAT_INC(ip6s_exthdrtoolong);
+		return;
 	}
 	ip6 = mtod(m, struct ip6_hdr *);
-	nd_ns = (struct nd_neighbor_solicit *)((caddr_t)ip6 + off);
+	nd_ns = (struct nd_neighbor_solicit *)((char *)ip6 + off);
 
 	saddr6 = ip6->ip6_src;
 	daddr6 = ip6->ip6_dst;
@@ -623,10 +620,10 @@ nd6_ns_output_fib(struct ifnet *ifp, const struct in6_addr *saddr6,
 		m->m_pkthdr.len += optlen;
 		m->m_len += optlen;
 		icmp6len += optlen;
-		bzero((caddr_t)nd_opt, optlen);
+		bzero(nd_opt, optlen);
 		nd_opt->nd_opt_type = ND_OPT_NONCE;
 		nd_opt->nd_opt_len = optlen >> 3;
-		bcopy(nonce, (caddr_t)(nd_opt + 1), ND_OPT_NONCE_LEN);
+		bcopy(nonce, nd_opt + 1, ND_OPT_NONCE_LEN);
 	}
 	ip6->ip6_plen = htons((u_short)icmp6len);
 	nd_ns->nd_ns_cksum = 0;
@@ -710,15 +707,12 @@ nd6_na_input(struct mbuf *m, int off, int icmp6len)
 		goto bad;
 	}
 
-	if (m->m_len < off + icmp6len) {
-		m = m_pullup(m, off + icmp6len);
-		if (m == NULL) {
-			IP6STAT_INC(ip6s_exthdrtoolong);
-			return;
-		}
+	if ((m = m_pullup(m, off + icmp6len)) == NULL) {
+		IP6STAT_INC(ip6s_exthdrtoolong);
+		return;
 	}
 	ip6 = mtod(m, struct ip6_hdr *);
-	nd_na = (struct nd_neighbor_advert *)((caddr_t)ip6 + off);
+	nd_na = (struct nd_neighbor_advert *)((char *)ip6 + off);
 
 	flags = nd_na->nd_na_flags_reserved;
 	is_router = ((flags & ND_NA_FLAG_ROUTER) != 0);
@@ -1004,7 +998,7 @@ nd6_na_output_fib(struct ifnet *ifp, const struct in6_addr *daddr6_0,
 	NET_EPOCH_ASSERT();
 
 	int icmp6len, maxlen, error;
-	caddr_t mac = NULL;
+	char *mac = NULL;
 
 	daddr6 = *daddr6_0;	/* make a local copy for modification */
 
@@ -1104,7 +1098,7 @@ nd6_na_output_fib(struct ifnet *ifp, const struct in6_addr *daddr6_0,
 		m->m_pkthdr.len += optlen;
 		m->m_len += optlen;
 		icmp6len += optlen;
-		bzero((caddr_t)nd_opt, optlen);
+		bzero(nd_opt, optlen);
 		nd_opt->nd_opt_type = ND_OPT_TARGET_LINKADDR;
 		nd_opt->nd_opt_len = optlen >> 3;
 		memcpy((char *)(nd_opt + 1) + pad, mac, ifp->if_addrlen);
@@ -1149,7 +1143,7 @@ nd6_na_output(struct ifnet *ifp, const struct in6_addr *daddr6_0,
 }
 #endif
 
-caddr_t
+char *
 nd6_ifptomac(struct ifnet *ifp)
 {
 	switch (ifp->if_type) {

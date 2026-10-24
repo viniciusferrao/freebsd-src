@@ -1708,10 +1708,10 @@ ktls_reset_receive_tag(void *context, int pending)
 	INP_RUNLOCK(inp);
 
 	if (inp->inp_vflag & INP_IPV6) {
-		if ((if_getcapenable2(ifp) & IFCAP2_RXTLS6) == 0)
+		if ((if_getcapenable2(ifp) & IFCAP2_BIT(IFCAP2_RXTLS6)) == 0)
 			goto out;
 	} else {
-		if ((if_getcapenable2(ifp) & IFCAP2_RXTLS4) == 0)
+		if ((if_getcapenable2(ifp) & IFCAP2_BIT(IFCAP2_RXTLS4)) == 0)
 			goto out;
 	}
 
@@ -2390,14 +2390,14 @@ tls13_find_record_type(struct ktls_session *tls, struct mbuf *m, int tls_len,
 			m_len--;
 		if (m_len > 0) {
 			record_type = cp[m_len - 1];
-			last_offset = offset + m_len;
+			last_offset = offset + m_len - 1;
 		}
 	}
 	if (last_offset < tls->params.tls_hlen)
 		return (EBADMSG);
 
 	*record_typep = record_type;
-	*trailer_len = tls_len - last_offset + 1;
+	*trailer_len = tls_len - last_offset;
 	return (0);
 }
 

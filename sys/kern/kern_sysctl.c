@@ -191,7 +191,7 @@ sysctl_root_handler_locked(struct sysctl_oid *oid, void *arg1, intmax_t arg2,
 
 	/*
 	 * Treat set CTLFLAG_NEEDGIANT and unset CTLFLAG_MPSAFE flags the same,
-	 * untill we're ready to remove all traces of Giant from sysctl(9).
+	 * until we're ready to remove all traces of Giant from sysctl(9).
 	 */
 	if ((oid->oid_kind & CTLFLAG_NEEDGIANT) ||
 	    (!(oid->oid_kind & CTLFLAG_MPSAFE)))
@@ -2370,7 +2370,7 @@ sysctl_root(SYSCTL_HANDLER_ARGS)
 	if (IN_CAPABILITY_MODE(req->td)) {
 		if ((req->oldptr && !(oid->oid_kind & CTLFLAG_CAPRD)) ||
 		    (req->newptr && !(oid->oid_kind & CTLFLAG_CAPWR))) {
-			error = EPERM;
+			error = ECAPMODE;
 			goto out;
 		}
 	}
@@ -2580,14 +2580,9 @@ userland_sysctl(struct thread *td, int *name, u_int namelen, void *old,
 	}
 	CURVNET_SET(TD_TO_VNET(td));
 
-	for (;;) {
-		req.oldidx = 0;
-		req.newidx = 0;
-		error = sysctl_root(0, name, namelen, &req);
-		if (error != EAGAIN)
-			break;
-		kern_yield(PRI_USER);
-	}
+	req.oldidx = 0;
+	req.newidx = 0;
+	error = sysctl_root(0, name, namelen, &req);
 
 	CURVNET_RESTORE();
 

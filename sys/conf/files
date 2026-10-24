@@ -214,13 +214,12 @@ contrib/openzfs/module/os/freebsd/zfs/zfs_ctldir.c		optional zfs compile-with "$
 contrib/openzfs/module/os/freebsd/zfs/zfs_debug.c		optional zfs compile-with "${ZFS_C}"
 contrib/openzfs/module/os/freebsd/zfs/zfs_dir.c		optional zfs compile-with "${ZFS_C}"
 contrib/openzfs/module/os/freebsd/zfs/zfs_file_os.c		optional zfs compile-with "${ZFS_C}"
-contrib/openzfs/module/os/freebsd/zfs/zfs_ioctl_compat.c		optional zfs compile-with "${ZFS_C}"
 contrib/openzfs/module/os/freebsd/zfs/zfs_ioctl_os.c		optional zfs compile-with "${ZFS_C}"
 contrib/openzfs/module/os/freebsd/zfs/zfs_racct.c		optional zfs compile-with "${ZFS_C}"
 contrib/openzfs/module/os/freebsd/zfs/zfs_vfsops.c		optional zfs compile-with "${ZFS_C}"
 contrib/openzfs/module/os/freebsd/zfs/zfs_vnops_os.c		optional zfs compile-with "${ZFS_C}"
 contrib/openzfs/module/os/freebsd/zfs/zfs_znode_os.c		optional zfs compile-with "${ZFS_C}"
-contrib/openzfs/module/os/freebsd/zfs/zio_crypt.c		optional zfs compile-with "${ZFS_C}"
+contrib/openzfs/module/os/freebsd/zfs/zio_crypt_os.c		optional zfs compile-with "${ZFS_C}"
 contrib/openzfs/module/os/freebsd/zfs/zvol_os.c		optional zfs compile-with "${ZFS_C}"
 
 #zfs checksums / zcommon
@@ -378,6 +377,7 @@ contrib/openzfs/module/zfs/zil.c		optional zfs compile-with "${ZFS_C}"
 contrib/openzfs/module/zfs/zio.c		optional zfs compile-with "${ZFS_C}"
 contrib/openzfs/module/zfs/zio_checksum.c		optional zfs compile-with "${ZFS_C}"
 contrib/openzfs/module/zfs/zio_compress.c		optional zfs compile-with "${ZFS_C}"
+contrib/openzfs/module/zfs/zio_crypt.c		optional zfs compile-with "${ZFS_C}"
 contrib/openzfs/module/zfs/zio_inject.c		optional zfs compile-with "${ZFS_C}"
 contrib/openzfs/module/zfs/zle.c		optional zfs compile-with "${ZFS_C}"
 contrib/openzfs/module/zfs/zrlock.c		optional zfs compile-with "${ZFS_C}"
@@ -736,6 +736,9 @@ dev/aacraid/aacraid.c		optional aacraid
 dev/aacraid/aacraid_cam.c	optional aacraid scbus
 dev/aacraid/aacraid_debug.c	optional aacraid
 dev/aacraid/aacraid_pci.c	optional aacraid pci
+dev/acpi_apple/acpi_apple.c	optional acpi_apple acpi pci backlight
+dev/acpi_apple/acpi_apple_bl.c	optional acpi_apple acpi pci backlight
+dev/acpi_apple/acpi_apple_platform.c optional acpi_apple acpi pci backlight
 dev/acpi_support/acpi_wmi.c	optional acpi_wmi acpi
 dev/acpi_support/acpi_asus.c	optional acpi_asus acpi
 dev/acpi_support/acpi_asus_wmi.c	optional acpi_asus_wmi acpi
@@ -1332,6 +1335,9 @@ dev/bnxt/bnxt_en/bnxt_ulp.c		optional bnxt iflib pci compile-with "${BNXT_C}"
 dev/bnxt/bnxt_en/bnxt_log.c		optional bnxt iflib pci compile-with "${BNXT_C}"
 dev/bnxt/bnxt_en/bnxt_log_data.c	optional bnxt iflib pci compile-with "${BNXT_C}"
 dev/bnxt/bnxt_en/bnxt_coredump.c	optional bnxt iflib pci compile-with "${BNXT_C}"
+dev/bnxt/bnxt_en/bnxt_ptp.c		optional bnxt iflib pci compile-with "${BNXT_C}"
+dev/bnxt/bnxt_en/bnxt_mpc.c		optional bnxt iflib pci compile-with "${BNXT_C}"
+dev/bnxt/bnxt_en/bnxt_ktls.c		optional bnxt iflib pci compile-with "${BNXT_C}"
 dev/bnxt/bnxt_en/if_bnxt.c		optional bnxt iflib pci compile-with "${BNXT_C}"
 dev/bwi/bwimac.c		optional bwi
 dev/bwi/bwiphy.c		optional bwi
@@ -1633,6 +1639,8 @@ dev/dwc/if_dwc.c		optional dwc fdt
 dev/dwc/if_dwc_if.m		optional dwc fdt
 dev/dwc/dwc1000_core.c		optional dwc fdt
 dev/dwc/dwc1000_dma.c		optional dwc fdt
+dev/dwc/dwc4_core.c		optional dwc fdt
+dev/dwc/dwc4_dma.c		optional dwc fdt
 dev/efidev/efidev.c		optional efirt efidev
 dev/efidev/efirt.c		optional efirt
 dev/efidev/efirtc.c		optional efirt efirtc
@@ -1731,6 +1739,7 @@ dev/fdt/fdt_clock_if.m		optional fdt fdt_clock
 dev/fdt/fdt_common.c		optional fdt
 dev/fdt/fdt_pinctrl.c		optional fdt fdt_pinctrl
 dev/fdt/fdt_pinctrl_if.m	optional fdt fdt_pinctrl
+dev/fdt/fdt_reserved_memory.c	optional fdt
 dev/fdt/fdt_slicer.c		optional fdt cfi | fdt mx25l | fdt n25q | fdt at45d
 dev/fdt/fdt_static_dtb.S	optional fdt fdt_dtb_static \
 	dependency	"${FDT_DTS_FILE:T:R}.dtb"
@@ -1816,6 +1825,7 @@ dev/hid/hrfkill.c		optional hrfkill
 dev/hid/hsctrl.c		optional hsctrl
 dev/hid/ietp.c			optional ietp
 dev/hid/ps4dshock.c		optional ps4dshock
+dev/hid/ps5dsense.c		optional ps5dsense
 dev/hid/u2f.c			optional u2f
 dev/hid/xb360gp.c		optional xb360gp
 dev/hptiop/hptiop.c		optional hptiop scbus
@@ -2347,6 +2357,8 @@ dev/ixgbe/ixgbe_common.c	optional ix inet | ixv inet \
 	compile-with "${NORMAL_C} -I$S/dev/ixgbe"
 dev/ixgbe/ixgbe_fw_logging.c	optional ix inet | ixv inet \
 	compile-with "${NORMAL_C} -I$S/dev/ixgbe"
+dev/ixgbe/ixgbe_hv_vf.c		optional ixv inet \
+	compile-with "${NORMAL_C} -I$S/dev/ixgbe"
 dev/ixgbe/ixgbe_mbx.c		optional ix inet | ixv inet \
 	compile-with "${NORMAL_C} -I$S/dev/ixgbe"
 dev/ixgbe/ixgbe_vf.c		optional ix inet | ixv inet \
@@ -2372,10 +2384,6 @@ dev/jme/if_jme.c		optional jme pci
 dev/kbd/kbd.c			optional atkbd | pckbd | sc | ukbd | vt | hkbd
 dev/kbdmux/kbdmux.c		optional kbdmux
 dev/ksyms/ksyms.c		optional ksyms
-dev/le/am7990.c			optional le
-dev/le/am79900.c		optional le
-dev/le/if_le_pci.c		optional le pci
-dev/le/lance.c			optional le
 dev/led/led.c			standard
 dev/lge/if_lge.c		optional lge
 dev/liquidio/base/cn23xx_pf_device.c		optional lio	\
@@ -3333,6 +3341,7 @@ dev/ufshci/ufshci_acpi.c	optional ufshci acpi
 dev/ufshci/ufshci_ctrlr.c	optional ufshci
 dev/ufshci/ufshci_ctrlr_cmd.c	optional ufshci
 dev/ufshci/ufshci_dev.c		optional ufshci
+dev/ufshci/ufshci_ioctl.c	optional ufshci
 dev/ufshci/ufshci_pci.c		optional ufshci pci
 dev/ufshci/ufshci_req_queue.c	optional ufshci
 dev/ufshci/ufshci_req_sdb.c	optional ufshci
@@ -3592,13 +3601,13 @@ dev/vt/vt_font.c		optional vt
 dev/vt/vt_sysmouse.c		optional vt
 dev/vte/if_vte.c		optional vte pci
 dev/watchdog/watchdog.c		standard
-dev/wg/if_wg.c			optional wg				\
+dev/wg/if_wg.c			optional wg inet | wg inet6		\
 	compile-with "${NORMAL_C} -include $S/dev/wg/compat.h"
-dev/wg/wg_cookie.c		optional wg				\
+dev/wg/wg_cookie.c		optional wg inet | wg inet6		\
 	compile-with "${NORMAL_C} -include $S/dev/wg/compat.h"
-dev/wg/wg_crypto.c		optional wg				\
+dev/wg/wg_crypto.c		optional wg inet | wg inet6		\
 	compile-with "${NORMAL_C} -include $S/dev/wg/compat.h"
-dev/wg/wg_noise.c		optional wg				\
+dev/wg/wg_noise.c		optional wg inet | wg inet6		\
 	compile-with "${NORMAL_C} -include $S/dev/wg/compat.h"
 dev/wpi/if_wpi.c		optional wpi pci
 wpifw.c			optional wpifw					\
@@ -4740,6 +4749,8 @@ compat/linuxkpi/common/src/linux_kthread.c	optional compat_linuxkpi \
 	compile-with "${LINUXKPI_C}"
 compat/linuxkpi/common/src/linux_lock.c		optional compat_linuxkpi \
 	compile-with "${LINUXKPI_C}"
+compat/linuxkpi/common/src/linux_math.c		optional compat_linuxkpi \
+	compile-with "${LINUXKPI_C}"
 compat/linuxkpi/common/src/linux_mhi.c		optional compat_linuxkpi wlan \
 	compile-with "${LINUXKPI_C}"
 compat/linuxkpi/common/src/linux_netdev.c	optional compat_linuxkpi \
@@ -4771,6 +4782,8 @@ compat/linuxkpi/common/src/linux_siphash.c	optional compat_linuxkpi \
 compat/linuxkpi/common/src/linux_skbuff.c	optional compat_linuxkpi \
 	compile-with "${LINUXKPI_C}"
 compat/linuxkpi/common/src/linux_slab.c		optional compat_linuxkpi \
+	compile-with "${LINUXKPI_C}"
+compat/linuxkpi/common/src/linux_timesub.c	optional compat_linuxkpi \
 	compile-with "${LINUXKPI_C}"
 compat/linuxkpi/common/src/linux_usb.c		optional compat_linuxkpi usb \
 	compile-with "${LINUXKPI_C}"
@@ -5409,7 +5422,7 @@ vm/vm_pager.c			standard
 vm/vm_phys.c			standard
 vm/vm_radix.c			standard
 vm/vm_reserv.c			standard
-vm/vm_swapout.c			optional racct
+vm/vm_swapout.c			standard
 vm/vm_unix.c			standard
 vm/vnode_pager.c		standard
 xen/features.c			optional xenhvm

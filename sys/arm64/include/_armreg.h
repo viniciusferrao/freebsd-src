@@ -29,7 +29,8 @@
 
 #if !defined(_MACHINE_ARMREG_H_) && \
     !defined(_MACHINE_CPU_H_) && \
-    !defined(_MACHINE_HYPERVISOR_H_)
+    !defined(_MACHINE_HYPERVISOR_H_) && \
+    !defined(_MACHINE_SYSINSN_H_)
 #error Do not include this file directly
 #endif
 
@@ -77,6 +78,13 @@
 	_Static_assert(insn##_op0 == 1, "Invalid SYS instruction");	\
 	__asm __volatile("sysl	%0, " SYS_ALT_NAME(insn)		\
 	    : "=&r"(_val));						\
+	_val;								\
+})
+
+/* TODO: Use CNTPCTSS when FEAT_ECV is available */
+#define	READ_CNTPCT()							\
+({	uint64_t _val;							\
+	__asm __volatile("isb\nmrs	%0, cntpct_el0" : "=&r" (_val));\
 	_val;								\
 })
 

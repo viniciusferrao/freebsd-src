@@ -187,7 +187,7 @@ static char *origin_subst_one(Obj_Entry *, char *, const char *, const char *,
     bool);
 static char *origin_subst(Obj_Entry *, const char *);
 static bool obj_resolve_origin(Obj_Entry *obj);
-static void preinit_main(void);
+static void preinit_main(RtldLockState *lockstate);
 static void rtld_recalc_bind_not(const char *);
 static void rtld_recalc_dangerous_ld_env(void);
 static void rtld_recalc_debug(const char *);
@@ -999,13 +999,13 @@ _rtld(Elf_Addr *sp, func_ptr_type *exit_proc, Obj_Entry **objp)
 
 	dbg("resolving ifuncs");
 	if (initlist_objects_ifunc(&initlist,
-		ld_bind_now != NULL && *ld_bind_now != '\0', SYMLOOK_EARLY,
-		&lockstate) == -1)
+	    ld_bind_now != NULL && *ld_bind_now != '\0', SYMLOOK_EARLY,
+	    &lockstate) == -1)
 		rtld_die();
 
 	rtld_exit_ptr = rtld_exit;
 	if (obj_main->crt_no_init)
-		preinit_main();
+		preinit_main(&lockstate);
 	objlist_call_init(&initlist, &lockstate);
 	_r_debug_postinit(&obj_main->linkmap);
 	objlist_clear(&initlist);
@@ -1785,14 +1785,19 @@ digest_phdr(const Elf_Phdr *phdr, int phnum, caddr_t entry, const char *path)
 void
 digest_notes(Obj_Entry *obj, Elf_Addr note_start, Elf_Addr note_end)
 {
-	const Elf_Note *note;
+	const Elf_Note *note, *next_note;
 	const char *note_name;
 	uintptr_t p;
 
-	for (note = (const Elf_Note *)note_start; (Elf_Addr)note < note_end;
-	    note = (const Elf_Note *)((const char *)(note + 1) +
-		roundup2(note->n_namesz, sizeof(Elf32_Addr)) +
-		roundup2(note->n_descsz, sizeof(Elf32_Addr)))) {
+	for (note = (const Elf_Note *)note_start;; note = next_note) {
+		if ((Elf_Addr)note + sizeof(Elf_Note) > note_end)
+			break;
+		next_note = (const Elf_Note *)((const char *)(note + 1) +
+		    roundup2(note->n_namesz, sizeof(Elf32_Addr)) +
+		    roundup2(note->n_descsz, sizeof(Elf32_Addr)));
+		if ((Elf_Addr)next_note > note_end)
+			break;
+
 		if (arch_digest_note(obj, note))
 			continue;
 
@@ -1805,7 +1810,7 @@ digest_notes(Obj_Entry *obj, Elf_Addr note_start, Elf_Addr note_end)
 			continue;
 		note_name = (const char *)(note + 1);
 		if (strncmp(NOTE_FREEBSD_VENDOR, note_name,
-			sizeof(NOTE_FREEBSD_VENDOR)) != 0)
+		    sizeof(NOTE_FREEBSD_VENDOR)) != 0)
 			continue;
 		switch (note->n_type) {
 		case NT_FREEBSD_ABI_TAG:
@@ -3022,6 +3027,7 @@ do_load_object(int fd, const char *name, char *path, struct stat *sbp,
 
 errp:
 	munmap(obj->mapbase, obj->mapsize);
+	obj->path = NULL;	/* obj->path is owned and freed by caller */
 	obj_free(obj);
 	return (NULL);
 }
@@ -3116,7 +3122,7 @@ obj_from_addr(const void *addr)
 }
 
 static void
-preinit_main(void)
+preinit_main(RtldLockState *lockstate)
 {
 	uintptr_t *preinit_addr;
 	int index;
@@ -3125,6 +3131,7 @@ preinit_main(void)
 	if (preinit_addr == NULL)
 		return;
 
+	lock_release(rtld_bind_lock, lockstate);
 	for (index = 0; index < obj_main->preinit_array_num; index++) {
 		if (preinit_addr[index] != 0 && preinit_addr[index] != 1) {
 			dbg("calling preinit function for %s at %p",
@@ -3134,6 +3141,7 @@ preinit_main(void)
 			call_init_pointer(obj_main, preinit_addr[index]);
 		}
 	}
+	wlock_acquire(rtld_bind_lock, lockstate);
 }
 
 /*

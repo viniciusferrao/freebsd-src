@@ -262,7 +262,7 @@ static const struct {
 	unsigned        avail:1;
 }       mixtable[SOUND_MIXER_NRDEVICES] = {
 	[SOUND_MIXER_VOLUME]	= { 0, 0x0, 0x1, 1, 0x1f7f, 1 },
-	[SOUND_MIXER_PCM] 	= { 1, 0x2, 0x3, 1, 0x0400, 1 },
+	[SOUND_MIXER_PCM]	= { 1, 0x2, 0x3, 1, 0x0400, 1 },
 	[SOUND_MIXER_SYNTH]	= { 2, 0x4, 0x5, 1, 0x0060, 1 },
 	[SOUND_MIXER_CD]	= { 3, 0x6, 0x7, 1, 0x0006, 1 },
 	[SOUND_MIXER_LINE]	= { 4, 0x8, 0x9, 1, 0x0018, 1 },
@@ -612,16 +612,16 @@ eschan1370_setspeed(kobj_t obj, void *data, uint32_t speed)
 static uint32_t
 eschan1371_setspeed(kobj_t obj, void *data, uint32_t speed)
 {
-  	struct es_chinfo *ch = data;
-  	struct es_info *es = ch->parent;
+	struct es_chinfo *ch = data;
+	struct es_info *es = ch->parent;
 	uint32_t i;
 	int delta;
 
 	ES_LOCK(es);
 	if (ch->dir == PCMDIR_PLAY)
-  		i = es1371_dac_rate(es, speed, ch->index); /* play */
+		i = es1371_dac_rate(es, speed, ch->index); /* play */
 	else
-  		i = es1371_adc_rate(es, speed, ch->index); /* record */
+		i = es1371_adc_rate(es, speed, ch->index); /* record */
 	ES_UNLOCK(es);
 	delta = (speed > i) ? (speed - i) : (i - speed);
 	if (delta < 2)
@@ -632,8 +632,9 @@ eschan1371_setspeed(kobj_t obj, void *data, uint32_t speed)
 static int
 eschan_setfragments(kobj_t obj, void *data, uint32_t blksz, uint32_t blkcnt)
 {
-  	struct es_chinfo *ch = data;
-  	struct es_info *es = ch->parent;
+	struct es_chinfo *ch = data;
+	struct es_info *es = ch->parent;
+	int error;
 
 	blksz &= ES_BLK_ALIGN;
 
@@ -657,9 +658,11 @@ eschan_setfragments(kobj_t obj, void *data, uint32_t blksz, uint32_t blkcnt)
 
 	if ((ch->buffer->blksz != blksz ||
 	    ch->buffer->blkcnt != blkcnt) &&
-	    sndbuf_resize(ch->buffer, blkcnt, blksz) != 0)
+	    (error = sndbuf_resize(ch->buffer, blkcnt, blksz)) != 0) {
 		device_printf(es->dev, "%s: failed blksz=%u blkcnt=%u\n",
 		    __func__, blksz, blkcnt);
+		return (error);
+	}
 
 	ch->bufsz = ch->buffer->bufsize;
 	ch->blksz = ch->buffer->blksz;
@@ -671,10 +674,11 @@ eschan_setfragments(kobj_t obj, void *data, uint32_t blksz, uint32_t blkcnt)
 static uint32_t
 eschan_setblocksize(kobj_t obj, void *data, uint32_t blksz)
 {
-  	struct es_chinfo *ch = data;
-  	struct es_info *es = ch->parent;
+	struct es_chinfo *ch = data;
+	struct es_info *es = ch->parent;
 
-	eschan_setfragments(obj, data, blksz, es->blkcnt);
+	if (eschan_setfragments(obj, data, blksz, es->blkcnt) != 0)
+		return (0);
 
 	return (ch->blksz);
 }
@@ -1113,23 +1117,23 @@ es1371_wrcd(kobj_t obj, void *s, int addr, uint32_t data)
 	struct es_info *es = (struct es_info*)s;
 
 	for (t = 0; t < 0x1000; t++) {
-	  	if (!es_rd(es, ES1371_REG_CODEC & CODEC_WIP, 4))
+		if (!es_rd(es, ES1371_REG_CODEC & CODEC_WIP, 4))
 			break;
 	}
 	/* save the current state for later */
- 	x = orig = es_rd(es, ES1371_REG_SMPRATE, 4);
+	x = orig = es_rd(es, ES1371_REG_SMPRATE, 4);
 	/* enable SRC state data in SRC mux */
 	es_wr(es, ES1371_REG_SMPRATE, (x & (ES1371_DIS_SRC | ES1371_DIS_P1 |
 	    ES1371_DIS_P2 | ES1371_DIS_R1)) | 0x00010000, 4);
 	/* busy wait */
 	for (t = 0; t < 0x1000; t++) {
-	  	if ((es_rd(es, ES1371_REG_SMPRATE, 4) & 0x00870000) ==
+		if ((es_rd(es, ES1371_REG_SMPRATE, 4) & 0x00870000) ==
 		    0x00000000)
 			break;
 	}
 	/* wait for a SAFE time to write addr/data and then do it, dammit */
 	for (t = 0; t < 0x1000; t++) {
-	  	if ((es_rd(es, ES1371_REG_SMPRATE, 4) & 0x00870000) ==
+		if ((es_rd(es, ES1371_REG_SMPRATE, 4) & 0x00870000) ==
 		    0x00010000)
 			break;
 	}
@@ -1147,46 +1151,46 @@ es1371_wrcd(kobj_t obj, void *s, int addr, uint32_t data)
 static int
 es1371_rdcd(kobj_t obj, void *s, int addr)
 {
-  	uint32_t t, x, orig;
-  	struct es_info *es = (struct es_info *)s;
+	uint32_t t, x, orig;
+	struct es_info *es = (struct es_info *)s;
 
-  	for (t = 0; t < 0x1000; t++) {
+	for (t = 0; t < 0x1000; t++) {
 		if (!(x = es_rd(es, ES1371_REG_CODEC, 4) & CODEC_WIP))
-	  		break;
+			break;
 	}
 
-  	/* save the current state for later */
-  	x = orig = es_rd(es, ES1371_REG_SMPRATE, 4);
-  	/* enable SRC state data in SRC mux */
-  	es_wr(es, ES1371_REG_SMPRATE, (x & (ES1371_DIS_SRC | ES1371_DIS_P1 |
+	/* save the current state for later */
+	x = orig = es_rd(es, ES1371_REG_SMPRATE, 4);
+	/* enable SRC state data in SRC mux */
+	es_wr(es, ES1371_REG_SMPRATE, (x & (ES1371_DIS_SRC | ES1371_DIS_P1 |
 	    ES1371_DIS_P2 | ES1371_DIS_R1)) | 0x00010000, 4);
 	/* busy wait */
-  	for (t = 0; t < 0x1000; t++) {
+	for (t = 0; t < 0x1000; t++) {
 		if ((x = es_rd(es, ES1371_REG_SMPRATE, 4) & 0x00870000) ==
 		    0x00000000)
-	  		break;
+			break;
 	}
-  	/* wait for a SAFE time to write addr/data and then do it, dammit */
-  	for (t = 0; t < 0x1000; t++) {
+	/* wait for a SAFE time to write addr/data and then do it, dammit */
+	for (t = 0; t < 0x1000; t++) {
 		if ((x = es_rd(es, ES1371_REG_SMPRATE, 4) & 0x00870000) ==
 		    0x00010000)
-	  		break;
+			break;
 	}
 
-  	es_wr(es, ES1371_REG_CODEC, ((addr << CODEC_POADD_SHIFT) &
+	es_wr(es, ES1371_REG_CODEC, ((addr << CODEC_POADD_SHIFT) &
 	    CODEC_POADD_MASK) | CODEC_PORD, 4);
 
-  	/* restore SRC reg */
-  	es1371_wait_src_ready(s);
-  	es_wr(es, ES1371_REG_SMPRATE, orig, 4);
+	/* restore SRC reg */
+	es1371_wait_src_ready(s);
+	es_wr(es, ES1371_REG_SMPRATE, orig, 4);
 
-  	/* now wait for the stinkin' data (RDY) */
-  	for (t = 0; t < 0x1000; t++) {
+	/* now wait for the stinkin' data (RDY) */
+	for (t = 0; t < 0x1000; t++) {
 		if ((x = es_rd(es, ES1371_REG_CODEC, 4)) & CODEC_RDY)
-	  		break;
+			break;
 	}
 
-  	return ((x & CODEC_PIDAT_MASK) >> CODEC_PIDAT_SHIFT);
+	return ((x & CODEC_PIDAT_MASK) >> CODEC_PIDAT_SHIFT);
 }
 
 static kobj_method_t es1371_ac97_methods[] = {
@@ -1201,13 +1205,13 @@ AC97_DECLARE(es1371_ac97);
 static unsigned int
 es1371_src_read(struct es_info *es, unsigned short reg)
 {
-  	uint32_t r;
+	uint32_t r;
 
-  	r = es1371_wait_src_ready(es) & (ES1371_DIS_SRC | ES1371_DIS_P1 |
+	r = es1371_wait_src_ready(es) & (ES1371_DIS_SRC | ES1371_DIS_P1 |
 	    ES1371_DIS_P2 | ES1371_DIS_R1);
-  	r |= ES1371_SRC_RAM_ADDRO(reg);
-  	es_wr(es, ES1371_REG_SMPRATE, r, 4);
-  	return (ES1371_SRC_RAM_DATAI(es1371_wait_src_ready(es)));
+	r |= ES1371_SRC_RAM_ADDRO(reg);
+	es_wr(es, ES1371_REG_SMPRATE, r, 4);
+	return (ES1371_SRC_RAM_DATAI(es1371_wait_src_ready(es)));
 }
 
 static void
@@ -1224,30 +1228,30 @@ es1371_src_write(struct es_info *es, unsigned short reg, unsigned short data)
 static unsigned int
 es1371_adc_rate(struct es_info *es, unsigned int rate, int set)
 {
-  	unsigned int n, truncm, freq, result;
+	unsigned int n, truncm, freq, result;
 
 	ES_LOCK_ASSERT(es);
 
-  	if (rate > 48000)
+	if (rate > 48000)
 		rate = 48000;
-  	if (rate < 4000)
+	if (rate < 4000)
 		rate = 4000;
-  	n = rate / 3000;
-  	if ((1 << n) & ((1 << 15) | (1 << 13) | (1 << 11) | (1 << 9)))
+	n = rate / 3000;
+	if ((1 << n) & ((1 << 15) | (1 << 13) | (1 << 11) | (1 << 9)))
 		n--;
-  	truncm = (21 * n - 1) | 1;
-  	freq = ((48000UL << 15) / rate) * n;
-  	result = (48000UL << 15) / (freq / n);
-  	if (set) {
+	truncm = (21 * n - 1) | 1;
+	freq = ((48000UL << 15) / rate) * n;
+	result = (48000UL << 15) / (freq / n);
+	if (set) {
 		if (rate >= 24000) {
-	  		if (truncm > 239)
+			if (truncm > 239)
 				truncm = 239;
-	  		es1371_src_write(es, ES_SMPREG_ADC + ES_SMPREG_TRUNC_N,
+			es1371_src_write(es, ES_SMPREG_ADC + ES_SMPREG_TRUNC_N,
 			    (((239 - truncm) >> 1) << 9) | (n << 4));
 		} else {
-	  		if (truncm > 119)
+			if (truncm > 119)
 				truncm = 119;
-	  		es1371_src_write(es, ES_SMPREG_ADC + ES_SMPREG_TRUNC_N,
+			es1371_src_write(es, ES_SMPREG_ADC + ES_SMPREG_TRUNC_N,
 			    0x8000 | (((119 - truncm) >> 1) << 9) | (n << 4));
 		}
 		es1371_src_write(es, ES_SMPREG_ADC + ES_SMPREG_INT_REGS,
@@ -1264,16 +1268,16 @@ es1371_adc_rate(struct es_info *es, unsigned int rate, int set)
 static unsigned int
 es1371_dac_rate(struct es_info *es, unsigned int rate, int set)
 {
-  	unsigned int freq, r, result, dac, dis;
+	unsigned int freq, r, result, dac, dis;
 
 	ES_LOCK_ASSERT(es);
 
-  	if (rate > 48000)
+	if (rate > 48000)
 		rate = 48000;
-  	if (rate < 4000)
+	if (rate < 4000)
 		rate = 4000;
-  	freq = ((rate << 15) + 1500) / 3000;
-  	result = (freq * 3000) >> 15;
+	freq = ((rate << 15) + 1500) / 3000;
+	result = (freq * 3000) >> 15;
 
 	dac = (set == ES_DAC1) ? ES_SMPREG_DAC1 : ES_SMPREG_DAC2;
 	dis = (set == ES_DAC1) ? ES1371_DIS_P2 : ES1371_DIS_P1;
@@ -1287,23 +1291,23 @@ es1371_dac_rate(struct es_info *es, unsigned int rate, int set)
 	r = (es1371_wait_src_ready(es) &
 	    (ES1371_DIS_SRC | dis | ES1371_DIS_R1));
 	es_wr(es, ES1371_REG_SMPRATE, r, 4);
-  	return (result);
+	return (result);
 }
 
 static uint32_t
 es1371_wait_src_ready(struct es_info *es)
 {
-  	uint32_t t, r;
+	uint32_t t, r;
 
-  	for (t = 0; t < 0x1000; t++) {
+	for (t = 0; t < 0x1000; t++) {
 		if (!((r = es_rd(es, ES1371_REG_SMPRATE, 4)) &
 		    ES1371_SRC_RAM_BUSY))
-	  		return (r);
+			return (r);
 		DELAY(1);
-  	}
+	}
 	device_printf(es->dev, "%s: timed out 0x%x [0x%x]\n", __func__,
 		ES1371_REG_SMPRATE, r);
-  	return (0);
+	return (0);
 }
 
 /* -------------------------------------------------------------------- */
@@ -1516,8 +1520,7 @@ sysctl_es137x_single_pcm_mixer(SYSCTL_HANDLER_ARGS)
 
 	dev = oidp->oid_arg1;
 	d = device_get_softc(dev);
-	if (!PCM_REGISTERED(d) || d->mixer_dev == NULL ||
-	    d->mixer_dev->si_drv1 == NULL)
+	if (!PCM_REGISTERED(d) || !MIXER_REGISTERED(d->mixer))
 		return (EINVAL);
 	es = d->devinfo;
 	if (es == NULL)
@@ -1535,7 +1538,7 @@ sysctl_es137x_single_pcm_mixer(SYSCTL_HANDLER_ARGS)
 	if (val == set)
 		return (0);
 	PCM_ACQUIRE_QUICK(d);
-	m = (d->mixer_dev != NULL) ? d->mixer_dev->si_drv1 : NULL;
+	m = d->mixer;
 	if (m == NULL) {
 		PCM_RELEASE_QUICK(d);
 		return (ENODEV);
@@ -1798,6 +1801,7 @@ es_pci_attach(device_t dev)
 	es->escfg = ES_SET_NUMREC(es->escfg, 1);
 
 	devid = pci_get_devid(dev);
+	pcm_init(dev, es);
 	switch (devid) {
 	case ES1371_PCI_ID:
 	case ES1371_PCI_ID2:
@@ -1805,25 +1809,25 @@ es_pci_attach(device_t dev)
 	case CT4730_PCI_ID:
 		es1371_init(es);
 		codec = AC97_CREATE(dev, es, es1371_ac97);
-	  	if (codec == NULL)
+		if (codec == NULL)
 			goto bad;
-	  	/* our init routine does everything for us */
-	  	/* set to NULL; flag mixer_init not to run the ac97_init */
-	  	/*	  ac97_mixer.init = NULL;  */
+		/* our init routine does everything for us */
+		/* set to NULL; flag mixer_init not to run the ac97_init */
+		/*	  ac97_mixer.init = NULL;  */
 		if (mixer_init(dev, ac97_getmixerclass(), codec))
 			goto bad;
 		ct = &eschan1371_class;
 		break;
 	case ES1370_PCI_ID:
-	  	es1370_init(es);
-		/* 
+		es1370_init(es);
+		/*
 		 * Disable fixed rate operation if DAC2 disabled.
 		 * This is a special case for es1370 only, where the
 		 * speed of both ADC and DAC2 locked together.
 		 */
 		if (!ES_DAC2_ENABLED(es->escfg))
 			es->escfg = ES_SET_FIXED_RATE(es->escfg, 0);
-	  	if (mixer_init(dev, &es1370_mixer_class, es))
+		if (mixer_init(dev, &es1370_mixer_class, es))
 			goto bad;
 		ct = &eschan1370_class;
 		break;
@@ -1858,7 +1862,6 @@ es_pci_attach(device_t dev)
 	    rman_get_start(es->reg), rman_get_start(es->irq),
 	    device_get_nameunit(device_get_parent(dev)));
 
-	pcm_init(dev, es);
 	for (i = 0; i < numplay; i++)
 		pcm_addchan(dev, PCMDIR_PLAY, ct, es);
 	pcm_addchan(dev, PCMDIR_REC, ct, es);
@@ -1935,5 +1938,5 @@ static driver_t es_driver = {
 };
 
 DRIVER_MODULE(snd_es137x, pci, es_driver, 0, 0);
-MODULE_DEPEND(snd_es137x, sound, SOUND_MINVER, SOUND_PREFVER, SOUND_MAXVER);
+MODULE_DEPEND(snd_es137x, sound, 1, 1, 1);
 MODULE_VERSION(snd_es137x, 1);

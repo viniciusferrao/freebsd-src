@@ -65,6 +65,10 @@
 
 #include <cam/nvme/nvme_all.h>
 
+/* SDT Probes */
+SDT_PROBE_DEFINE3(cam, , nda, error, "union ccb *", "uint32_t", "uint32_t");
+SDT_PROBE_DEFINE2(cam, , nda, recovery, "union ccb *", "int");
+
 typedef enum {
 	NDA_STATE_NORMAL
 } nda_state;
@@ -306,7 +310,7 @@ ndasetgeom(struct nda_softc *softc, struct cam_periph *periph)
 	 */
 	flags = disk->d_flags & DISKFLAG_UNMAPPED_BIO;	/* Need to preserve */
 
-	flbas_fmt = NVMEV(NVME_NS_DATA_FLBAS_FORMAT, nsd->flbas);
+	flbas_fmt = nvme_ns_data_format_index(nsd);
 	lbads = NVMEV(NVME_NS_DATA_LBAF_LBADS, nsd->lbaf[flbas_fmt]);
 	disk->d_sectorsize = 1 << lbads;
 	disk->d_mediasize = (off_t)(disk->d_sectorsize * nsd->nsze);
@@ -950,11 +954,20 @@ ndaregister(struct cam_periph *periph, void *arg)
 	const struct nvme_namespace_data *nsd;
 	const struct nvme_controller_data *cd;
 	char   announce_buf[80];
+	uint32_t ms;
 	u_int maxio;
 	int quirks;
 
 	nsd = nvme_get_identify_ns(periph);
 	cd = nvme_get_identify_cntrl(periph);
+
+	ms = NVMEV(NVME_NS_DATA_LBAF_MS,
+	    nsd->lbaf[NVMEV(NVME_NS_DATA_FLBAS_FORMAT, nsd->flbas)]);
+	if (ms != 0) {
+		xpt_print(periph->path,
+		    "lba format has %u-byte metadata, unsupported\n", ms);
+		return (CAM_REQ_CMP_ERR);
+	}
 
 	softc = (struct nda_softc *)malloc(sizeof(*softc), M_DEVBUF,
 	    M_NOWAIT | M_ZERO);
@@ -1309,15 +1322,15 @@ ndadone(struct cam_periph *periph, union ccb *done_ccb)
 			 * routine, which in the case of sendfile can be quite
 			 * extensive.
 			 */
-			cam_iosched_bio_complete(softc->cam_iosched, bp, done_ccb);
+			cam_iosched_bio_update_stats(softc->cam_iosched, bp, done_ccb);
 			xpt_release_ccb(done_ccb);
 			ndaschedule(periph);
 			cam_periph_unlock(periph);
 			biodone(bp);
 		} else { /* state == NDA_CCB_TRIM */
 			struct nda_trim_request *trim;
-			struct bio *bp1, *bp2;
-			TAILQ_HEAD(, bio) queue;
+			struct bio *bp2;
+			struct bio_queue queue;
 
 			trim = nvmeio->ccb_trim;
 			TAILQ_INIT(&queue);
@@ -1329,28 +1342,14 @@ ndadone(struct cam_periph *periph, union ccb *done_ccb)
 			 * need to call this here.
 			 * cam_iosched_trim_done(softc->cam_iosched);
 			 */
-			/*
-			 * The the I/O scheduler that we're finishing the I/O
-			 * so we can keep book. The first one we pass in the CCB
-			 * which has the timing information. The rest we pass in NULL
-			 * so we can keep proper counts.
-			 */
-			bp1 = TAILQ_FIRST(&queue);
-			cam_iosched_bio_complete(softc->cam_iosched, bp1, done_ccb);
+			cam_iosched_bio_queue_update_stats(softc->cam_iosched,
+			    &queue, done_ccb, error);
 			xpt_release_ccb(done_ccb);
 			softc->outstanding_cmds--;
 			ndaschedule(periph);
 			cam_periph_unlock(periph);
 			while ((bp2 = TAILQ_FIRST(&queue)) != NULL) {
 				TAILQ_REMOVE(&queue, bp2, bio_queue);
-				bp2->bio_error = error;
-				if (error != 0) {
-					bp2->bio_flags |= BIO_ERROR;
-					bp2->bio_resid = bp1->bio_bcount;
-				} else
-					bp2->bio_resid = 0;
-				if (bp1 != bp2)
-					cam_iosched_bio_complete(softc->cam_iosched, bp2, NULL);
 				biodone(bp2);
 			}
 		}
@@ -1371,6 +1370,10 @@ ndadone(struct cam_periph *periph, union ccb *done_ccb)
 static int
 ndaerror(union ccb *ccb, uint32_t cam_flags, uint32_t sense_flags)
 {
+	int error;
+
+	CAM_PROBE3(nda, error, ccb, cam_flags, sense_flags);
+
 #ifdef CAM_IO_STATS
 	struct nda_softc *softc;
 	struct cam_periph *periph;
@@ -1395,7 +1398,9 @@ ndaerror(union ccb *ccb, uint32_t cam_flags, uint32_t sense_flags)
 		break;
 	}
 
-	return(cam_periph_error(ccb, cam_flags, sense_flags));
+	error = cam_periph_error(ccb, cam_flags, sense_flags);
+	CAM_PROBE2(nda, recovery, ccb, error);
+	return (error);
 }
 
 /*

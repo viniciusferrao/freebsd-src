@@ -113,7 +113,8 @@ fwisound_chan_setblocksize(kobj_t obj, void *data, uint32_t blksz)
 	if (blksz < 4)
 		blksz = 4;
 
-	sndbuf_resize(chan->buf, chan->buf->bufsize / blksz, blksz);
+	if (sndbuf_resize(chan->buf, chan->buf->bufsize / blksz, blksz) != 0)
+		return (0);
 
 	return (chan->buf->blksz);
 }
@@ -230,4 +231,4 @@ static driver_t fwisound_pcm_driver = {
 
 DRIVER_MODULE(fwisound_pcm, fwisound, fwisound_pcm_driver, 0, 0);
 MODULE_DEPEND(fwisound_pcm, fwisound, 1, 1, 1);
-MODULE_DEPEND(fwisound_pcm, sound, SOUND_MINVER, SOUND_PREFVER, SOUND_MAXVER);
+MODULE_DEPEND(fwisound_pcm, sound, 1, 1, 1);

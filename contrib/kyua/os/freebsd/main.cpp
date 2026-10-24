@@ -55,18 +55,14 @@ int
 freebsd::main(const int, const char* const* const)
 {
     execenv::register_execenv(
-        std::shared_ptr< execenv::manager >(new freebsd::execenv_jail_manager())
-    );
+        std::make_shared<freebsd::execenv_jail_manager>());
 
 #ifdef __FreeBSD__
     engine::register_reqs_checker(
-        std::shared_ptr< engine::reqs_checker >(
-            new freebsd::reqs_checker_kmods()
-        )
-    );
+        std::make_shared<freebsd::reqs_checker_kmods>());
 
     prepare::register_handler(
-        std::shared_ptr< prepare::handler >(new freebsd::prepare_kmods()));
+        std::make_shared<freebsd::prepare_kmods>());
 #endif
 
     return 0;

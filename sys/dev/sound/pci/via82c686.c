@@ -205,8 +205,8 @@ via_read_codec(kobj_t obj, void *addr, int reg)
 }
 
 static kobj_method_t via_ac97_methods[] = {
-    	KOBJMETHOD(ac97_read,		via_read_codec),
-    	KOBJMETHOD(ac97_write,		via_write_codec),
+	KOBJMETHOD(ac97_read,		via_read_codec),
+	KOBJMETHOD(ac97_write,		via_write_codec),
 	KOBJMETHOD_END
 };
 AC97_DECLARE(via_ac97);
@@ -328,8 +328,9 @@ viachan_setblocksize(kobj_t obj, void *data, uint32_t blocksize)
 {
 	struct via_chinfo *ch = data;
 
+	if (sndbuf_resize(ch->buffer, SEGS_PER_CHAN, blocksize) != 0)
+		return 0;
 	ch->blksz = blocksize;
-	sndbuf_resize(ch->buffer, SEGS_PER_CHAN, ch->blksz);
 
 	return ch->blksz;
 }
@@ -371,7 +372,7 @@ viachan_getptr(kobj_t obj, void *data)
 	base1 = via_rd(via, ch->base, 4);
 	len = via_rd(via, ch->count, 4);
 	base = via_rd(via, ch->base, 4);
-	if (base != base1) 	/* Avoid race hazard */
+	if (base != base1)	/* Avoid race hazard */
 		len = via_rd(via, ch->count, 4);
 	mtx_unlock(&via->lock);
 
@@ -406,13 +407,13 @@ viachan_getcaps(kobj_t obj, void *data)
 }
 
 static kobj_method_t viachan_methods[] = {
-    	KOBJMETHOD(channel_init,		viachan_init),
-    	KOBJMETHOD(channel_setformat,		viachan_setformat),
-    	KOBJMETHOD(channel_setspeed,		viachan_setspeed),
-    	KOBJMETHOD(channel_setblocksize,	viachan_setblocksize),
-    	KOBJMETHOD(channel_trigger,		viachan_trigger),
-    	KOBJMETHOD(channel_getptr,		viachan_getptr),
-    	KOBJMETHOD(channel_getcaps,		viachan_getcaps),
+	KOBJMETHOD(channel_init,		viachan_init),
+	KOBJMETHOD(channel_setformat,		viachan_setformat),
+	KOBJMETHOD(channel_setspeed,		viachan_setspeed),
+	KOBJMETHOD(channel_setblocksize,	viachan_setblocksize),
+	KOBJMETHOD(channel_trigger,		viachan_trigger),
+	KOBJMETHOD(channel_getptr,		viachan_getptr),
+	KOBJMETHOD(channel_getcaps,		viachan_getcaps),
 	KOBJMETHOD_END
 };
 CHANNEL_DECLARE(viachan);
@@ -498,12 +499,12 @@ via_attach(device_t dev)
 	}
 
 	/* Power everything up */
-	pci_write_config(dev, VIA_ACLINKCTRL, VIA_ACLINK_DESIRED, 1);	
+	pci_write_config(dev, VIA_ACLINKCTRL, VIA_ACLINK_DESIRED, 1);
 
 	/* Wait for codec to become ready (largest reported delay here 310ms) */
 	for (cnt = 0; cnt < 2000; cnt++) {
 		data = pci_read_config(dev, VIA_AC97STATUS, 1);
-		if (data & VIA_AC97STATUS_RDY) 
+		if (data & VIA_AC97STATUS_RDY)
 			break;
 		DELAY(5000);
 	}
@@ -535,11 +536,12 @@ via_attach(device_t dev)
 	if (!via->codec)
 		goto bad;
 
+	pcm_init(dev, via);
 	if (mixer_init(dev, ac97_getmixerclass(), via->codec))
 		goto bad;
 
 	via->codec_caps = ac97_getextcaps(via->codec);
-	ac97_setextmode(via->codec, 
+	ac97_setextmode(via->codec,
 			via->codec_caps & (AC97_EXTCAP_VRA | AC97_EXTCAP_VRM));
 
 	/* DMA tag for buffers */
@@ -585,7 +587,6 @@ via_attach(device_t dev)
 		 device_get_nameunit(device_get_parent(dev)));
 
 	/* Register */
-	pcm_init(dev, via);
 	pcm_addchan(dev, PCMDIR_PLAY, &viachan_class, via);
 	pcm_addchan(dev, PCMDIR_REC, &viachan_class, via);
 	if (pcm_register(dev, status))
@@ -642,5 +643,5 @@ static driver_t via_driver = {
 };
 
 DRIVER_MODULE(snd_via82c686, pci, via_driver, 0, 0);
-MODULE_DEPEND(snd_via82c686, sound, SOUND_MINVER, SOUND_PREFVER, SOUND_MAXVER);
+MODULE_DEPEND(snd_via82c686, sound, 1, 1, 1);
 MODULE_VERSION(snd_via82c686, 1);

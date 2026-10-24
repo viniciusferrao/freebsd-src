@@ -72,12 +72,6 @@ ua_chan_setblocksize(kobj_t obj, void *data, uint32_t blocksize)
 }
 
 static int
-ua_chan_setfragments(kobj_t obj, void *data, uint32_t blocksize, uint32_t blockcount)
-{
-	return (uaudio_chan_set_param_fragments(data, blocksize, blockcount));
-}
-
-static int
 ua_chan_trigger(kobj_t obj, void *data, int go)
 {
 	if (PCMTRIG_COMMON(go)) {
@@ -114,7 +108,6 @@ static kobj_method_t ua_chan_methods[] = {
 	KOBJMETHOD(channel_setformat, ua_chan_setformat),
 	KOBJMETHOD(channel_setspeed, ua_chan_setspeed),
 	KOBJMETHOD(channel_setblocksize, ua_chan_setblocksize),
-	KOBJMETHOD(channel_setfragments, ua_chan_setfragments),
 	KOBJMETHOD(channel_trigger, ua_chan_trigger),
 	KOBJMETHOD(channel_getptr, ua_chan_getptr),
 	KOBJMETHOD(channel_getcaps, ua_chan_getcaps),
@@ -203,5 +196,5 @@ static driver_t ua_pcm_driver = {
 
 DRIVER_MODULE(ua_pcm, uaudio, ua_pcm_driver, 0, 0);
 MODULE_DEPEND(ua_pcm, snd_uaudio, 1, 1, 1);
-MODULE_DEPEND(ua_pcm, sound, SOUND_MINVER, SOUND_PREFVER, SOUND_MAXVER);
+MODULE_DEPEND(ua_pcm, sound, 1, 1, 1);
 MODULE_VERSION(ua_pcm, 1);

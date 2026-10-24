@@ -275,7 +275,7 @@ static int32_t rack_rate_sample_method = USE_RTT_LOW;
 static int32_t rack_pace_every_seg = 0;
 static int32_t rack_delayed_ack_time = 40000;	/* 40ms in usecs */
 static int32_t rack_pacing_delay_reduction = 4;
-static int32_t rack_wma_divisor = 8;		/* For WMA calculation */
+static uint32_t rack_wma_divisor = 8;		/* For WMA calculation */
 static int32_t rack_cwnd_block_ends_measure = 0;
 static int32_t rack_rwnd_block_ends_measure = 0;
 static int32_t rack_def_profile = 0;
@@ -837,6 +837,22 @@ sysctl_rack_clear(SYSCTL_HANDLER_ARGS)
 		COUNTER_ARRAY_ZERO(rack_out_size, TCP_MSS_ACCT_SIZE);
 	}
 	rack_clear_counter = 0;
+	return (0);
+}
+
+static int
+sysctl_rack_wma_divisor(SYSCTL_HANDLER_ARGS)
+{
+	uint32_t val;
+	int error;
+
+	val = *(uint32_t *)arg1;
+	error = sysctl_handle_32(oidp, &val, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (val == 0 || val > INT32_MAX)
+		return (EINVAL);
+	*(uint32_t *)arg1 = val;
 	return (0);
 }
 
@@ -1407,11 +1423,11 @@ rack_init_sysctls(void)
 	    "measure",
 	    CTLFLAG_RW | CTLFLAG_MPSAFE, 0,
 	    "Measure related controls");
-	SYSCTL_ADD_S32(&rack_sysctl_ctx,
+	SYSCTL_ADD_PROC(&rack_sysctl_ctx,
 	    SYSCTL_CHILDREN(rack_measure),
-	    OID_AUTO, "wma_divisor", CTLFLAG_RW,
-	    &rack_wma_divisor, 8,
-	    "When doing b/w calculation what is the  divisor for the WMA");
+	    OID_AUTO, "wma_divisor", CTLTYPE_U32 | CTLFLAG_RW | CTLFLAG_MPSAFE,
+	    &rack_wma_divisor, 0, sysctl_rack_wma_divisor, "IU",
+	    "When doing b/w calculation what is the divisor for the WMA");
 	SYSCTL_ADD_S32(&rack_sysctl_ctx,
 	    SYSCTL_CHILDREN(rack_measure),
 	    OID_AUTO, "end_cwnd", CTLFLAG_RW,
@@ -12234,14 +12250,8 @@ rack_process_data(struct mbuf *m, struct tcphdr *th, struct socket *so,
 			if (so->so_rcv.sb_state & SBS_CANTRCVMORE) {
 				m_freem(m);
 			} else {
-				int32_t newsize;
-
-				if (tlen > 0) {
-					newsize = tcp_autorcvbuf(m, th, so, tp, tlen);
-					if (newsize)
-						if (!sbreserve_locked(so, SO_RCV, newsize, NULL))
-							so->so_rcv.sb_flags &= ~SB_AUTOSIZE;
-				}
+				if (tlen > 0)
+					tcp_autorcvbuf(tp, tlen);
 #ifdef NETFLIX_SB_LIMITS
 				appended =
 #endif
@@ -12391,7 +12401,6 @@ rack_do_fastnewdata(struct mbuf *m, struct tcphdr *th, struct socket *so,
     uint32_t tiwin, int32_t nxt_pkt, uint8_t iptos)
 {
 	int32_t nsegs;
-	int32_t newsize = 0;	/* automatic sockbuf scaling */
 	struct tcp_rack *rack;
 #ifdef NETFLIX_SB_LIMITS
 	u_int mcnt, appended;
@@ -12469,20 +12478,13 @@ rack_do_fastnewdata(struct mbuf *m, struct tcphdr *th, struct socket *so,
 	tp->rcv_up = tp->rcv_nxt;
 	KMOD_TCPSTAT_ADD(tcps_rcvpack, nsegs);
 	KMOD_TCPSTAT_ADD(tcps_rcvbyte, tlen);
-	newsize = tcp_autorcvbuf(m, th, so, tp, tlen);
 
 	/* Add data to socket buffer. */
 	SOCK_RECVBUF_LOCK(so);
 	if (so->so_rcv.sb_state & SBS_CANTRCVMORE) {
 		m_freem(m);
 	} else {
-		/*
-		 * Set new socket buffer size. Give up when limit is
-		 * reached.
-		 */
-		if (newsize)
-			if (!sbreserve_locked(so, SO_RCV, newsize, NULL))
-				so->so_rcv.sb_flags &= ~SB_AUTOSIZE;
+		tcp_autorcvbuf(tp, tlen);
 		m_adj(m, drop_hdrlen);	/* delayed header drop */
 #ifdef NETFLIX_SB_LIMITS
 		appended =
@@ -13946,7 +13948,8 @@ rack_init_fsb_block(struct tcpcb *tp, struct tcp_rack *rack, int32_t flags)
 		ip6 = (struct ip6_hdr *)rack->r_ctl.fsb.tcp_ip_hdr;
 		if (tp->t_port) {
 			rack->r_ctl.fsb.tcp_ip_hdr_len += sizeof(struct udphdr);
-			udp = (struct udphdr *)((caddr_t)ip6 + sizeof(struct ip6_hdr));
+			udp = (struct udphdr *)((char *)ip6 +
+			    sizeof(struct ip6_hdr));
 			udp->uh_sport = htons(V_tcp_udp_tunneling_port);
 			udp->uh_dport = tp->t_port;
 			rack->r_ctl.fsb.udp = udp;
@@ -13968,7 +13971,7 @@ rack_init_fsb_block(struct tcpcb *tp, struct tcp_rack *rack, int32_t flags)
 		ip = (struct ip *)rack->r_ctl.fsb.tcp_ip_hdr;
 		if (tp->t_port) {
 			rack->r_ctl.fsb.tcp_ip_hdr_len += sizeof(struct udphdr);
-			udp = (struct udphdr *)((caddr_t)ip + sizeof(struct ip));
+			udp = (struct udphdr *)((char *)ip + sizeof(struct ip));
 			udp->uh_sport = htons(V_tcp_udp_tunneling_port);
 			udp->uh_dport = tp->t_port;
 			rack->r_ctl.fsb.udp = udp;
@@ -18117,7 +18120,7 @@ rack_fo_base_copym(struct mbuf *the_m, uint32_t the_off, int32_t *plen,
 			n->m_data = m->m_data + off;
 			mb_dupcl(n, m);
 		} else {
-			bcopy(mtod(m, caddr_t)+off, mtod(n, caddr_t),
+			bcopy(mtod(m, char *) + off, mtod(n, char *),
 			    (u_int)n->m_len);
 		}
 		len -= n->m_len;
@@ -18912,8 +18915,11 @@ rack_sndbuf_autoscale(struct tcp_rack *rack)
 			scaleup += so->so_snd.sb_hiwat;
 			if (scaleup > V_tcp_autosndbuf_max)
 				scaleup = V_tcp_autosndbuf_max;
-			if (!sbreserve_locked(so, SO_SND, scaleup, curthread))
+			if (sbreserve_locked(so, SO_SND, scaleup, curthread)) {
+				TCP_PROBE2(send__autoresize, tp, scaleup);
+			} else {
 				so->so_snd.sb_flags &= ~SB_AUTOSIZE;
+			}
 		}
 	}
 }
@@ -21412,7 +21418,7 @@ send:
 		s_moff = moff;
 		if (len <= MHLEN - hdrlen - max_linkhdr && !hw_tls) {
 			m_copydata(mb, moff, (int)len,
-				   mtod(m, caddr_t)+hdrlen);
+				   mtod(m, char *) + hdrlen);
 			/*
 			 * If we are not retransmitting advance the
 			 * sndptr to help remember the next place in
@@ -21547,7 +21553,8 @@ send:
 		if (isipv6) {
 			ip6 = mtod(m, struct ip6_hdr *);
 			if (tp->t_port) {
-				udp = (struct udphdr *)((caddr_t)ip6 + sizeof(struct ip6_hdr));
+				udp = (struct udphdr *)((char *)ip6 +
+				    sizeof(struct ip6_hdr));
 				udp->uh_sport = htons(V_tcp_udp_tunneling_port);
 				udp->uh_dport = tp->t_port;
 				ulen = hdrlen + len - sizeof(struct ip6_hdr);
@@ -21562,7 +21569,8 @@ send:
 #ifdef INET
 			ip = mtod(m, struct ip *);
 			if (tp->t_port) {
-				udp = (struct udphdr *)((caddr_t)ip + sizeof(struct ip));
+				udp = (struct udphdr *)((char *)ip +
+				    sizeof(struct ip));
 				udp->uh_sport = htons(V_tcp_udp_tunneling_port);
 				udp->uh_dport = tp->t_port;
 				ulen = hdrlen + len - sizeof(struct ip);

@@ -469,12 +469,9 @@ rip_send(struct socket *so, int pruflags, struct mbuf *m, struct sockaddr *nam,
 			return (ENOMEM);
 		ip = mtod(m, struct ip *);
 		hlen = ip->ip_hl << 2;
-		if (m->m_len < hlen) {
-			m = m_pullup(m, hlen);
-			if (m == NULL)
-				return (EINVAL);
-			ip = mtod(m, struct ip *);
-		}
+		if ((m = m_pullup(m, hlen)) == NULL)
+			return (EINVAL);
+		ip = mtod(m, struct ip *);
 		if (V_fib_hash_outbound) {
 			uint32_t hash_type, hash_val;
 
@@ -876,7 +873,7 @@ rip_bind(struct socket *so, struct sockaddr *nam, struct thread *td)
 
 	fib = V_rip_bind_all_fibs == 0 ? inp->inp_inc.inc_fibnum :
 	    RT_ALL_FIBS;
-
+	addr->sin_port = 0;
 	if (CK_STAILQ_EMPTY(&V_ifnet) ||
 	    (addr->sin_family != AF_INET && addr->sin_family != AF_IMPLINK) ||
 	    (addr->sin_addr.s_addr &&

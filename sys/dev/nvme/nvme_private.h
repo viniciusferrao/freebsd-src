@@ -33,6 +33,7 @@
 #include <sys/bio.h>
 #include <sys/bus.h>
 #include <sys/counter.h>
+#include <sys/eventhandler.h>
 #include <sys/kernel.h>
 #include <sys/lock.h>
 #include <sys/malloc.h>
@@ -80,8 +81,13 @@ MALLOC_DECLARE(M_NVME);
 
 #define NVME_ADMIN_TIMEOUT_PERIOD	(60)    /* in seconds */
 #define NVME_DEFAULT_TIMEOUT_PERIOD	(30)    /* in seconds */
+#define NVME_FORMAT_TIMEOUT_PERIOD	(10 * 60) /* in seconds */
 #define NVME_MIN_TIMEOUT_PERIOD		(5)
 #define NVME_MAX_TIMEOUT_PERIOD		(120)
+#define NVME_MAX_FORMAT_TIMEOUT_PERIOD	(60 * 60)
+
+#define NVME_TIMEOUT_DEFAULT		0U
+#define NVME_TIMEOUT_NONE		UINT32_MAX
 
 #define NVME_DEFAULT_RETRY_COUNT	(4)
 
@@ -112,12 +118,11 @@ struct nvme_request {
 	struct memdesc			payload;
 	nvme_cb_fn_t			cb_fn;
 	void				*cb_arg;
+	uint32_t			timeout_ms;
 	int16_t				retries;
 	uint16_t			ioq;
 #define NVME_IOQ_DEFAULT		0xffff
 	bool				payload_valid;
-	bool				timeout;
-	bool				spare[2];		/* Future use */
 	STAILQ_ENTRY(nvme_request)	stailq;
 };
 
@@ -132,6 +137,11 @@ struct nvme_async_event_request {
 	uint8_t				log_page_buffer[NVME_MAX_AER_LOG_SIZE];
 };
 
+/* Progress of a hardware Abort for a timed-out tracker */
+#define	NVME_ABORT_NONE		0	/* No abort submitted */
+#define	NVME_ABORT_SENT		1	/* Abort submitted, not yet completed */
+#define	NVME_ABORT_FAILED	2	/* Abort did not abort the command */
+
 struct nvme_tracker {
 	TAILQ_ENTRY(nvme_tracker)	tailq;
 	struct nvme_request		*req;
@@ -139,6 +149,7 @@ struct nvme_tracker {
 	sbintime_t			deadline;
 	bus_dmamap_t			payload_dma_map;
 	uint16_t			cid;
+	uint8_t				abort_state;
 
 	uint64_t			*prp;
 	bus_addr_t			prp_bus_addr;
@@ -257,6 +268,7 @@ struct nvme_controller {
 	struct resource		*msix_pba_resource;
 
 	int			msi_count;
+	bool			is_msix;
 	uint32_t		enable_aborts;
 
 	uint32_t		num_io_queues;
@@ -294,6 +306,7 @@ struct nvme_controller {
 
 	/** timeout period in seconds */
 	uint32_t		admin_timeout_period;
+	uint32_t		format_timeout_period;
 	uint32_t		timeout_period;
 
 	/** doorbell stride */
@@ -321,6 +334,8 @@ struct nvme_controller {
 	bool				is_dying;
 	bool				isr_warned;
 	bool				is_initialized;
+
+	eventhandler_tag		timestamp_tag;
 
 	/* Host Memory Buffer */
 	int				hmb_nchunks;
@@ -436,6 +451,7 @@ void	nvme_completion_poll_cb(void *arg, const struct nvme_completion *cpl);
 int	nvme_ctrlr_construct(struct nvme_controller *ctrlr, device_t dev);
 void	nvme_ctrlr_destruct(struct nvme_controller *ctrlr, device_t dev);
 void	nvme_ctrlr_shutdown(struct nvme_controller *ctrlr);
+int	nvme_ctrlr_delete_qpairs(struct nvme_controller *ctrlr);
 void	nvme_ctrlr_reset(struct nvme_controller *ctrlr);
 /* ctrlr defined as void * to allow use with config_intrhook. */
 void	nvme_ctrlr_start_config_hook(void *ctrlr_arg);
@@ -530,7 +546,7 @@ _nvme_allocate_request(const int how, nvme_cb_fn_t cb_fn, void *cb_arg)
 		req->ioq = NVME_IOQ_DEFAULT;
 		req->cb_fn = cb_fn;
 		req->cb_arg = cb_arg;
-		req->timeout = true;
+		req->timeout_ms = NVME_TIMEOUT_DEFAULT;
 	}
 	return (req);
 }

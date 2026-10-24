@@ -303,6 +303,7 @@ call_again:
 	TAILQ_INSERT_TAIL(&ct->ct_pending, cr, cr_link);
 	mtx_unlock(&ct->ct_lock);
 
+	error = 0;		/* Keep compilers happy. */
 	if (xprt->xp_socket != NULL) {
 		/* Handle TCP sockets. */
 		/* For RPC-over-TLS, copy mrep to a chain of ext_pgs. */
@@ -629,3 +630,4 @@ clnt_bck_svccall(void *arg, struct mbuf *mrep, uint32_t xid)
 	if (foundreq == 0)
 		m_freem(mrep);
 }
+

@@ -122,6 +122,10 @@
 #define NUM_UDP_PER_SELECT 1
 #endif
 
+/** The number of TCP queries over a TCP connection, per read indication
+ * from select. */
+#define NUM_TCP_PER_SELECT 100
+
 /** timeout in millisec to wait for write to unblock, packets dropped after.*/
 #define SEND_BLOCKED_WAIT_TIMEOUT 200
 /** max number of times to wait for write to unblock, packets dropped after.*/
@@ -2824,7 +2828,7 @@ doq_lookup_repinfo(struct doq_table* table, struct comm_reply* repinfo)
 /** doq find connection and stream. From inside callbacks from worker. */
 static int
 doq_lookup_conn_stream(struct comm_reply* repinfo, struct comm_point* c,
-	struct doq_conn** conn, struct doq_stream** stream)
+	struct doq_conn** conn, struct doq_stream** stream, int checkclose)
 {
 	log_assert(c->doq_socket);
 	if(c->doq_socket->current_conn) {
@@ -2852,7 +2856,7 @@ doq_lookup_conn_stream(struct comm_reply* repinfo, struct comm_point* c,
 		}
 		return 0;
 	}
-	if((*stream)->is_closed) {
+	if(checkclose && (*stream)->is_closed) {
 		/* stream is closed, ignore reply or drop */
 		if(!c->doq_socket->current_conn) {
 			/* Not inside callbacks, we have our own lock on conn.
@@ -2864,6 +2868,24 @@ doq_lookup_conn_stream(struct comm_reply* repinfo, struct comm_point* c,
 	return 1;
 }
 
+/** doq remove mesh state from stream */
+void doq_find_stream_remove_mesh_state(struct comm_reply* repinfo)
+{
+	struct doq_conn* conn;
+	struct doq_stream* stream;
+	log_assert(repinfo->c->type == comm_doq);
+	if(!doq_lookup_conn_stream(repinfo, repinfo->c, &conn, &stream, 0)) {
+		/* No stream, it may have been removed. */
+		return;
+	}
+	doq_stream_remove_mesh_state(stream);
+	if(!repinfo->c->doq_socket->current_conn) {
+		/* Not inside callbacks, we have our own lock on conn.
+		 * Release it. */
+		lock_basic_unlock(&conn->lock);
+	}
+}
+
 /** doq send a reply from a comm reply */
 static void
 doq_socket_send_reply(struct comm_reply* repinfo)
@@ -2871,7 +2893,7 @@ doq_socket_send_reply(struct comm_reply* repinfo)
 	struct doq_conn* conn;
 	struct doq_stream* stream;
 	log_assert(repinfo->c->type == comm_doq);
-	if(!doq_lookup_conn_stream(repinfo, repinfo->c, &conn, &stream)) {
+	if(!doq_lookup_conn_stream(repinfo, repinfo->c, &conn, &stream, 1)) {
 		verbose(VERB_ALGO, "doq: send_reply but %s is gone",
 			(conn?"stream":"connection"));
 		/* No stream, it may have been closed. */
@@ -2902,7 +2924,7 @@ doq_socket_drop_reply(struct comm_reply* repinfo)
 	struct doq_conn* conn;
 	struct doq_stream* stream;
 	log_assert(repinfo->c->type == comm_doq);
-	if(!doq_lookup_conn_stream(repinfo, repinfo->c, &conn, &stream)) {
+	if(!doq_lookup_conn_stream(repinfo, repinfo->c, &conn, &stream, 1)) {
 		verbose(VERB_ALGO, "doq: drop_reply but %s is gone",
 			(conn?"stream":"connection"));
 		/* The connection or stream is already gone. */
@@ -3225,6 +3247,26 @@ static int http2_submit_settings(struct http2_session* h2_session)
 	return 1;
 }
 #endif /* HAVE_NGHTTP2 */
+
+/** Clear http2 stream mesh states */
+static void http2_session_clear_meshstate(struct http2_session* h2_session)
+{
+#ifdef HAVE_NGHTTP2
+	/* Since the session gets closed, remove the mesh state references. */
+	struct http2_stream* h2_stream;
+	for(h2_stream = h2_session->first_stream; h2_stream;
+		h2_stream = h2_stream->next) {
+		if(h2_stream->mesh_state) {
+			mesh_state_remove_reply(h2_stream->mesh,
+				h2_stream->mesh_state, h2_session->c,
+				h2_stream, NULL);
+			h2_stream->mesh_state = NULL;
+		}
+	}
+#else
+	(void)h2_session;
+#endif /* HAVE_NGHTTP2 */
+}
 
 #ifdef HAVE_NGHTTP2
 /** Delete http2 stream. After session delete or stream close callback */
@@ -4621,6 +4663,10 @@ comm_point_tcp_handle_write(int fd, struct comm_point* c)
 static int
 tcp_req_info_read_again(int fd, struct comm_point* c)
 {
+	/* One event-loop visit drains at most this many pipelined queries;
+	 * the rest is re-queued, so that other file descriptors get
+	 * serviced in between. */
+	int budget = NUM_TCP_PER_SELECT;
 	while(c->tcp_req_info->read_again) {
 		int r;
 		c->tcp_req_info->read_again = 0;
@@ -4637,6 +4683,16 @@ tcp_req_info_read_again(int fd, struct comm_point* c)
 			}
 			return 0;
 		}
+		if(--budget <= 0 && c->tcp_req_info->read_again) {
+			/* Defer the rest of the drain to the next loop turn.
+			 * This uses a zero delay timer. For TLS the undrained
+			 * remainder sits in OpenSSL's user-space buffer. */
+			struct timeval tv;
+			memset(&tv, 0, sizeof(tv));
+			verbose(VERB_ALGO, "Defer tcp_req_info read again");
+			comm_timer_set(c->tcp_req_info->read_again_timer, &tv);
+			return 1;
+		}
 	}
 	return 1;
 }
@@ -4650,6 +4706,7 @@ tcp_more_read_again(int fd, struct comm_point* c)
 	/* this continues until the read routines get EAGAIN or so,
 	 * and thus does not call the callback, and the bool is 0 */
 	int* moreread = c->tcp_more_read_again;
+	int budget = NUM_TCP_PER_SELECT;
 	while(moreread && *moreread) {
 		*moreread = 0;
 		if(!comm_point_tcp_handle_read(fd, c, 0)) {
@@ -4660,6 +4717,30 @@ tcp_more_read_again(int fd, struct comm_point* c)
 				(void)(*c->callback)(c, c->cb_arg,
 					NETEVENT_CLOSED, NULL);
 			}
+			return;
+		}
+		if(--budget <= 0 && *moreread) {
+			/* Defer the rest of the drain to the next loop turn.
+			 * This uses a zero delay timer. For TLS the undrained
+			 * remainder sits in OpenSSL's user-space buffer. */
+			struct timeval tv;
+			memset(&tv, 0, sizeof(tv));
+			if(!c->tcp_more_read_again_timer) {
+				c->tcp_more_read_again_timer = comm_timer_create(c->ev->base, tcp_more_read_again_cb, c);
+				if(!c->tcp_more_read_again_timer) {
+					log_err("out of memory for tcp more read again timer");
+					reclaim_tcp_handler(c);
+					if(!c->tcp_do_close) {
+						fptr_ok(fptr_whitelist_comm_point(
+							c->callback));
+						(void)(*c->callback)(c, c->cb_arg,
+							NETEVENT_CLOSED, NULL);
+					}
+					return;
+				}
+			}
+			verbose(VERB_ALGO, "Defer more read again");
+			comm_timer_set(c->tcp_more_read_again_timer, &tv);
 			return;
 		}
 	}
@@ -4687,6 +4768,23 @@ tcp_more_write_again(int fd, struct comm_point* c)
 			return;
 		}
 	}
+}
+
+void
+tcp_read_again_cb(void* arg)
+{
+	struct tcp_req_info* req = (struct tcp_req_info*)arg;
+	verbose(VERB_ALGO, "tcp_read_again_cb");
+	if(!tcp_req_info_read_again(req->cp->fd, req->cp))
+		return;
+}
+
+void
+tcp_more_read_again_cb(void* arg)
+{
+	struct comm_point* c = (struct comm_point*)arg;
+	verbose(VERB_ALGO, "tcp_more_read_again_cb");
+	tcp_more_read_again(c->fd, c);
 }
 
 void
@@ -6131,7 +6229,7 @@ comm_point_create_tcp_handler(struct comm_base *base,
 	c->pp2_enabled = parent->pp2_enabled;
 	c->pp2_header_state = pp2_header_none;
 	if(spoolbuf) {
-		c->tcp_req_info = tcp_req_info_create(spoolbuf);
+		c->tcp_req_info = tcp_req_info_create(base, spoolbuf);
 		if(!c->tcp_req_info) {
 			log_err("could not create tcp commpoint");
 			sldns_buffer_free(c->buffer);
@@ -6693,6 +6791,9 @@ comm_point_close(struct comm_point* c)
 		*c->tcp_more_read_again = 0;
 	if(c->tcp_more_write_again && *c->tcp_more_write_again)
 		*c->tcp_more_write_again = 0;
+	if(c->tcp_more_read_again_timer &&
+		comm_timer_is_set(c->tcp_more_read_again_timer))
+		comm_timer_disable(c->tcp_more_read_again_timer);
 
 	/* close fd after removing from event lists, or epoll.. is messed up */
 	if(c->fd != -1 && !c->do_not_close) {
@@ -6732,6 +6833,7 @@ comm_point_delete(struct comm_point* c)
 		free(c->tcp_handlers);
 	}
 	free(c->timeout);
+	comm_timer_delete(c->tcp_more_read_again_timer);
 	if(c->type == comm_tcp || c->type == comm_local || c->type == comm_http) {
 		sldns_buffer_free(c->buffer);
 #ifdef USE_DNSCRYPT
@@ -6872,6 +6974,7 @@ comm_point_drop_reply(struct comm_reply* repinfo)
 	if(repinfo->c->type == comm_http) {
 		if(repinfo->c->h2_session) {
 			repinfo->c->h2_session->is_drop = 1;
+			http2_session_clear_meshstate(repinfo->c->h2_session);
 			if(!repinfo->c->h2_session->postpone_drop)
 				reclaim_http_handler(repinfo->c);
 			return;

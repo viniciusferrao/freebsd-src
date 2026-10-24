@@ -77,7 +77,7 @@ struct sc_info {
 	bus_dma_tag_t		parent_dmat;
 
 	/* Enhanced register resources */
-	struct resource 	*enh_reg;
+	struct resource		*enh_reg;
 	bus_space_tag_t		enh_st;
 	bus_space_handle_t	enh_sh;
 	int			enh_type;
@@ -91,7 +91,7 @@ struct sc_info {
 	int			dmaa_rid, dmac_rid;
 
 	/* Interrupt resources */
-	struct resource 	*irq;
+	struct resource		*irq;
 	int			irqid;
 	void			*ih;
 
@@ -224,7 +224,8 @@ svchan_setblocksize(kobj_t obj, void *data, uint32_t blocksize)
 
         /* user has requested interrupts every blocksize bytes */
 	RANGE(blocksize, SV_MIN_BLKSZ, sc->bufsz / SV_INTR_PER_BUFFER);
-	sndbuf_resize(ch->buffer, SV_INTR_PER_BUFFER, blocksize);
+	if (sndbuf_resize(ch->buffer, SV_INTR_PER_BUFFER, blocksize) != 0)
+		return 0;
 	DEB(printf("svchan_setblocksize: %d\n", blocksize));
 	return blocksize;
 }
@@ -313,7 +314,7 @@ static int
 svrchan_trigger(kobj_t obj, void *data, int go)
 {
 	struct sc_chinfo	*ch = data;
-	struct sc_info 		*sc = ch->parent;
+	struct sc_info		*sc = ch->parent;
 	uint32_t		count, enable;
 	uint8_t		v;
 
@@ -357,7 +358,7 @@ static uint32_t
 svrchan_getptr(kobj_t obj, void *data)
 {
 	struct sc_chinfo	*ch = data;
-	struct sc_info 		*sc = ch->parent;
+	struct sc_info		*sc = ch->parent;
 	uint32_t sz, remain;
 
 	sz = ch->buffer->bufsize;
@@ -434,7 +435,7 @@ static uint32_t
 svpchan_getptr(kobj_t obj, void *data)
 {
 	struct sc_chinfo	*ch = data;
-	struct sc_info 		*sc = ch->parent;
+	struct sc_info		*sc = ch->parent;
 	uint32_t sz, remain;
 
 	sz = ch->buffer->bufsize;
@@ -520,7 +521,7 @@ sv_mix_mute_all(struct sc_info *sc)
 static int
 sv_mix_init(struct snd_mixer *m)
 {
-	uint32_t 	i, v;
+	uint32_t	i, v;
 
 	for(i = v = 0; i < SOUND_MIXER_NRDEVICES; i++) {
 		if (mt[i].max) v |= (1 << i);
@@ -785,6 +786,8 @@ sv_attach(device_t dev) {
 	sv_power(sc, 0);
 	sv_init(sc);
 
+	pcm_init(dev, sc);
+
 	if (mixer_init(dev, &sv_mixer_class, sc) != 0) {
 		device_printf(dev, "sv_attach: Mixer failed to initialize\n");
 		goto fail;
@@ -867,7 +870,6 @@ sv_attach(device_t dev) {
 	if (bootverbose)
 		printf("Sonicvibes: revision %d.\n", sc->rev);
 
-	pcm_init(dev, sc);
         pcm_addchan(dev, PCMDIR_PLAY, &svpchan_class, sc);
         pcm_addchan(dev, PCMDIR_REC,  &svrchan_class, sc);
 
@@ -939,5 +941,5 @@ static driver_t sonicvibes_driver = {
 };
 
 DRIVER_MODULE(snd_vibes, pci, sonicvibes_driver, 0, 0);
-MODULE_DEPEND(snd_vibes, sound, SOUND_MINVER, SOUND_PREFVER, SOUND_MAXVER);
+MODULE_DEPEND(snd_vibes, sound, 1, 1, 1);
 MODULE_VERSION(snd_vibes, 1);
