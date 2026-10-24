@@ -1118,10 +1118,9 @@ svc_rdma_xprt_destroy(SVCXPRT *xprt)
 		xprt->xp_p1 = NULL;
 	}
 	/*
-	 * Release the backchannel client bound at CREATE_SESSION, as
-	 * svc_vc_destroy does.  This runs on the last release, after the recv
-	 * completions drained and sro_disconnect closed it.  The session's own
-	 * transport reference is a separate refcount.
+	 * Release this transport's reference to the backchannel client, as
+	 * svc_vc_destroy does.  The session may have bound the same client to
+	 * a new transport after this connection failed.
 	 */
 	if (xprt->xp_p2 != NULL) {
 		CLNT_RELEASE((CLIENT *)xprt->xp_p2);
@@ -1389,14 +1388,11 @@ svc_rdma_sro_disconnect(void *ctx, struct svc_rdma_conn *conn)
 	mtx_unlock(&xr->xr_lock);
 
 	/*
-	 * Quiesce the backchannel client after xr_conn is NULL, so an in-flight
-	 * send drops with ENOTCONN and a late reply is freed rather than
-	 * matched against state about to go away.  xp_p2 is not released here;
-	 * xp_destroy holds the single release.  The close may sleep.
+	 * The backchannel client belongs to the session, which can bind it to
+	 * another connection.  Do not close it here.  With xr_conn cleared,
+	 * sends on this transport fail with ENOTCONN; xp_destroy releases
+	 * this transport's reference to the client.
 	 */
-	if (xprt->xp_p2 != NULL)
-		CLNT_CLOSE((CLIENT *)xprt->xp_p2);
-
 	/* Detach our back-pointer; conn is freed by the verbs layer after we
 	 * return, and must not be dereferenced again. */
 	svc_rdma_conn_set_ctx_wrap(conn, NULL);
