@@ -1258,11 +1258,10 @@ svc_rdma_listen_start_ops(uint16_t port, const struct svc_rdma_ops *ops,
 		return (rc4 != 0 ? rc4 : (rc6 != 0 ? rc6 : EAFNOSUPPORT));
 	}
 
-	if (bootverbose)
-		printf("nfsrdma: listening on port %u (%s%s%s)\n", port,
-		    id4 != NULL ? "IPv4" : "",
-		    (id4 != NULL && id6 != NULL) ? "+" : "",
-		    id6 != NULL ? "IPv6" : "");
+	printf("nfsrdma: listening on port %u (%s%s%s)\n", port,
+	    id4 != NULL ? "IPv4" : "",
+	    (id4 != NULL && id6 != NULL) ? "+" : "",
+	    id6 != NULL ? "IPv6" : "");
 	sx_xunlock(&svc_rdma_listen_cfg_lock);
 	return (0);
 }
