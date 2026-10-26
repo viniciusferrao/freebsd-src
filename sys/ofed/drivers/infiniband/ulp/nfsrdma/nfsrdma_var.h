@@ -101,11 +101,12 @@ extern struct svc_rdma_listener svc_rdma_listener;
 
 /*
  * Caps the inbound length pulled from one read list.  A local constant, not
- * a peer-supplied sum: a request asking for more is closed.  The companion
+ * a peer-supplied sum: a request asking for more is closed.  Allow one page
+ * for RPC framing beyond a 1 MiB NFS WRITE payload.  The companion
  * SVC_RDMA_MAX_READ_SEGS caps the chained WRs, each of which takes an SQ slot
  * and must fit the head room reserved at accept.
  */
-#define	SVC_RDMA_MAX_READ	(1U << 20)	/* 1 MiB whole-request cap */
+#define	SVC_RDMA_MAX_READ	((1U << 20) + PAGE_SIZE)
 /* SVC_RDMA_MAX_READ_SEGS lives in <rdma/svc_rdma.h>, which sizes reads[]. */
 
 /*
