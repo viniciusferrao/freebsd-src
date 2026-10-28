@@ -1163,7 +1163,7 @@ svc_rdma_conn_reply_chunk(struct svc_rdma_conn *conn, uint32_t xid,
 	h = ws->ws_hdr;
 	be32enc(h +  0, xid);
 	be32enc(h +  4, RPCRDMA_VERSION);
-	be32enc(h +  8, (uint32_t)conn->sc_nrecv);
+	be32enc(h +  8, svc_rdma_conn_credits(conn));
 	be32enc(h + 12, RDMA_NOMSG);
 	be32enc(h + 16, 0);
 	be32enc(h + 20, 0);
@@ -1533,7 +1533,7 @@ svc_rdma_conn_write_list(struct svc_rdma_conn *conn, uint32_t xid,
 	h = ws->ws_hdr;
 	be32enc(h +  0, xid);
 	be32enc(h +  4, RPCRDMA_VERSION);
-	be32enc(h +  8, (uint32_t)conn->sc_nrecv);
+	be32enc(h +  8, svc_rdma_conn_credits(conn));
 	be32enc(h + 12, RDMA_MSG);
 	be32enc(h + 16, 0);
 	be32enc(h + 20, 1);
@@ -1788,7 +1788,7 @@ svc_rdma_conn_write_list_pages(struct svc_rdma_conn *conn, uint32_t xid,
 	h = ws->ws_hdr;
 	be32enc(h +  0, xid);
 	be32enc(h +  4, RPCRDMA_VERSION);
-	be32enc(h +  8, (uint32_t)conn->sc_nrecv);
+	be32enc(h +  8, svc_rdma_conn_credits(conn));
 	be32enc(h + 12, RDMA_MSG);
 	be32enc(h + 16, 0);
 	be32enc(h + 20, 1);

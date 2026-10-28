@@ -390,14 +390,16 @@ svc_rdma_conn_get_ctx(struct svc_rdma_conn *conn)
 }
 
 /*
- * The recv buffers actually posted, which a reply advertises in rdma_credit.
- * Written once at accept, so the read needs no lock.
+ * Keep one receive outside the forward-call credit grant when possible.
+ * An inline request can be replied to before its receive buffer is
+ * reposted. Without spare capacity, a replacement call within the credit
+ * limit can receive an RNR NAK. sc_nrecv is fixed at accept.
  */
 uint32_t
 svc_rdma_conn_credits(struct svc_rdma_conn *conn)
 {
 
-	return ((uint32_t)conn->sc_nrecv);
+	return ((uint32_t)max_t(int, conn->sc_nrecv - 1, 1));
 }
 
 /*
@@ -447,7 +449,7 @@ svc_rdma_conn_peeraddr(struct svc_rdma_conn *conn, struct sockaddr_storage *ss)
 /*
  * Marshal and post an RDMA_ERROR reply (RFC 8166 4.4).  ERR_VERS appends our
  * supported range and is followed by a close; ERR_CHUNK leaves the connection
- * up.  rdma_credit carries sc_nrecv, the credit we grant rather than the
+ * up.  rdma_credit carries the credit we grant rather than the
  * peer's offer, read without sc_lock since it is set at accept and never
  * mutated.  The caller must pass an xid from a header whose fixed prefix
  * parsed.  Goes through svc_rdma_conn_send(), so it takes the usual gate, pool
@@ -463,7 +465,7 @@ svc_rdma_send_error(struct svc_rdma_conn *conn, uint32_t xid, uint32_t errcode)
 
 	be32enc(p +  0, xid);
 	be32enc(p +  4, RPCRDMA_VERSION);
-	be32enc(p +  8, (uint32_t)conn->sc_nrecv);
+	be32enc(p +  8, svc_rdma_conn_credits(conn));
 	be32enc(p + 12, RDMA_ERROR);
 	be32enc(p + 16, errcode);
 	len = RPCRDMA_HDR_FIXED + RPCRDMA_WORD;
