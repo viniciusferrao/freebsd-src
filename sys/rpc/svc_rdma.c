@@ -264,8 +264,8 @@ STAILQ_HEAD(svc_rdma_qhead, svc_rdma_qent);
 
 /*
  * A captured chunk must survive from xp_recv to xp_reply with only the xid
- * linking them, so this fixed table under xr_pendlock holds it.  Sized at or
- * above the verbs recv depth, so requests cannot outrun it; a missing entry
+ * linking them, so this fixed table under xr_lock holds it.  Sized at or above
+ * the verbs recv depth, so requests cannot outrun it; a missing entry just
  * means no chunk for that reply.
  */
 #define	SVC_RDMA_REPLY_PEND	64
@@ -277,7 +277,7 @@ struct svc_rdma_reply_pend {
 	 * The chunk is filled in xp_recv and the read-data boundary later from
 	 * xp_control on the same thread, then both are consumed by xp_reply.
 	 * rp_has_reply is separate so an entry can exist for a write-list-only
-	 * READ.  All under xr_pendlock.
+	 * READ.  All under xr_lock.
 	 */
 	bool		rp_has_reply;
 	bool		rp_has_writes;
@@ -291,8 +291,6 @@ struct svc_rdma_reply_pend {
 struct svc_rdma_xprt {
 	struct svc_rdma_conn	*xr_conn;	/* verbs conn (NULL after disc.) */
 	struct mtx		 xr_lock;	/* guards xr_mq + xr_conn + xr_seq */
-	/* The pending-table lock must not nest with xr_lock. */
-	struct mtx		 xr_pendlock;	/* guards xr_pend */
 	struct svc_rdma_qhead	 xr_mq;		/* queued recv messages */
 	uint32_t		 xr_seq;	/* monotonic posted-reply counter */
 	bool			 xr_died;	/* connection gone */
@@ -340,7 +338,7 @@ svc_rdma_drain_queue(struct svc_rdma_xprt *xr)
 /*
  * Insert a captured chunk keyed by xid, reusing a slot already holding that
  * xid so a retransmit's re-offered chunk wins.  A full table drops it and
- * xp_reply falls back to inline-or-drop.  Under xr_pendlock.
+ * xp_reply falls back to inline-or-drop.  Under xr_lock.
  */
 static void
 svc_rdma_reply_pend_insert(struct svc_rdma_xprt *xr, uint32_t xid,
@@ -350,8 +348,7 @@ svc_rdma_reply_pend_insert(struct svc_rdma_xprt *xr, uint32_t xid,
 {
 	int i, free_slot = -1;
 
-	mtx_assert(&xr->xr_lock, MA_NOTOWNED);
-	mtx_lock(&xr->xr_pendlock);
+	mtx_lock(&xr->xr_lock);
 	for (i = 0; i < SVC_RDMA_REPLY_PEND; i++) {
 		if (xr->xr_pend[i].rp_valid && xr->xr_pend[i].rp_xid == xid) {
 			free_slot = i;			/* overwrite same-xid slot */
@@ -381,7 +378,7 @@ svc_rdma_reply_pend_insert(struct svc_rdma_xprt *xr, uint32_t xid,
 		p->rp_ddp_off = 0;
 		p->rp_ddp_len = 0;
 	}
-	mtx_unlock(&xr->xr_pendlock);
+	mtx_unlock(&xr->xr_lock);
 	if (free_slot < 0 &&
 	    ppsratecheck(&svc_rdma_log_last, &svc_rdma_log_pps, 5))
 		printf("svc_rdma: reply-pend table full (xid=0x%08x): "
@@ -391,7 +388,7 @@ svc_rdma_reply_pend_insert(struct svc_rdma_xprt *xr, uint32_t xid,
 /*
  * Record the DDP boundary from SVCSET_READDDP into this xid's entry, between
  * xp_recv and xp_reply on the request's pool thread.  Only the first READ for
- * an xid takes it, RFC 8267 reducing one result.  Under xr_pendlock.
+ * an xid takes it, RFC 8267 reducing one result.  Under xr_lock.
  */
 static void
 svc_rdma_readddp_set(struct svc_rdma_xprt *xr, uint32_t xid, uint32_t off,
@@ -399,8 +396,7 @@ svc_rdma_readddp_set(struct svc_rdma_xprt *xr, uint32_t xid, uint32_t off,
 {
 	int i;
 
-	mtx_assert(&xr->xr_lock, MA_NOTOWNED);
-	mtx_lock(&xr->xr_pendlock);
+	mtx_lock(&xr->xr_lock);
 	for (i = 0; i < SVC_RDMA_REPLY_PEND; i++) {
 		if (xr->xr_pend[i].rp_valid && xr->xr_pend[i].rp_xid == xid) {
 			if (!xr->xr_pend[i].rp_has_ddp) {
@@ -411,10 +407,10 @@ svc_rdma_readddp_set(struct svc_rdma_xprt *xr, uint32_t xid, uint32_t off,
 			break;
 		}
 	}
-	mtx_unlock(&xr->xr_pendlock);
+	mtx_unlock(&xr->xr_lock);
 }
 
-/* Look up and remove the pending chunk for xid.  Under xr_pendlock. */
+/* Look up and remove the pending chunk for xid.  Under xr_lock. */
 static bool
 svc_rdma_reply_pend_take(struct svc_rdma_xprt *xr, uint32_t xid,
     struct svc_rdma_reply_pend *out)
@@ -422,8 +418,7 @@ svc_rdma_reply_pend_take(struct svc_rdma_xprt *xr, uint32_t xid,
 	int i;
 	bool found = false;
 
-	mtx_assert(&xr->xr_lock, MA_NOTOWNED);
-	mtx_lock(&xr->xr_pendlock);
+	mtx_lock(&xr->xr_lock);
 	for (i = 0; i < SVC_RDMA_REPLY_PEND; i++) {
 		if (xr->xr_pend[i].rp_valid && xr->xr_pend[i].rp_xid == xid) {
 			*out = xr->xr_pend[i];	/* whole entry (value type) */
@@ -432,7 +427,7 @@ svc_rdma_reply_pend_take(struct svc_rdma_xprt *xr, uint32_t xid,
 			break;
 		}
 	}
-	mtx_unlock(&xr->xr_pendlock);
+	mtx_unlock(&xr->xr_lock);
 	return (found);
 }
 
@@ -1118,7 +1113,6 @@ svc_rdma_xprt_destroy(SVCXPRT *xprt)
 
 	if (xr != NULL) {
 		svc_rdma_drain_queue(xr);
-		mtx_destroy(&xr->xr_pendlock);
 		mtx_destroy(&xr->xr_lock);
 		free(xr, M_SVCRDMA);
 		xprt->xp_p1 = NULL;
@@ -1154,7 +1148,6 @@ svc_rdma_sro_newconn(void *ctx, struct svc_rdma_conn *conn)
 
 	xr = malloc(sizeof(*xr), M_SVCRDMA, M_WAITOK | M_ZERO);
 	mtx_init(&xr->xr_lock, "svcrdma_xr", NULL, MTX_DEF);
-	mtx_init(&xr->xr_pendlock, "svcrdma_pend", NULL, MTX_DEF);
 	STAILQ_INIT(&xr->xr_mq);
 	xr->xr_conn = conn;
 	xr->xr_died = false;
