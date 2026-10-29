@@ -36,12 +36,12 @@ eventhandler_tag svc_rdma_sink_lowmem_tag;
 
 /*
  * Borrow a sink buffer from the recycle list, or allocate one.  Always
- * SVC_RDMA_MAX_READ bytes, so any buffer fits any read.  M_NOWAIT because the
- * callers run in the CQ workqueue and under the CM handler mutex.  The
- * returned memory is unmapped; the caller maps it.
+ * SVC_RDMA_MAX_READ bytes, so any buffer fits any read or whole reply.  The
+ * returned memory is unmapped; the caller maps it.  Sleeping allocations are
+ * only permitted during reply preparation, before the connection lock.
  */
 void *
-svc_rdma_sink_get(void)
+svc_rdma_sink_get_flags(int flags)
 {
 	void *buf;
 
@@ -53,9 +53,17 @@ svc_rdma_sink_get(void)
 	}
 	mtx_unlock(&svc_rdma_sink_lock);
 	if (buf == NULL)
-		buf = contigmalloc(SVC_RDMA_MAX_READ, M_NFSRDMA, M_NOWAIT, 0,
+		buf = contigmalloc(SVC_RDMA_MAX_READ, M_NFSRDMA, flags, 0,
 		    ~(vm_paddr_t)0, PAGE_SIZE, 0);
 	return (buf);
+}
+
+void *
+svc_rdma_sink_get(void)
+{
+
+	/* Receive and connection setup callers cannot sleep. */
+	return (svc_rdma_sink_get_flags(M_NOWAIT));
 }
 
 /*

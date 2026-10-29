@@ -472,6 +472,7 @@ extern volatile u_int svc_rdma_cqv;
 extern int svc_rdma_listen_port;
 
 void	*svc_rdma_sink_get(void);
+void	*svc_rdma_sink_get_flags(int flags);
 void	svc_rdma_sink_put(void *buf);
 void	svc_rdma_sink_reclaim(void *arg __unused, int how __unused);
 void	svc_rdma_sink_drain(void);

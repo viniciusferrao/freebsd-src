@@ -1091,12 +1091,13 @@ svc_rdma_write_alloc(uint32_t nsegs, uint32_t reducedlen, const void *reply,
 	ws->ws_hdrlen = hdrlen + reducedlen;
 	ws->ws_hdr = malloc(ws->ws_hdrlen, M_NFSRDMA, M_WAITOK);
 	if (reply != NULL) {
-		ws->ws_src = contigmalloc(replylen, M_NFSRDMA, M_WAITOK, 0,
-		    ~(vm_paddr_t)0, PAGE_SIZE, 0);
+		CTASSERT(SVC_RDMA_MAX_REPLY <= SVC_RDMA_MAX_READ);
+		ws->ws_src = svc_rdma_sink_get_flags(M_WAITOK);
 		if (ws->ws_src == NULL) {
 			svc_rdma_write_free(ws);
 			return (ENOMEM);
 		}
+		ws->ws_src_pooled = true;
 		memcpy(ws->ws_src, reply, replylen);
 	}
 	*wsp = ws;
