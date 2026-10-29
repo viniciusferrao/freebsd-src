@@ -1066,7 +1066,7 @@ svc_rdma_write_alloc(uint32_t nsegs, uint32_t reducedlen, const void *reply,
 	if (nsegs == 0 || nsegs > SVC_RDMA_MAX_WRITE_SEGS ||
 	    (reply == NULL && replylen != 0) ||
 	    (reply != NULL && (replylen == 0 ||
-	    replylen > SVC_RDMA_MAX_WRITE || reducedlen != 0)))
+	    replylen > SVC_RDMA_MAX_REPLY || reducedlen != 0)))
 		return (EINVAL);
 
 	/* A write list has one more terminating word than a reply chunk. */
@@ -1127,7 +1127,7 @@ svc_rdma_conn_reply_chunk(struct svc_rdma_conn *conn, uint32_t xid,
 	 * len is the server's own marshalled reply size.  Zero is a caller bug,
 	 * and anything over the whole-reply cap is refused rather than written.
 	 */
-	if (len == 0 || len > SVC_RDMA_MAX_WRITE) {
+	if (len == 0 || len > SVC_RDMA_MAX_REPLY) {
 		rc = EINVAL;
 		goto badwrite;
 	}

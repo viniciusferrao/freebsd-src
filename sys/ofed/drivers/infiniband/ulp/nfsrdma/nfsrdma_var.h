@@ -110,11 +110,11 @@ extern struct svc_rdma_listener svc_rdma_listener;
 /* SVC_RDMA_MAX_READ_SEGS lives in <rdma/svc_rdma.h>, which sizes reads[]. */
 
 /*
- * Caps the length written into a client's chunks for one reply.  The source
- * is the server's own marshalled reply, so the length is known locally and
- * never taken from a peer field.
+ * Write-list chunks carry the NFS payload.  A reply chunk carries the whole
+ * RPC reply, so allow one additional page for its framing.
  */
-#define	SVC_RDMA_MAX_WRITE	(1U << 20)	/* 1 MiB whole-reply cap */
+#define	SVC_RDMA_MAX_WRITE	(1U << 20)
+#define	SVC_RDMA_MAX_REPLY	(SVC_RDMA_MAX_WRITE + PAGE_SIZE)
 #define	SVC_RDMA_MAX_WRITE_SEGS	SVC_RDMA_MAX_SEGS
 /*
  * An M_EXTPG read source is at most SVC_RDMA_MAX_WRITE bytes of page SGEs.
