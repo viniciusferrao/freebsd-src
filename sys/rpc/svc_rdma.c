@@ -633,6 +633,7 @@ svc_rdma_do_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 {
 	struct svc_rdma_xprt *xr = (struct svc_rdma_xprt *)xprt->xp_p1;
 	struct svc_rdma_conn *conn;
+	struct svc_rdma_write_state *ws;
 	struct svc_rdma_reply_pend pend;
 	struct mbuf *mrep;
 	char *buf;
@@ -768,6 +769,14 @@ svc_rdma_do_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 				 * data and its XDR pad.  Built off xr_lock.
 				 */
 				reducedlen = rlen - padded;
+				mtx_assert(&xr->xr_lock, MA_NOTOWNED);
+				rc = vops->svo_write_alloc(
+				    pend.rp_writes.wc_nsegs, reducedlen,
+				    NULL, 0, &ws);
+				if (rc != 0) {
+					m_freem(mrep);
+					return (FALSE);
+				}
 				reduced = malloc(reducedlen, M_SVCRDMA, M_WAITOK);
 				if (doff > 0)
 					m_copydata(mrep, 0, doff, reduced);
@@ -810,6 +819,7 @@ svc_rdma_do_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 					}
 					if (src == NULL) {
 						/* contig WAITOK can fail */
+						vops->svo_write_free(ws);
 						free(pgs, M_SVCRDMA);
 						free(reduced, M_SVCRDMA);
 						m_freem(mrep);
@@ -832,7 +842,9 @@ svc_rdma_do_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 				} else if (npg > 0) {
 					rc = vops->svo_conn_write_list_pages(
 					    conn, msg->rm_xid, &pend.rp_writes, mrep,
-					    pgs, npg, dlen, reduced, reducedlen);
+					    pgs, npg, dlen, reduced, reducedlen,
+					    ws);
+					ws = NULL;
 					/*
 					 * The engine owns mrep on every return,
 					 * so the reference is dropped here and
@@ -845,12 +857,15 @@ svc_rdma_do_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 					rc = vops->svo_conn_write_list(
 					    conn, msg->rm_xid, &pend.rp_writes,
 					    src, dlen, reduced, reducedlen,
-					    src_pooled);
+					    src_pooled, ws);
+					ws = NULL;
 					if (rc == 0)
 						seqval = ++xr->xr_seq;
 				}
 				mtx_unlock(&xr->xr_lock);
 
+				if (ws != NULL)
+					vops->svo_write_free(ws);
 				free(pgs, M_SVCRDMA);
 				free(reduced, M_SVCRDMA);
 				if (mrep != NULL)
@@ -886,19 +901,31 @@ svc_rdma_do_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 			m_copydata(mrep, 0, rlen, buf);
 			m_freem(mrep);
 
+			mtx_assert(&xr->xr_lock, MA_NOTOWNED);
+			if (vops == NULL) {
+				free(buf, M_SVCRDMA);
+				return (FALSE);
+			}
+			rc = vops->svo_write_alloc(pend.rp_reply.wc_nsegs, 0,
+			    buf, rlen, &ws);
+			free(buf, M_SVCRDMA);
+			if (rc != 0)
+				return (FALSE);
+
 			mtx_lock(&xr->xr_lock);
 			conn = xr->xr_conn;
-			if (conn != NULL && vops != NULL &&
-			    vops->svo_conn_reply_chunk != NULL) {
+			if (conn != NULL) {
 				rc = vops->svo_conn_reply_chunk(conn,
-				    msg->rm_xid, &pend.rp_reply, buf, rlen);
+				    msg->rm_xid, &pend.rp_reply, ws, rlen);
+				ws = NULL;
 				if (rc == 0)
 					seqval = ++xr->xr_seq;
 			} else
 				rc = ENOTCONN;
 			mtx_unlock(&xr->xr_lock);
 
-			free(buf, M_SVCRDMA);
+			if (ws != NULL)
+				vops->svo_write_free(ws);
 
 			if (rc != 0) {
 				if (rc != ENOTCONN &&
@@ -1449,7 +1476,8 @@ svc_rdma_register_verbs(const struct svc_rdma_verbs_ops *ops)
 	    ops->svo_listen_stop == NULL || ops->svo_conn_send == NULL ||
 	    ops->svo_conn_reply_chunk == NULL ||
 	    ops->svo_conn_set_ctx == NULL || ops->svo_conn_get_ctx == NULL ||
-	    ops->svo_conn_credits == NULL)
+	    ops->svo_conn_credits == NULL || ops->svo_write_alloc == NULL ||
+	    ops->svo_write_free == NULL)
 		return (EINVAL);
 
 	mtx_lock(&svc_rdma_verbs_lock);

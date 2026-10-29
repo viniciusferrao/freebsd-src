@@ -47,6 +47,8 @@ static const struct svc_rdma_verbs_ops ibcore_verbs_ops = {
 	.svo_thread_setup	= svc_rdma_thread_setup,
 	.svo_sink_get		= svc_rdma_sink_get,
 	.svo_sink_put		= svc_rdma_sink_put,
+	.svo_write_alloc	= svc_rdma_write_alloc,
+	.svo_write_free		= svc_rdma_write_free,
 };
 
 /*

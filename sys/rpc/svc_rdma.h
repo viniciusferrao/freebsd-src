@@ -58,6 +58,7 @@ struct svc_rdma_page {
 
 /* Opaque; valid from sro_newconn to sro_disconnect. */
 struct svc_rdma_conn;
+struct svc_rdma_write_state;
 
 /* sro_recv_mbuf's chain has an EXT_DISPOSABLE segment with a verbs ext_free. */
 struct mbuf;
@@ -177,19 +178,35 @@ int	svc_rdma_conn_error(struct svc_rdma_conn *conn, uint32_t xid,
 	    uint32_t errcode);
 
 /*
+ * Prepare a write state and its SEND buffer in a sleepable caller, before
+ * acquiring the connection's lifetime lock.  A non-NULL reply is copied into
+ * a contiguous source for a reply chunk; otherwise replylen must be zero and
+ * reducedlen is the inline body length for a write-list reply.
+ *
+ * No connection or DMA resources are accessed.  On success the caller owns
+ * *wsp until it passes it to a posting function, which consumes it on every
+ * return, or calls svc_rdma_write_free() after a disconnect.  On failure
+ * *wsp is NULL.  Hold the verbs provider throughout preparation and posting.
+ */
+int	svc_rdma_write_alloc(uint32_t nsegs, uint32_t reducedlen,
+	    const void *reply, uint32_t replylen,
+	    struct svc_rdma_write_state **wsp);
+void	svc_rdma_write_free(struct svc_rdma_write_state *ws);
+
+/*
  * Write an over-inline reply into the client's reply chunk, then SEND an
- * RDMA_NOMSG header with the length written (RFC 8166 4.3).  buf is the ONC
- * RPC body only and is copied.
+ * RDMA_NOMSG header with the length written (RFC 8166 4.3).  The ONC
+ * RPC body is copied by svc_rdma_write_alloc() before this call.
  *
  * reply is peer-supplied and re-validated here against the caps and against
  * len, so an oversized reply returns EMSGSIZE rather than overrunning the
- * chunk.  Does not sleep; same lifetime rule as svc_rdma_conn_send().  A
- * nonzero return leaves nothing allocated; a posted chain that fails later is
- * reclaimed by the teardown.
+ * chunk.  Does not sleep; same lifetime rule as svc_rdma_conn_send().  Each
+ * posting function consumes the prepared state on every return.  A partially
+ * posted chain is reclaimed only after completion or drain.
  */
 int	svc_rdma_conn_reply_chunk(struct svc_rdma_conn *conn, uint32_t xid,
-	    const struct svc_rdma_write_chunk *reply, const void *buf,
-	    uint32_t len);
+	    const struct svc_rdma_write_chunk *reply,
+	    struct svc_rdma_write_state *ws, uint32_t len);
 
 /*
  * Write a DDP-eligible READ's data into the client's write-list chunk, then
@@ -200,7 +217,7 @@ int	svc_rdma_conn_reply_chunk(struct svc_rdma_conn *conn, uint32_t xid,
 int	svc_rdma_conn_write_list(struct svc_rdma_conn *conn, uint32_t xid,
 	    const struct svc_rdma_write_chunk *write, void *src,
 	    uint32_t datalen, const void *reduced, uint32_t reducedlen,
-	    bool src_pooled);
+	    bool src_pooled, struct svc_rdma_write_state *ws);
 
 /*
  * Zero-copy form, sourced from the reply's M_EXTPG pages.  The engine owns
@@ -209,7 +226,8 @@ int	svc_rdma_conn_write_list(struct svc_rdma_conn *conn, uint32_t xid,
 int	svc_rdma_conn_write_list_pages(struct svc_rdma_conn *conn, uint32_t xid,
 	    const struct svc_rdma_write_chunk *write, struct mbuf *mrep,
 	    const struct svc_rdma_page *pages, uint32_t npages,
-	    uint32_t datalen, const void *reduced, uint32_t reducedlen);
+	    uint32_t datalen, const void *reduced, uint32_t reducedlen,
+	    struct svc_rdma_write_state *ws);
 
 /*
  * Recv buffers actually posted, which is what a reply advertises in
@@ -227,8 +245,9 @@ void	svc_rdma_thread_setup(void);
  * The verbs table nfsrdma registers at load.  It must outlive every call krpc
  * can make through it, so the module passes a static one and unregisters
  * before its text goes away; only one provider at a time.  Missing core
- * entries are rejected, while the optional ones are NULL-checked at the call
- * site so an older module still registers.
+ * entries are rejected, while optional entries are NULL-checked at the call
+ * site.  Changes to this private table require rebuilding both the consumer
+ * and provider.
  */
 struct svc_rdma_verbs_ops {
 	int	(*svo_listen_start)(uint16_t port,
@@ -237,18 +256,20 @@ struct svc_rdma_verbs_ops {
 	int	(*svo_conn_send)(struct svc_rdma_conn *conn, const void *buf,
 		    uint32_t len);
 	int	(*svo_conn_reply_chunk)(struct svc_rdma_conn *conn, uint32_t xid,
-		    const struct svc_rdma_write_chunk *reply, const void *buf,
+		    const struct svc_rdma_write_chunk *reply,
+		    struct svc_rdma_write_state *ws,
 		    uint32_t len);
 	/* Optional; without it over-inline READs fall back to the drop. */
 	int	(*svo_conn_write_list)(struct svc_rdma_conn *conn, uint32_t xid,
 		    const struct svc_rdma_write_chunk *write, void *src,
 		    uint32_t datalen, const void *reduced, uint32_t reducedlen,
-		    bool src_pooled);
+		    bool src_pooled, struct svc_rdma_write_state *ws);
 	/* Optional; without it the consumer stays on the copy path. */
 	int	(*svo_conn_write_list_pages)(struct svc_rdma_conn *conn, uint32_t xid,
 		    const struct svc_rdma_write_chunk *write, struct mbuf *mrep,
 		    const struct svc_rdma_page *pages, uint32_t npages,
-		    uint32_t datalen, const void *reduced, uint32_t reducedlen);
+		    uint32_t datalen, const void *reduced, uint32_t reducedlen,
+		    struct svc_rdma_write_state *ws);
 	void	(*svo_conn_set_ctx)(struct svc_rdma_conn *conn, void *cctx);
 	void	*(*svo_conn_get_ctx)(struct svc_rdma_conn *conn);
 	uint32_t (*svo_conn_credits)(struct svc_rdma_conn *conn);
@@ -266,6 +287,10 @@ struct svc_rdma_verbs_ops {
 	 */
 	void	*(*svo_sink_get)(void);
 	void	(*svo_sink_put)(void *buf);
+	int	(*svo_write_alloc)(uint32_t nsegs, uint32_t reducedlen,
+		    const void *reply, uint32_t replylen,
+		    struct svc_rdma_write_state **wsp);
+	void	(*svo_write_free)(struct svc_rdma_write_state *ws);
 };
 
 /*

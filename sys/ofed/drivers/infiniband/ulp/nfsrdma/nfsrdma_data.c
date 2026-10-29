@@ -978,10 +978,10 @@ svc_rdma_wc_rdma_read(struct ib_cq *cq, struct ib_wc *wc)
  */
 
 /*
- * Release one outbound write state exactly once, driven by ws_src_mapped,
- * ws_hdr_mapped and the buffer pointers rather than by ws_active, so a second
- * call is a no-op.  The caller has already detached ws from sc_writes, or is
- * the teardown draining the list, so this never touches the list.  The source
+ * Release one outbound write state, using the mapped flags and buffer
+ * pointers to unwind partial preparation.  The caller has already detached
+ * ws from sc_writes, or never inserted it, so this never touches the list.
+ * The state is freed here and must not be passed in again.  The source
  * mapping must stay live until the device is done reading, which is why the
  * teardown reclaims only after ib_free_cq().
  */
@@ -1051,18 +1051,71 @@ svc_rdma_write_free(struct svc_rdma_write_state *ws)
 }
 
 /*
+ * Allocate before taking the consumer's connection lock.  The state is not
+ * attached to a connection until posting, so it can wait for memory without
+ * holding up disconnect.  A prepared state can also be freed after disconnect.
+ */
+int
+svc_rdma_write_alloc(uint32_t nsegs, uint32_t reducedlen, const void *reply,
+    uint32_t replylen, struct svc_rdma_write_state **wsp)
+{
+	struct svc_rdma_write_state *ws;
+	uint32_t hdrlen;
+
+	*wsp = NULL;
+	if (nsegs == 0 || nsegs > SVC_RDMA_MAX_WRITE_SEGS ||
+	    (reply == NULL && replylen != 0) ||
+	    (reply != NULL && (replylen == 0 ||
+	    replylen > SVC_RDMA_MAX_WRITE || reducedlen != 0)))
+		return (EINVAL);
+
+	/* A write list has one more terminating word than a reply chunk. */
+	hdrlen = RPCRDMA_HDR_FIXED + 4 * RPCRDMA_WORD +
+	    nsegs * (RPCRDMA_SEG_WORDS * RPCRDMA_WORD);
+	if (reply == NULL)
+		hdrlen += RPCRDMA_WORD;
+	if (reducedlen > SVC_RDMA_INLINE - hdrlen)
+		return (EMSGSIZE);
+
+	ws = malloc(sizeof(*ws), M_NFSRDMA, M_WAITOK);
+	ws->ws_conn = NULL;
+	ws->ws_src = NULL;
+	ws->ws_src_mapped = false;
+	ws->ws_src_pooled = false;
+	ws->ws_hdr_mapped = false;
+	ws->ws_active = false;
+	ws->ws_pages_mapped = false;
+	ws->ws_npgs = 0;
+	ws->ws_keepm = NULL;
+	ws->ws_srclen = replylen;
+	ws->ws_hdrlen = hdrlen + reducedlen;
+	ws->ws_hdr = malloc(ws->ws_hdrlen, M_NFSRDMA, M_WAITOK);
+	if (reply != NULL) {
+		ws->ws_src = contigmalloc(replylen, M_NFSRDMA, M_WAITOK, 0,
+		    ~(vm_paddr_t)0, PAGE_SIZE, 0);
+		if (ws->ws_src == NULL) {
+			svc_rdma_write_free(ws);
+			return (ENOMEM);
+		}
+		memcpy(ws->ws_src, reply, replylen);
+	}
+	*wsp = ws;
+	return (0);
+}
+
+/*
  * Write an over-inline reply into the client's reply chunk and send the
  * RDMA_NOMSG header reporting the length.  Runs on a krpc pool thread under
- * the consumer's per-connection lock, the same caller-reference rule as
- * svc_rdma_conn_send(), and does not sleep.  buf and len are the ONC RPC body
- * only.  A nonzero return has already released everything for a never-posted
+ * the consumer's per-connection lock, the same lifetime rule as
+ * svc_rdma_conn_send(), and does not sleep.  The source and header buffers
+ * were prepared off-lock.  A nonzero return has released a never-posted
  * attempt; a posted-but-failed chain is left to the teardown.
  */
 int
 svc_rdma_conn_reply_chunk(struct svc_rdma_conn *conn, uint32_t xid,
-    const struct svc_rdma_write_chunk *reply, const void *buf, uint32_t len)
+    const struct svc_rdma_write_chunk *reply, struct svc_rdma_write_state *ws,
+    uint32_t len)
 {
-	struct svc_rdma_write_state *ws;
 	struct ib_device *dev = conn->sc_id->device;
 	const struct ib_send_wr *bad_wr;
 	uint64_t capacity;
@@ -1074,8 +1127,10 @@ svc_rdma_conn_reply_chunk(struct svc_rdma_conn *conn, uint32_t xid,
 	 * len is the server's own marshalled reply size.  Zero is a caller bug,
 	 * and anything over the whole-reply cap is refused rather than written.
 	 */
-	if (len == 0 || len > SVC_RDMA_MAX_WRITE)
-		return (EINVAL);
+	if (len == 0 || len > SVC_RDMA_MAX_WRITE) {
+		rc = EINVAL;
+		goto badwrite;
+	}
 
 	/*
 	 * Re-check the chunk shape at post time, so this engine is correct
@@ -1083,8 +1138,10 @@ svc_rdma_conn_reply_chunk(struct svc_rdma_conn *conn, uint32_t xid,
 	 * over-cap chunk reach the HCA.
 	 */
 	n = reply->wc_nsegs;
-	if (n == 0 || n > SVC_RDMA_MAX_WRITE_SEGS)
-		return (EINVAL);
+	if (n == 0 || n > SVC_RDMA_MAX_WRITE_SEGS) {
+		rc = EINVAL;
+		goto badwrite;
+	}
 
 	/*
 	 * Sum the offered capacity without overflow, re-checking each length.
@@ -1095,53 +1152,22 @@ svc_rdma_conn_reply_chunk(struct svc_rdma_conn *conn, uint32_t xid,
 	for (i = 0; i < n; i++) {
 		uint32_t slen = reply->wc_segs[i].rs_length;
 
-		if (slen == 0 || slen > SVC_RDMA_MAX_SEG_LEN)
-			return (EINVAL);
+		if (slen == 0 || slen > SVC_RDMA_MAX_SEG_LEN) {
+			rc = EINVAL;
+			goto badwrite;
+		}
 		capacity += slen;
 	}
-	if ((uint64_t)len > capacity)
-		return (EMSGSIZE);
-
-	/*
-	 * The write state outlives this call, since the writes and the header
-	 * SEND complete later.  M_NOWAIT because xp_reply may run under the
-	 * consumer's leaf mutex.
-	 */
-	ws = malloc(sizeof(*ws), M_NFSRDMA, M_NOWAIT);
-	if (ws == NULL)
-		return (ENOMEM);
-	ws->ws_conn = conn;
-	ws->ws_src = NULL;
-	ws->ws_src_mapped = false;
-	ws->ws_src_pooled = false;
-	ws->ws_hdr = NULL;
-	ws->ws_hdr_mapped = false;
-	ws->ws_active = false;
-	ws->ws_pages_mapped = false;
-	ws->ws_npgs = 0;
-	ws->ws_keepm = NULL;
-
-	/*
-	 * Copy the reply into the source buffer and map it, since the HCA reads
-	 * from here.  It is sized by the server's own length.
-	 */
-	ws->ws_srclen = len;
-	/*
-	 * Like the read sink, the source must be physically contiguous for
-	 * ib_dma_map_single(), or a multi-page reply would source the wrong
-	 * physical pages.
-	 */
-	ws->ws_src = contigmalloc(len, M_NFSRDMA, M_NOWAIT, 0, ~(vm_paddr_t)0,
-	    PAGE_SIZE, 0);
-	if (ws->ws_src == NULL) {
-		free(ws, M_NFSRDMA);
-		return (ENOMEM);
+	if ((uint64_t)len > capacity) {
+		rc = EMSGSIZE;
+		goto badwrite;
 	}
-	memcpy(ws->ws_src, buf, len);
+
+	MPASS(ws->ws_src != NULL && ws->ws_srclen == len);
+	ws->ws_conn = conn;
 	ws->ws_src_dma = ib_dma_map_single(dev, ws->ws_src, len, DMA_TO_DEVICE);
 	if (ib_dma_mapping_error(dev, ws->ws_src_dma)) {
-		free(ws->ws_src, M_NFSRDMA);
-		free(ws, M_NFSRDMA);
+		svc_rdma_write_free(ws);
 		return (EIO);
 	}
 	ws->ws_src_mapped = true;
@@ -1154,12 +1180,7 @@ svc_rdma_conn_reply_chunk(struct svc_rdma_conn *conn, uint32_t xid,
 	hdrlen = RPCRDMA_HDR_FIXED + 2 * RPCRDMA_WORD +
 	    2 * RPCRDMA_WORD +
 	    n * (RPCRDMA_SEG_WORDS * RPCRDMA_WORD);
-	ws->ws_hdrlen = hdrlen;
-	ws->ws_hdr = malloc(hdrlen, M_NFSRDMA, M_NOWAIT);
-	if (ws->ws_hdr == NULL) {
-		svc_rdma_write_free(ws);
-		return (ENOMEM);
-	}
+	MPASS(ws->ws_hdrlen == hdrlen);
 	h = ws->ws_hdr;
 	be32enc(h +  0, xid);
 	be32enc(h +  4, RPCRDMA_VERSION);
@@ -1296,6 +1317,10 @@ svc_rdma_conn_reply_chunk(struct svc_rdma_conn *conn, uint32_t xid,
 		return (rc < 0 ? -rc : rc);
 	}
 	return (0);
+
+badwrite:
+	svc_rdma_write_free(ws);
+	return (rc);
 }
 
 /*
@@ -1417,9 +1442,8 @@ int
 svc_rdma_conn_write_list(struct svc_rdma_conn *conn, uint32_t xid,
     const struct svc_rdma_write_chunk *write, void *src,
     uint32_t datalen, const void *reduced, uint32_t reducedlen,
-    bool src_pooled)
+    bool src_pooled, struct svc_rdma_write_state *ws)
 {
-	struct svc_rdma_write_state *ws;
 	struct ib_device *dev = conn->sc_id->device;
 	const struct ib_send_wr *bad_wr;
 	uint64_t capacity;
@@ -1480,25 +1504,9 @@ svc_rdma_conn_write_list(struct svc_rdma_conn *conn, uint32_t xid,
 	}
 	sendlen = hdrlen + reducedlen;
 
-	/*
-	 * The write state outlives this call, since the writes and the SEND
-	 * complete later.  M_NOWAIT because xp_reply runs under a leaf mutex.
-	 */
-	ws = malloc(sizeof(*ws), M_NFSRDMA, M_NOWAIT);
-	if (ws == NULL) {
-		rc = ENOMEM;
-		goto badsrc;
-	}
+	MPASS(ws->ws_src == NULL && ws->ws_hdrlen == sendlen);
 	ws->ws_conn = conn;
-	ws->ws_src = NULL;
-	ws->ws_src_mapped = false;
 	ws->ws_src_pooled = src_pooled;
-	ws->ws_hdr = NULL;
-	ws->ws_hdr_mapped = false;
-	ws->ws_active = false;
-	ws->ws_pages_mapped = false;
-	ws->ws_npgs = 0;
-	ws->ws_keepm = NULL;
 
 	/*
 	 * Take ownership of the caller's source buffer and map it for the HCA
@@ -1524,12 +1532,6 @@ svc_rdma_conn_write_list(struct svc_rdma_conn *conn, uint32_t xid,
 	 * Build the reduced SEND buffer: the header, echoing the chunk with the
 	 * bytes actually written, followed by the reduced inline body.
 	 */
-	ws->ws_hdrlen = sendlen;
-	ws->ws_hdr = malloc(sendlen, M_NFSRDMA, M_NOWAIT);
-	if (ws->ws_hdr == NULL) {
-		svc_rdma_write_free(ws);	/* unmaps ws_src, frees ws */
-		return (ENOMEM);
-	}
 	h = ws->ws_hdr;
 	be32enc(h +  0, xid);
 	be32enc(h +  4, RPCRDMA_VERSION);
@@ -1646,11 +1648,12 @@ svc_rdma_conn_write_list(struct svc_rdma_conn *conn, uint32_t xid,
 	return (0);
 
 	/*
-	 * Failures before the write state exists still own the caller's source
-	 * buffer, never attached, so it is freed here.  Later paths free it
-	 * through the release path and must not reach this label.
+	 * Failures before the source is attached free it separately from the
+	 * prepared state.  Later paths use the release path and must not reach
+	 * this label.
 	 */
 badsrc:
+	svc_rdma_write_free(ws);
 	/* A pooled buffer goes back to the recycle pool rather than free(). */
 	if (src_pooled)
 		svc_rdma_sink_put(src);
@@ -1672,9 +1675,9 @@ int
 svc_rdma_conn_write_list_pages(struct svc_rdma_conn *conn, uint32_t xid,
     const struct svc_rdma_write_chunk *write, struct mbuf *mrep,
     const struct svc_rdma_page *pages, uint32_t npages,
-    uint32_t datalen, const void *reduced, uint32_t reducedlen)
+    uint32_t datalen, const void *reduced, uint32_t reducedlen,
+    struct svc_rdma_write_state *ws)
 {
-	struct svc_rdma_write_state *ws;
 	struct ib_device *dev = conn->sc_id->device;
 	const struct ib_send_wr *bad_wr;
 	uint64_t capacity, pgsum;
@@ -1736,20 +1739,8 @@ svc_rdma_conn_write_list_pages(struct svc_rdma_conn *conn, uint32_t xid,
 	}
 	sendlen = hdrlen + reducedlen;
 
-	ws = malloc(sizeof(*ws), M_NFSRDMA, M_NOWAIT);
-	if (ws == NULL) {
-		rc = ENOMEM;
-		goto badm;
-	}
+	MPASS(ws->ws_src == NULL && ws->ws_hdrlen == sendlen);
 	ws->ws_conn = conn;
-	ws->ws_src = NULL;
-	ws->ws_src_mapped = false;
-	ws->ws_src_pooled = false;
-	ws->ws_hdr = NULL;
-	ws->ws_hdr_mapped = false;
-	ws->ws_active = false;
-	ws->ws_pages_mapped = false;
-	ws->ws_npgs = 0;
 	ws->ws_srclen = datalen;
 	/*
 	 * The state owns mrep from here, so every later error path frees it
@@ -1779,12 +1770,6 @@ svc_rdma_conn_write_list_pages(struct svc_rdma_conn *conn, uint32_t xid,
 	}
 
 	/* The reduced SEND buffer, built as in write_list. */
-	ws->ws_hdrlen = sendlen;
-	ws->ws_hdr = malloc(sendlen, M_NFSRDMA, M_NOWAIT);
-	if (ws->ws_hdr == NULL) {
-		svc_rdma_write_free(ws);
-		return (ENOMEM);
-	}
 	h = ws->ws_hdr;
 	be32enc(h +  0, xid);
 	be32enc(h +  4, RPCRDMA_VERSION);
@@ -1931,12 +1916,13 @@ svc_rdma_conn_write_list_pages(struct svc_rdma_conn *conn, uint32_t xid,
 	return (0);
 
 	/*
-	 * Failures before the write state exists own mrep without having
-	 * attached it, so it is freed here to keep the engine-owns-mrep
-	 * contract.  Every path after ws_keepm is set frees it through the
-	 * release path instead and must not reach this label.
+	 * Failures before mrep is attached free it separately from the prepared
+	 * state to keep the engine-owns-mrep contract.  Every path after
+	 * ws_keepm is set frees it through the release path instead and must
+	 * not reach this label.
 	 */
 badm:
+	svc_rdma_write_free(ws);
 	if (mrep != NULL)
 		m_freem(mrep);
 	return (rc);
