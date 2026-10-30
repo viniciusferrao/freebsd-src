@@ -908,9 +908,10 @@ svc_rdma_do_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 			}
 			rc = vops->svo_write_alloc(pend.rp_reply.wc_nsegs, 0,
 			    buf, rlen, &ws);
-			free(buf, M_SVCRDMA);
-			if (rc != 0)
+			if (rc != 0) {
+				free(buf, M_SVCRDMA);
 				return (FALSE);
+			}
 
 			mtx_lock(&xr->xr_lock);
 			conn = xr->xr_conn;
@@ -924,6 +925,7 @@ svc_rdma_do_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 				rc = ENOTCONN;
 			mtx_unlock(&xr->xr_lock);
 
+			free(buf, M_SVCRDMA);
 			if (ws != NULL)
 				vops->svo_write_free(ws);
 
