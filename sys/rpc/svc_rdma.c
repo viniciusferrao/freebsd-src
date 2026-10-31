@@ -626,6 +626,37 @@ svc_rdma_xprt_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 	return (stat);
 }
 
+/*
+ * A reply worker can wait for a send buffer; the CQ callback cannot.
+ * Drop xr_lock during each wait so disconnect can clear xr_conn.  Never
+ * retain the connection pointer across that wait.  The request holds the
+ * transport reference, and the provider is held by our
+ * caller.  A one-tick wait also covers completions that preceded the sleep.
+ */
+static int
+svc_rdma_send_locked(struct svc_rdma_xprt *xr,
+    const struct svc_rdma_verbs_ops *vops, char *buf, uint32_t len)
+{
+	struct svc_rdma_conn *conn;
+	uint32_t credit;
+	int error;
+
+	mtx_assert(&xr->xr_lock, MA_OWNED);
+	for (;;) {
+		conn = xr->xr_conn;
+		if (conn == NULL || vops == NULL)
+			return (ENOTCONN);
+		credit = vops->svo_conn_credits(conn);
+		if (credit == 0)
+			credit = SVC_RDMA_CREDIT_GRANT;
+		be32enc(buf + 8, credit);
+		error = vops->svo_conn_send(conn, buf, len);
+		if (error != EBUSY)
+			return (error);
+		(void)msleep(xr, &xr->xr_lock, 0, "svcrsend", 1);
+	}
+}
+
 static bool_t
 svc_rdma_do_reply(SVCXPRT *xprt, struct rpc_msg *msg,
     struct sockaddr *addr, struct mbuf *m, uint32_t *seq,
@@ -983,23 +1014,13 @@ svc_rdma_do_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 
 	/*
 	 * Post under xr_lock to observe a stable xr_conn: sro_disconnect NULLs
-	 * it under the same lock after draining every sro_recv, so either the
-	 * conn is live for the whole of the non-sleeping send or it is NULL and
-	 * this drops.  The granted credit is read from the same live conn.
+	 * it under the same lock after draining every sro_recv.  If the pool is
+	 * full, drop the lock while waiting, then check xr_conn before posting.
 	 */
 	mtx_lock(&xr->xr_lock);
-	conn = xr->xr_conn;
-	if (conn != NULL && vops != NULL) {
-		uint32_t credit = vops->svo_conn_credits(conn);
-
-		if (credit == 0)
-			credit = SVC_RDMA_CREDIT_GRANT;
-		be32enc(buf + 8, credit);
-		rc = vops->svo_conn_send(conn, buf, total);
-		if (rc == 0)
-			seqval = ++xr->xr_seq;
-	} else
-		rc = ENOTCONN;
+	rc = svc_rdma_send_locked(xr, vops, buf, total);
+	if (rc == 0)
+		seqval = ++xr->xr_seq;
 	mtx_unlock(&xr->xr_lock);
 
 	free(buf, M_SVCRDMA);

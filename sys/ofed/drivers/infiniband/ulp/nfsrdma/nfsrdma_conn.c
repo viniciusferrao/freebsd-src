@@ -311,8 +311,8 @@ svc_rdma_conn_send(struct svc_rdma_conn *conn, const void *buf, uint32_t len)
 	}
 	if (ss == NULL) {
 		/*
-		 * The pool is exhausted, so drop the reply rather than block
-		 * the completion or grow the pool.
+		 * The caller must retry from a sleepable context, or close the
+		 * connection if it cannot retain the reply.
 		 */
 		mtx_unlock(&conn->sc_lock);
 		return (EBUSY);
@@ -476,9 +476,12 @@ svc_rdma_send_error(struct svc_rdma_conn *conn, uint32_t xid, uint32_t errcode)
 	}
 
 	rc = svc_rdma_conn_send(conn, err, len);
+	/* Receive completions cannot wait for another CQ callback. */
+	if (rc == EBUSY)
+		svc_rdma_conn_close(conn);
 	if (rc != 0 && ppsratecheck(&svc_rdma_log_last, &svc_rdma_log_pps, 5)) {
 		if (rc == EBUSY)
-			printf("nfsrdma: send buffers exhausted, dropping "
+			printf("nfsrdma: send buffers exhausted, closing after "
 			    "RDMA_ERROR err=%u (xid=0x%08x)\n", errcode, xid);
 		else if (rc == ENOTCONN)
 			; /* connection tearing down; silent (expected) */
@@ -491,7 +494,7 @@ svc_rdma_send_error(struct svc_rdma_conn *conn, uint32_t xid, uint32_t errcode)
 
 /*
  * Lets the consumer report ERR_CHUNK by xid without knowing the wire header.
- * Does not close the connection.
+ * Closes the connection if no send buffer is available.
  */
 int
 svc_rdma_conn_error(struct svc_rdma_conn *conn, uint32_t xid, uint32_t errcode)

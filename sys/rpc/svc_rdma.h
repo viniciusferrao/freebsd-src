@@ -159,7 +159,9 @@ void	*svc_rdma_conn_get_ctx(struct svc_rdma_conn *conn);
 
 /*
  * Post an inline reply.  buf is copied, so it can be freed on return.
- * Callable from sro_recv and does not sleep.
+ * Callable from sro_recv and does not sleep.  EBUSY leaves buf untouched;
+ * a sleepable caller must retain it and retry, rechecking connection lifetime
+ * after each wait.  A caller that cannot retry must close the connection.
  *
  * conn is valid only between sro_newconn and sro_disconnect, so a caller
  * posting from outside an upcall must hold something that keeps it alive:
@@ -171,7 +173,8 @@ int	svc_rdma_conn_send(struct svc_rdma_conn *conn, const void *buf,
 
 /*
  * Post an RDMA_ERROR reply (RFC 8166 4.4).  The xid must come from a request
- * whose header parsed.  ERR_CHUNK leaves the connection up to be retried.
+ * whose header parsed.  ERR_CHUNK normally leaves the connection up to be
+ * retried; send-buffer exhaustion closes it so the caller can reconnect.
  * Same context and lifetime rules as svc_rdma_conn_send().
  */
 int	svc_rdma_conn_error(struct svc_rdma_conn *conn, uint32_t xid,
