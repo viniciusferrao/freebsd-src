@@ -300,8 +300,9 @@ struct svc_rdma_xprt {
 	uint32_t		 xr_seq;	/* monotonic posted-reply counter */
 	bool			 xr_died;	/* connection gone */
 	/* Outstanding callback replies, protected by xr_lock. */
-	uint32_t		 xr_bck_xid[SVC_RDMA_BCK_CREDITS];
-	bool			 xr_bck_busy[SVC_RDMA_BCK_CREDITS];
+	uint32_t		 xr_bck_xid[SVC_RDMA_MAX_BCK_CREDITS];
+	bool			 xr_bck_busy[SVC_RDMA_MAX_BCK_CREDITS];
+	u_int			 xr_bck_limit; /* fixed receive reserve */
 	u_int			 xr_bck_pending;
 	uint32_t		 xr_bck_credit;
 	uint64_t		 xr_bck_replies; /* matched replies */
@@ -1110,7 +1111,7 @@ svc_rdma_do_bck_send(SVCXPRT *xprt, struct mbuf *mreq,
 	buf = malloc(total, M_SVCRDMA, M_WAITOK);
 	be32enc(buf + 0, ntohl(netxid));
 	be32enc(buf + 4, RPCRDMA_VERSION);
-	be32enc(buf + 8, SVC_RDMA_BCK_CREDITS);
+	be32enc(buf + 8, xr->xr_bck_limit);
 	be32enc(buf + 12, RDMA_MSG);
 	be32enc(buf + 16, 0);
 	be32enc(buf + 20, 0);
@@ -1146,19 +1147,19 @@ svc_rdma_do_bck_send(SVCXPRT *xprt, struct mbuf *mreq,
 			rc = ETIMEDOUT;
 			break;
 		}
-		for (i = 0; i < SVC_RDMA_BCK_CREDITS; i++)
+		for (i = 0; i < xr->xr_bck_limit; i++)
 			if (xr->xr_bck_busy[i] &&
 			    xr->xr_bck_xid[i] == ntohl(netxid))
 				break;
-		if (i < SVC_RDMA_BCK_CREDITS) {
+		if (i < xr->xr_bck_limit) {
 			rc = EALREADY;
 			break;
 		}
 		if (xr->xr_bck_pending < xr->xr_bck_credit) {
-			for (i = 0; i < SVC_RDMA_BCK_CREDITS; i++)
+			for (i = 0; i < xr->xr_bck_limit; i++)
 				if (!xr->xr_bck_busy[i])
 					break;
-			KASSERT(i < SVC_RDMA_BCK_CREDITS,
+			KASSERT(i < xr->xr_bck_limit,
 			    ("svc_rdma: callback receive reserve exhausted"));
 			xr->xr_bck_busy[i] = true;
 			xr->xr_bck_xid[i] = ntohl(netxid);
@@ -1269,6 +1270,10 @@ svc_rdma_sro_newconn(void *ctx, struct svc_rdma_conn *conn)
 	STAILQ_INIT(&xr->xr_mq);
 	xr->xr_conn = conn;
 	xr->xr_died = false;
+	xr->xr_bck_limit = svc_rdma_verbs->svo_conn_bck_credits(conn);
+	KASSERT(xr->xr_bck_limit >= 1 &&
+	    xr->xr_bck_limit <= SVC_RDMA_MAX_BCK_CREDITS,
+	    ("svc_rdma: invalid callback receive reserve"));
 	xr->xr_bck_credit = 1;	/* Initial reverse-direction credit. */
 
 	xprt = svc_xprt_alloc();
@@ -1339,17 +1344,17 @@ svc_rdma_bck_reply(struct svc_rdma_xprt *xr, uint32_t xid, uint32_t credit)
 	u_int i;
 
 	mtx_lock(&xr->xr_lock);
-	for (i = 0; i < SVC_RDMA_BCK_CREDITS; i++)
+	for (i = 0; i < xr->xr_bck_limit; i++)
 		if (xr->xr_bck_busy[i] && xr->xr_bck_xid[i] == xid)
 			break;
-	if (i == SVC_RDMA_BCK_CREDITS) {
+	if (i == xr->xr_bck_limit) {
 		mtx_unlock(&xr->xr_lock);
 		return (false);
 	}
 	xr->xr_bck_busy[i] = false;
 	xr->xr_bck_pending--;
 	/* RFC 8166 forbids zero grants; tolerate one without deadlocking. */
-	xr->xr_bck_credit = MAX(1U, MIN(credit, SVC_RDMA_BCK_CREDITS));
+	xr->xr_bck_credit = MAX(1U, MIN(credit, xr->xr_bck_limit));
 	xr->xr_bck_replies++;
 	wakeup(xr);
 	mtx_unlock(&xr->xr_lock);
@@ -1600,7 +1605,8 @@ svc_rdma_register_verbs(const struct svc_rdma_verbs_ops *ops)
 	    ops->svo_listen_stop == NULL || ops->svo_conn_send == NULL ||
 	    ops->svo_conn_reply_chunk == NULL ||
 	    ops->svo_conn_set_ctx == NULL || ops->svo_conn_get_ctx == NULL ||
-	    ops->svo_conn_credits == NULL || ops->svo_conn_close == NULL ||
+	    ops->svo_conn_credits == NULL ||
+	    ops->svo_conn_bck_credits == NULL || ops->svo_conn_close == NULL ||
 	    ops->svo_write_alloc == NULL ||
 	    ops->svo_write_free == NULL)
 		return (EINVAL);

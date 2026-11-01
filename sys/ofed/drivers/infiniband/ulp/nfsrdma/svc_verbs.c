@@ -42,6 +42,7 @@ static const struct svc_rdma_verbs_ops ibcore_verbs_ops = {
 	.svo_conn_set_ctx	= svc_rdma_conn_set_ctx,
 	.svo_conn_get_ctx	= svc_rdma_conn_get_ctx,
 	.svo_conn_credits	= svc_rdma_conn_credits,
+	.svo_conn_bck_credits	= svc_rdma_conn_bck_credits,
 	.svo_conn_close		= svc_rdma_conn_close,
 	.svo_conn_peeraddr	= svc_rdma_conn_peeraddr,
 	.svo_conn_error		= svc_rdma_conn_error,

@@ -28,6 +28,28 @@
 
 #include "nfsrdma_var.h"
 
+static u_int svc_rdma_bck_credits = SVC_RDMA_BCK_CREDITS;
+SYSCTL_DECL(_vfs_nfsd);
+
+static int
+sysctl_nfsd_rdma_callback_credits(SYSCTL_HANDLER_ARGS)
+{
+	int error, credits;
+
+	credits = atomic_load_acq_int(&svc_rdma_bck_credits);
+	error = sysctl_handle_int(oidp, &credits, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (credits < 1 || credits > SVC_RDMA_MAX_BCK_CREDITS)
+		return (EINVAL);
+	atomic_store_rel_int(&svc_rdma_bck_credits, credits);
+	return (0);
+}
+SYSCTL_PROC(_vfs_nfsd, OID_AUTO, rdma_callback_credits,
+    CTLTYPE_INT | CTLFLAG_MPSAFE | CTLFLAG_RWTUN, NULL, 0,
+    sysctl_nfsd_rdma_callback_credits, "I",
+    "Maximum outstanding RDMA callbacks per new connection (1-64)");
+
 struct svc_rdma_listener svc_rdma_listener = {
 	.sl_id = NULL,
 	.sl_id6 = NULL,
@@ -397,10 +419,19 @@ svc_rdma_conn_get_ctx(struct svc_rdma_conn *conn)
 uint32_t
 svc_rdma_conn_credits(struct svc_rdma_conn *conn)
 {
+	u_int reserve;
 
-	KASSERT(conn->sc_nrecv > SVC_RDMA_RECV_RESERVE,
+	reserve = conn->sc_bck_credits + SVC_RDMA_REPOST_RESERVE;
+	KASSERT(conn->sc_nrecv > reserve,
 	    ("nfsrdma: receive queue too small"));
-	return (conn->sc_nrecv - SVC_RDMA_RECV_RESERVE);
+	return (conn->sc_nrecv - reserve);
+}
+
+uint32_t
+svc_rdma_conn_bck_credits(struct svc_rdma_conn *conn)
+{
+
+	return (conn->sc_bck_credits);
 }
 
 /*
@@ -767,11 +798,14 @@ svc_rdma_accept(struct rdma_cm_id *id)
 	struct svc_rdma_conn *conn;
 	struct ib_device *dev = id->device;
 	const struct ib_recv_wr *bad_wr;
-	u32 max_wr, max_send_wr, max_sge, max_send_sge;
+	u32 max_wr, max_send_wr, max_sge, max_send_sge, reserve;
 	u32 send_vec, recv_vec;
 	int i, rc;
 
 	conn = malloc(sizeof(*conn), M_NFSRDMA, M_WAITOK | M_ZERO);
+	/* One snapshot sizes the QP and governs callbacks for its lifetime. */
+	conn->sc_bck_credits = atomic_load_acq_int(&svc_rdma_bck_credits);
+	reserve = conn->sc_bck_credits + SVC_RDMA_REPOST_RESERVE;
 
 	/*
 	 * Live before any verbs resource exists, so every failure from here can
@@ -814,7 +848,7 @@ svc_rdma_accept(struct rdma_cm_id *id)
 	 * buffer.  These are local bounds, not peer counts; on a small-cap
 	 * device the clamp wins and an overflowing chain fails the post.
 	 */
-	max_wr = SVC_RDMA_RECV_DEPTH;
+	max_wr = SVC_RDMA_FORWARD_CREDITS + reserve;
 	if (dev->attrs.max_qp_wr > 0 &&
 	    (u32)dev->attrs.max_qp_wr < max_wr)
 		max_wr = dev->attrs.max_qp_wr;
@@ -922,7 +956,7 @@ svc_rdma_accept(struct rdma_cm_id *id)
 	}
 	/* Honour the provider's returned receive cap as well as our request. */
 	max_wr = min_t(u32, max_wr, qp_attr.cap.max_recv_wr);
-	if (max_wr <= SVC_RDMA_RECV_RESERVE) {
+	if (max_wr <= reserve) {
 		printf("nfsrdma: receive queue cannot fit reserved buffers\n");
 		goto fail;
 	}
@@ -938,8 +972,7 @@ svc_rdma_accept(struct rdma_cm_id *id)
 	 * posting the full depth on a smaller device would fail part way
 	 * through the loop.
 	 */
-	conn->sc_nrecv = (SVC_RDMA_RECV_DEPTH < max_wr) ?
-	    SVC_RDMA_RECV_DEPTH : max_wr;
+	conn->sc_nrecv = max_wr;
 	conn->sc_recv = malloc(conn->sc_nrecv * sizeof(*conn->sc_recv),
 	    M_NFSRDMA, M_WAITOK | M_ZERO);
 

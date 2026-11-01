@@ -71,7 +71,8 @@ struct mbuf;
 #define	SVC_RDMA_MAX_SEGS	16	/* max rdma_segments in one chunk */
 #define	SVC_RDMA_MAX_CHUNKS	8	/* max chunks in read/write list */
 #define	SVC_RDMA_FORWARD_CREDITS	63	/* maximum forward-call grant */
-#define	SVC_RDMA_BCK_CREDITS	8	/* reserved callback replies per conn */
+#define	SVC_RDMA_BCK_CREDITS	8	/* default callback limit */
+#define	SVC_RDMA_MAX_BCK_CREDITS	64	/* maximum callback limit */
 #define	SVC_RDMA_MAX_SEG_LEN	(1U << 30)	/* sane per-segment length cap */
 /*
  * Capped apart from SVC_RDMA_MAX_CHUNKS since an NFS WRITE arrives as many
@@ -239,6 +240,7 @@ int	svc_rdma_conn_write_list_pages(struct svc_rdma_conn *conn, uint32_t xid,
  * dispatch-before-repost.  Set at accept and never mutated.
  */
 uint32_t svc_rdma_conn_credits(struct svc_rdma_conn *conn);
+uint32_t svc_rdma_conn_bck_credits(struct svc_rdma_conn *conn);
 
 /*
  * Pre-allocate this thread's linuxkpi current shadow off-lock, so a later
@@ -278,6 +280,7 @@ struct svc_rdma_verbs_ops {
 	void	(*svo_conn_set_ctx)(struct svc_rdma_conn *conn, void *cctx);
 	void	*(*svo_conn_get_ctx)(struct svc_rdma_conn *conn);
 	uint32_t (*svo_conn_credits)(struct svc_rdma_conn *conn);
+	uint32_t (*svo_conn_bck_credits)(struct svc_rdma_conn *conn);
 	void	(*svo_conn_close)(struct svc_rdma_conn *conn);
 	void	(*svo_conn_peeraddr)(struct svc_rdma_conn *conn,
 		    struct sockaddr_storage *ss);

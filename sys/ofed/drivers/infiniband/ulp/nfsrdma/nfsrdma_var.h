@@ -99,11 +99,9 @@ extern struct svc_rdma_listener svc_rdma_listener;
  */
 #define	SVC_RDMA_INLINE		4096
 #define	SVC_RDMA_REPOST_RESERVE	3
-#define	SVC_RDMA_RECV_RESERVE	(SVC_RDMA_BCK_CREDITS + SVC_RDMA_REPOST_RESERVE)
-#define	SVC_RDMA_RECV_DEPTH \
-	(SVC_RDMA_FORWARD_CREDITS + SVC_RDMA_RECV_RESERVE)
 #define	SVC_RDMA_SEND_DEPTH	64
 CTASSERT(SVC_RDMA_SEND_DEPTH > SVC_RDMA_FORWARD_CREDITS);
+CTASSERT(SVC_RDMA_MAX_BCK_CREDITS <= SVC_RDMA_SEND_DEPTH);
 
 /*
  * Caps the inbound length pulled from one read list.  A local constant, not
@@ -364,6 +362,7 @@ struct svc_rdma_conn {
 	struct ib_cq		*sc_rcq;	/* recv CQ */
 	struct svc_rdma_recv	*sc_recv;	/* sc_nrecv-element array */
 	int			 sc_nrecv;
+	u_int			 sc_bck_credits; /* fixed at accept */
 	struct svc_rdma_send	*sc_send;	/* sc_nsend-element reply-send pool */
 	int			 sc_nsend;
 	struct svc_rdma_readbuf	*sc_rbpool;	/* sc_nrbpool-element read-buffer pool */
