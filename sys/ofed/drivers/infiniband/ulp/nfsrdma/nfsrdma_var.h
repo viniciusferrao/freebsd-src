@@ -98,12 +98,12 @@ extern struct svc_rdma_listener svc_rdma_listener;
  * but the three can run concurrently.
  */
 #define	SVC_RDMA_INLINE		4096
-#define	SVC_RDMA_FORWARD_CREDITS	63
 #define	SVC_RDMA_REPOST_RESERVE	3
 #define	SVC_RDMA_RECV_RESERVE	(SVC_RDMA_BCK_CREDITS + SVC_RDMA_REPOST_RESERVE)
 #define	SVC_RDMA_RECV_DEPTH \
 	(SVC_RDMA_FORWARD_CREDITS + SVC_RDMA_RECV_RESERVE)
 #define	SVC_RDMA_SEND_DEPTH	64
+CTASSERT(SVC_RDMA_SEND_DEPTH > SVC_RDMA_FORWARD_CREDITS);
 
 /*
  * Caps the inbound length pulled from one read list.  A local constant, not
@@ -240,7 +240,8 @@ struct svc_rdma_read_state {
  * must not be pinned at a high-water mark.
  */
 
-#define	SVC_RDMA_SINK_CACHE_MAX	(4 * SVC_RDMA_RECV_DEPTH)  /* ~256 MiB high-water; vm_lowmem reclaims it */
+/* About 256 MiB, independent of receive reserves; vm_lowmem reclaims it. */
+#define	SVC_RDMA_SINK_CACHE_MAX	256
 extern struct mtx svc_rdma_sink_lock;
 extern void	*svc_rdma_sink_head;	/* LIFO; next ptr lives in buf[0] */
 extern int	 svc_rdma_sink_count;

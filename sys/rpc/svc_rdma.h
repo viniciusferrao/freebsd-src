@@ -70,6 +70,7 @@ struct mbuf;
  */
 #define	SVC_RDMA_MAX_SEGS	16	/* max rdma_segments in one chunk */
 #define	SVC_RDMA_MAX_CHUNKS	8	/* max chunks in read/write list */
+#define	SVC_RDMA_FORWARD_CREDITS	63	/* maximum forward-call grant */
 #define	SVC_RDMA_BCK_CREDITS	8	/* reserved callback replies per conn */
 #define	SVC_RDMA_MAX_SEG_LEN	(1U << 30)	/* sane per-segment length cap */
 /*

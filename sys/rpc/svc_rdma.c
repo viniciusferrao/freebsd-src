@@ -159,6 +159,10 @@ svc_rdma_nfsd_running(void)
  */
 #define	SVC_RDMA_CREDIT_GRANT	8
 
+/* Bound credit stalls separately from each callback's admission wait. */
+#define	SVC_RDMA_BCK_IDLE	(5 * SBT_1S)
+#define	SVC_RDMA_BCK_WAIT	(8 * SBT_1S)
+
 MALLOC_DEFINE(M_SVCRDMA, "svcrdma", "NFS over RDMA server SVCXPRT");
 /* M_NFSRDMA is defined here (base kernel / krpc) so both svc_rdma.c and the
  * nfsrdma module (svc_verbs.c) share the tag without a KLD→base linker dep. */
@@ -264,11 +268,12 @@ STAILQ_HEAD(svc_rdma_qhead, svc_rdma_qent);
 
 /*
  * A captured chunk must survive from xp_recv to xp_reply with only the xid
- * linking them, so this fixed table under xr_lock holds it.  Sized at or above
- * the verbs recv depth, so requests cannot outrun it; a missing entry just
- * means no chunk for that reply.
+ * linking them, so this fixed table under xr_lock holds it.  Only forward
+ * calls need entries; callback and repost reserves do not consume this table.
+ * A missing entry means no chunk for that reply.
  */
 #define	SVC_RDMA_REPLY_PEND	64
+CTASSERT(SVC_RDMA_REPLY_PEND >= SVC_RDMA_FORWARD_CREDITS);
 struct svc_rdma_reply_pend {
 	bool		rp_valid;
 	uint32_t	rp_xid;
@@ -299,6 +304,7 @@ struct svc_rdma_xprt {
 	bool			 xr_bck_busy[SVC_RDMA_BCK_CREDITS];
 	u_int			 xr_bck_pending;
 	uint32_t		 xr_bck_credit;
+	uint64_t		 xr_bck_replies; /* matched replies */
 	struct svc_rdma_reply_pend xr_pend[SVC_RDMA_REPLY_PEND]; /* reply chunks */
 };
 
@@ -1081,8 +1087,9 @@ svc_rdma_do_bck_send(SVCXPRT *xprt, struct mbuf *mreq,
 	struct svc_rdma_xprt *xr = (struct svc_rdma_xprt *)xprt->xp_p1;
 	struct svc_rdma_conn *conn;
 	uint32_t netxid;
+	uint64_t replies;
 	char *buf;
-	sbintime_t deadline;
+	sbintime_t deadline, idle_deadline, now;
 	u_int rlen, total, i;
 	int rc;
 
@@ -1114,16 +1121,29 @@ svc_rdma_do_bck_send(SVCXPRT *xprt, struct mbuf *mreq,
 	/*
 	 * A callback consumes a reserved receive until its reply arrives.  The
 	 * RPC caller can time out without notifying this transport; recycling
-	 * its slot then would leave no buffer for a late reply.  If credits do
-	 * not become available within a second, close instead of overcommitting
-	 * the queue or sleeping indefinitely inside the send hook.
+	 * its slot then would leave no buffer for a late reply.  Close a full
+	 * callback window only after five seconds without a matching reply.
+	 * A busy sender can lose the race for credits while replies still flow;
+	 * bound its total wait without closing that progressing connection.
 	 */
-	deadline = sbinuptime() + SBT_1S;
 	mtx_lock(&xr->xr_lock);
+	now = sbinuptime();
+	deadline = now + SVC_RDMA_BCK_WAIT;
+	idle_deadline = now + SVC_RDMA_BCK_IDLE;
+	replies = xr->xr_bck_replies;
 	for (;;) {
 		conn = xr->xr_conn;
 		if (conn == NULL || xr->xr_died || vops == NULL) {
 			rc = ENOTCONN;
+			break;
+		}
+		now = sbinuptime();
+		if (replies != xr->xr_bck_replies) {
+			replies = xr->xr_bck_replies;
+			idle_deadline = now + SVC_RDMA_BCK_IDLE;
+		}
+		if (now >= deadline) {
+			rc = ETIMEDOUT;
 			break;
 		}
 		for (i = 0; i < SVC_RDMA_BCK_CREDITS; i++)
@@ -1151,7 +1171,8 @@ svc_rdma_do_bck_send(SVCXPRT *xprt, struct mbuf *mreq,
 			if (rc != EBUSY)
 				break;
 		}
-		if (sbinuptime() >= deadline) {
+		if (xr->xr_bck_pending >= xr->xr_bck_credit &&
+		    now >= idle_deadline) {
 			xr->xr_died = true;
 			vops->svo_conn_close(conn);
 			wakeup(xr);
@@ -1327,7 +1348,9 @@ svc_rdma_bck_reply(struct svc_rdma_xprt *xr, uint32_t xid, uint32_t credit)
 	}
 	xr->xr_bck_busy[i] = false;
 	xr->xr_bck_pending--;
-	xr->xr_bck_credit = MIN(credit, SVC_RDMA_BCK_CREDITS);
+	/* RFC 8166 forbids zero grants; tolerate one without deadlocking. */
+	xr->xr_bck_credit = MAX(1U, MIN(credit, SVC_RDMA_BCK_CREDITS));
+	xr->xr_bck_replies++;
 	wakeup(xr);
 	mtx_unlock(&xr->xr_lock);
 	return (true);
