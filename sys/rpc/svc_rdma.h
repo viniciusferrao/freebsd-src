@@ -70,6 +70,7 @@ struct mbuf;
  */
 #define	SVC_RDMA_MAX_SEGS	16	/* max rdma_segments in one chunk */
 #define	SVC_RDMA_MAX_CHUNKS	8	/* max chunks in read/write list */
+#define	SVC_RDMA_BCK_CREDITS	8	/* reserved callback replies per conn */
 #define	SVC_RDMA_MAX_SEG_LEN	(1U << 30)	/* sane per-segment length cap */
 /*
  * Capped apart from SVC_RDMA_MAX_CHUNKS since an NFS WRITE arrives as many
@@ -233,8 +234,8 @@ int	svc_rdma_conn_write_list_pages(struct svc_rdma_conn *conn, uint32_t xid,
 	    struct svc_rdma_write_state *ws);
 
 /*
- * Recv buffers actually posted, which is what a reply advertises in
- * rdma_credit (RFC 8166 3.3.1).  Set at accept and never mutated.
+ * Forward-call grant after reserving receives for callback replies and
+ * dispatch-before-repost.  Set at accept and never mutated.
  */
 uint32_t svc_rdma_conn_credits(struct svc_rdma_conn *conn);
 
@@ -276,6 +277,7 @@ struct svc_rdma_verbs_ops {
 	void	(*svo_conn_set_ctx)(struct svc_rdma_conn *conn, void *cctx);
 	void	*(*svo_conn_get_ctx)(struct svc_rdma_conn *conn);
 	uint32_t (*svo_conn_credits)(struct svc_rdma_conn *conn);
+	void	(*svo_conn_close)(struct svc_rdma_conn *conn);
 	void	(*svo_conn_peeraddr)(struct svc_rdma_conn *conn,
 		    struct sockaddr_storage *ss);
 	/* Optional; without it an unplaceable reply is dropped. */

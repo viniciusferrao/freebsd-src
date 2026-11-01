@@ -91,13 +91,19 @@ extern struct svc_rdma_listener svc_rdma_listener;
 
 /*
  * RFC 8166 defaults the inline threshold to 1024 bytes; a page leaves head
- * room and keeps one buffer to a single mapping.  The send depth matches the
- * recv depth so every call in flight can have a reply.  Both are clamped to
- * the device QP caps at accept.
+ * room and keeps one buffer to a single mapping.  Reserve receive buffers
+ * for callback replies separately from forward-call credits.  Three more
+ * cover dispatch before repost: one each for the receive CQ, send CQ Read
+ * completions, and CM replay of early receives.  Each context is serialized,
+ * but the three can run concurrently.
  */
 #define	SVC_RDMA_INLINE		4096
-#define	SVC_RDMA_RECV_DEPTH	64
-#define	SVC_RDMA_SEND_DEPTH	SVC_RDMA_RECV_DEPTH
+#define	SVC_RDMA_FORWARD_CREDITS	63
+#define	SVC_RDMA_REPOST_RESERVE	3
+#define	SVC_RDMA_RECV_RESERVE	(SVC_RDMA_BCK_CREDITS + SVC_RDMA_REPOST_RESERVE)
+#define	SVC_RDMA_RECV_DEPTH \
+	(SVC_RDMA_FORWARD_CREDITS + SVC_RDMA_RECV_RESERVE)
+#define	SVC_RDMA_SEND_DEPTH	64
 
 /*
  * Caps the inbound length pulled from one read list.  A local constant, not

@@ -390,16 +390,17 @@ svc_rdma_conn_get_ctx(struct svc_rdma_conn *conn)
 }
 
 /*
- * Keep one receive outside the forward-call credit grant when possible.
- * An inline request can be replied to before its receive buffer is
- * reposted. Without spare capacity, a replacement call within the credit
- * limit can receive an RNR NAK. sc_nrecv is fixed at accept.
+ * Callback replies and dispatch-before-repost need receive capacity outside
+ * the forward-call grant.  Accept rejects a QP that cannot fit the reserve
+ * and at least one forward call.  sc_nrecv is fixed at accept.
  */
 uint32_t
 svc_rdma_conn_credits(struct svc_rdma_conn *conn)
 {
 
-	return ((uint32_t)max_t(int, conn->sc_nrecv - 1, 1));
+	KASSERT(conn->sc_nrecv > SVC_RDMA_RECV_RESERVE,
+	    ("nfsrdma: receive queue too small"));
+	return (conn->sc_nrecv - SVC_RDMA_RECV_RESERVE);
 }
 
 /*
@@ -918,6 +919,12 @@ svc_rdma_accept(struct rdma_cm_id *id)
 			    rc < 0 ? -rc : rc);
 			goto fail;
 		}
+	}
+	/* Honour the provider's returned receive cap as well as our request. */
+	max_wr = min_t(u32, max_wr, qp_attr.cap.max_recv_wr);
+	if (max_wr <= SVC_RDMA_RECV_RESERVE) {
+		printf("nfsrdma: receive queue cannot fit reserved buffers\n");
+		goto fail;
 	}
 	conn->sc_max_send_sge = max_send_sge;
 	if (bootverbose && ppsratecheck(&svc_rdma_log_last, &svc_rdma_log_pps, 1))

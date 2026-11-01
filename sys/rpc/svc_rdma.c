@@ -294,6 +294,11 @@ struct svc_rdma_xprt {
 	struct svc_rdma_qhead	 xr_mq;		/* queued recv messages */
 	uint32_t		 xr_seq;	/* monotonic posted-reply counter */
 	bool			 xr_died;	/* connection gone */
+	/* Outstanding callback replies, protected by xr_lock. */
+	uint32_t		 xr_bck_xid[SVC_RDMA_BCK_CREDITS];
+	bool			 xr_bck_busy[SVC_RDMA_BCK_CREDITS];
+	u_int			 xr_bck_pending;
+	uint32_t		 xr_bck_credit;
 	struct svc_rdma_reply_pend xr_pend[SVC_RDMA_REPLY_PEND]; /* reply chunks */
 };
 
@@ -1060,8 +1065,10 @@ svc_rdma_bck_send(SVCXPRT *xprt, struct mbuf *mreq)
 	 * it with xr_lock dropped, so a concurrent unload cannot free that text
 	 * mid-call on the modular build.
 	 */
+	SVC_ACQUIRE(xprt);
 	vops = svc_rdma_verbs_hold();
 	rc = svc_rdma_do_bck_send(xprt, mreq, vops);
+	SVC_RELEASE(xprt);
 	if (vops != NULL)
 		svc_rdma_verbs_unhold();
 	return (rc);
@@ -1075,7 +1082,8 @@ svc_rdma_do_bck_send(SVCXPRT *xprt, struct mbuf *mreq,
 	struct svc_rdma_conn *conn;
 	uint32_t netxid;
 	char *buf;
-	u_int rlen, total;
+	sbintime_t deadline;
+	u_int rlen, total, i;
 	int rc;
 
 	/* Pre-warm the linuxkpi current shadow off-lock before the post. */
@@ -1095,7 +1103,7 @@ svc_rdma_do_bck_send(SVCXPRT *xprt, struct mbuf *mreq,
 	buf = malloc(total, M_SVCRDMA, M_WAITOK);
 	be32enc(buf + 0, ntohl(netxid));
 	be32enc(buf + 4, RPCRDMA_VERSION);
-	be32enc(buf + 8, SVC_RDMA_CREDIT_GRANT);
+	be32enc(buf + 8, SVC_RDMA_BCK_CREDITS);
 	be32enc(buf + 12, RDMA_MSG);
 	be32enc(buf + 16, 0);
 	be32enc(buf + 20, 0);
@@ -1103,17 +1111,56 @@ svc_rdma_do_bck_send(SVCXPRT *xprt, struct mbuf *mreq,
 	m_copydata(mreq, 0, rlen, buf + RPCRDMA_HDR_MIN);
 	m_freem(mreq);
 
+	/*
+	 * A callback consumes a reserved receive until its reply arrives.  The
+	 * RPC caller can time out without notifying this transport; recycling
+	 * its slot then would leave no buffer for a late reply.  If credits do
+	 * not become available within a second, close instead of overcommitting
+	 * the queue or sleeping indefinitely inside the send hook.
+	 */
+	deadline = sbinuptime() + SBT_1S;
 	mtx_lock(&xr->xr_lock);
-	conn = xr->xr_conn;
-	if (conn != NULL && vops != NULL) {
-		uint32_t credit = vops->svo_conn_credits(conn);
-
-		if (credit == 0)
-			credit = SVC_RDMA_CREDIT_GRANT;
-		be32enc(buf + 8, credit);
-		rc = vops->svo_conn_send(conn, buf, total);
-	} else
-		rc = ENOTCONN;
+	for (;;) {
+		conn = xr->xr_conn;
+		if (conn == NULL || xr->xr_died || vops == NULL) {
+			rc = ENOTCONN;
+			break;
+		}
+		for (i = 0; i < SVC_RDMA_BCK_CREDITS; i++)
+			if (xr->xr_bck_busy[i] &&
+			    xr->xr_bck_xid[i] == ntohl(netxid))
+				break;
+		if (i < SVC_RDMA_BCK_CREDITS) {
+			rc = EALREADY;
+			break;
+		}
+		if (xr->xr_bck_pending < xr->xr_bck_credit) {
+			for (i = 0; i < SVC_RDMA_BCK_CREDITS; i++)
+				if (!xr->xr_bck_busy[i])
+					break;
+			KASSERT(i < SVC_RDMA_BCK_CREDITS,
+			    ("svc_rdma: callback receive reserve exhausted"));
+			xr->xr_bck_busy[i] = true;
+			xr->xr_bck_xid[i] = ntohl(netxid);
+			xr->xr_bck_pending++;
+			rc = vops->svo_conn_send(conn, buf, total);
+			if (rc == 0)
+				break;
+			xr->xr_bck_busy[i] = false;
+			xr->xr_bck_pending--;
+			if (rc != EBUSY)
+				break;
+		}
+		if (sbinuptime() >= deadline) {
+			xr->xr_died = true;
+			vops->svo_conn_close(conn);
+			wakeup(xr);
+			rc = ETIMEDOUT;
+			break;
+		}
+		/* Recheck the connection after sleeping; xr_lock pins it. */
+		msleep(xr, &xr->xr_lock, 0, "svcrbck", 1);
+	}
 	mtx_unlock(&xr->xr_lock);
 
 	free(buf, M_SVCRDMA);
@@ -1201,6 +1248,7 @@ svc_rdma_sro_newconn(void *ctx, struct svc_rdma_conn *conn)
 	STAILQ_INIT(&xr->xr_mq);
 	xr->xr_conn = conn;
 	xr->xr_died = false;
+	xr->xr_bck_credit = 1;	/* Initial reverse-direction credit. */
 
 	xprt = svc_xprt_alloc();
 	sx_init(&xprt->xp_lock, "xprt->xp_lock");
@@ -1260,6 +1308,32 @@ svc_rdma_sro_newconn(void *ctx, struct svc_rdma_conn *conn)
 }
 
 /*
+ * Only a matching callback reply retires a receive reservation or changes
+ * the reverse-direction credit grant.  Forward calls and duplicate replies
+ * cannot release callback slots.
+ */
+static bool
+svc_rdma_bck_reply(struct svc_rdma_xprt *xr, uint32_t xid, uint32_t credit)
+{
+	u_int i;
+
+	mtx_lock(&xr->xr_lock);
+	for (i = 0; i < SVC_RDMA_BCK_CREDITS; i++)
+		if (xr->xr_bck_busy[i] && xr->xr_bck_xid[i] == xid)
+			break;
+	if (i == SVC_RDMA_BCK_CREDITS) {
+		mtx_unlock(&xr->xr_lock);
+		return (false);
+	}
+	xr->xr_bck_busy[i] = false;
+	xr->xr_bck_pending--;
+	xr->xr_bck_credit = MIN(credit, SVC_RDMA_BCK_CREDITS);
+	wakeup(xr);
+	mtx_unlock(&xr->xr_lock);
+	return (true);
+}
+
+/*
  * sro_recv: an inline call completed.  The analogue of svc_vc_soupcall, with
  * the completion as the data-ready signal.  Runs in the recv completion and
  * must not sleep, so m_getm2() pre-sizes the chain with M_NOWAIT and a failed
@@ -1291,10 +1365,13 @@ svc_rdma_sro_recv(void *ctx, struct svc_rdma_conn *conn,
 	 * bytes are copied now with M_NOWAIT, since msg->rpc points into the
 	 * recv buffer and this cannot sleep.
 	 */
-	if (msg->rpc_len >= 8 && xprt->xp_p2 != NULL &&
+	if (msg->rpc_len >= 8 &&
 	    be32dec((const char *)msg->rpc + 4) == REPLY) {
 		struct mbuf *rm;
 
+		if (!svc_rdma_bck_reply(xr, msg->xid, msg->credit) ||
+		    xprt->xp_p2 == NULL)
+			return (0);
 		rm = m_getm2(NULL, msg->rpc_len, M_NOWAIT, MT_DATA, M_PKTHDR);
 		if (rm == NULL)
 			return (0);
@@ -1435,6 +1512,7 @@ svc_rdma_sro_disconnect(void *ctx, struct svc_rdma_conn *conn)
 	mtx_lock(&xr->xr_lock);
 	xr->xr_conn = NULL;
 	xr->xr_died = true;
+	wakeup(xr);
 	mtx_unlock(&xr->xr_lock);
 
 	/*
@@ -1499,7 +1577,8 @@ svc_rdma_register_verbs(const struct svc_rdma_verbs_ops *ops)
 	    ops->svo_listen_stop == NULL || ops->svo_conn_send == NULL ||
 	    ops->svo_conn_reply_chunk == NULL ||
 	    ops->svo_conn_set_ctx == NULL || ops->svo_conn_get_ctx == NULL ||
-	    ops->svo_conn_credits == NULL || ops->svo_write_alloc == NULL ||
+	    ops->svo_conn_credits == NULL || ops->svo_conn_close == NULL ||
+	    ops->svo_write_alloc == NULL ||
 	    ops->svo_write_free == NULL)
 		return (EINVAL);
 
