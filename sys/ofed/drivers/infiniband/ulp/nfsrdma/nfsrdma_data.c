@@ -739,7 +739,7 @@ svc_rdma_wc_rdma_read(struct ib_cq *cq, struct ib_wc *wc)
 	struct svc_rdma_read_state *rs;
 	struct svc_rdma_recv *rr;
 	struct svc_rdma_conn *conn;
-	uint32_t pos, bodylen, inner_xid, rndup_total;
+	uint32_t pos, bodylen, inner_xid, readlen;
 	int rc;
 	bool ready, first, xid_valid;
 
@@ -786,7 +786,10 @@ svc_rdma_wc_rdma_read(struct ib_cq *cq, struct ib_wc *wc)
 	 * their sum cannot overflow.
 	 */
 	pos = rs->rs_msg.reads[0].rc_position;
-	bodylen = rs->rs_headlen + rs->rs_total;
+	readlen = rs->rs_total;
+	if (pos != 0)
+		readlen = roundup2(readlen, RPCRDMA_WORD);
+	bodylen = rs->rs_headlen + readlen;
 
 	/*
 	 * Sync the sink before the CPU reads it: the mapping may be bounced, so
@@ -810,7 +813,6 @@ svc_rdma_wc_rdma_read(struct ib_cq *cq, struct ib_wc *wc)
 	} else {
 		xid_valid = true;
 		inner_xid = be32dec(rs->rs_head);
-		rndup_total = roundup2(rs->rs_total, RPCRDMA_WORD);
 	}
 	if (!xid_valid || bodylen < sizeof(uint32_t) ||
 	    inner_xid != rs->rs_msg.xid) {
@@ -861,6 +863,11 @@ svc_rdma_wc_rdma_read(struct ib_cq *cq, struct ib_wc *wc)
 			return;
 		}
 
+		/* Restore omitted XDR padding (RFC 8166, Section 3.4.5.2). */
+		if (readlen > rs->rs_total)
+			memset((char *)sinkbuf + rs->rs_total, 0,
+			    readlen - rs->rs_total);
+
 		/*
 		 * EXT_DISPOSABLE wraps the sink, with the buffer pointer as
 		 * ext_arg1 for the ext_free.  flags is 0 because
@@ -868,14 +875,9 @@ svc_rdma_wc_rdma_read(struct ib_cq *cq, struct ib_wc *wc)
 		 * so the free fires once even if the chain is copied and
 		 * passing the flag would set a stray m_flags bit.
 		 */
-		m_extadd(mext, (char *)sinkbuf, rs->rs_total,
+		m_extadd(mext, (char *)sinkbuf, readlen,
 		    svc_rdma_read_extfree, sinkbuf, NULL, 0, EXT_DISPOSABLE);
-		if (pos > 0 && rndup_total > rs->rs_total) {
-			memset((char *)sinkbuf + rs->rs_total, 0, rndup_total -
-			    rs->rs_total);
-			mext->m_len = rndup_total;
-		} else
-			mext->m_len = rs->rs_total;
+		mext->m_len = readlen;
 
 		/*
 		 * The chain head carries the pkthdr, pre-sized so the copy
@@ -907,7 +909,7 @@ svc_rdma_wc_rdma_read(struct ib_cq *cq, struct ib_wc *wc)
 			m_copyback(mt, 0, tlen, rs->rs_head + pos);
 			mext->m_next = mt;
 		}
-		mhead->m_pkthdr.len = roundup2(bodylen, RPCRDMA_WORD);
+		mhead->m_pkthdr.len = bodylen;
 
 		/*
 		 * Snapshot the reply-chunk identity before the release.  rs_msg
