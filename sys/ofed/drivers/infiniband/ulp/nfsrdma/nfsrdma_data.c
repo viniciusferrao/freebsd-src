@@ -739,7 +739,7 @@ svc_rdma_wc_rdma_read(struct ib_cq *cq, struct ib_wc *wc)
 	struct svc_rdma_read_state *rs;
 	struct svc_rdma_recv *rr;
 	struct svc_rdma_conn *conn;
-	uint32_t pos, bodylen, inner_xid;
+	uint32_t pos, bodylen, inner_xid, rndup_total;
 	int rc;
 	bool ready, first, xid_valid;
 
@@ -810,6 +810,7 @@ svc_rdma_wc_rdma_read(struct ib_cq *cq, struct ib_wc *wc)
 	} else {
 		xid_valid = true;
 		inner_xid = be32dec(rs->rs_head);
+		rndup_total = roundup2(rs->rs_total, RPCRDMA_WORD);
 	}
 	if (!xid_valid || bodylen < sizeof(uint32_t) ||
 	    inner_xid != rs->rs_msg.xid) {
@@ -869,7 +870,12 @@ svc_rdma_wc_rdma_read(struct ib_cq *cq, struct ib_wc *wc)
 		 */
 		m_extadd(mext, (char *)sinkbuf, rs->rs_total,
 		    svc_rdma_read_extfree, sinkbuf, NULL, 0, EXT_DISPOSABLE);
-		mext->m_len = rs->rs_total;
+		if (pos > 0 && rndup_total > rs->rs_total) {
+			memset((char *)sinkbuf + rs->rs_total, 0, rndup_total -
+			    rs->rs_total);
+			mext->m_len = rndup_total;
+		} else
+			mext->m_len = rs->rs_total;
 
 		/*
 		 * The chain head carries the pkthdr, pre-sized so the copy
@@ -901,7 +907,7 @@ svc_rdma_wc_rdma_read(struct ib_cq *cq, struct ib_wc *wc)
 			m_copyback(mt, 0, tlen, rs->rs_head + pos);
 			mext->m_next = mt;
 		}
-		mhead->m_pkthdr.len = bodylen;
+		mhead->m_pkthdr.len = roundup2(bodylen, RPCRDMA_WORD);
 
 		/*
 		 * Snapshot the reply-chunk identity before the release.  rs_msg
