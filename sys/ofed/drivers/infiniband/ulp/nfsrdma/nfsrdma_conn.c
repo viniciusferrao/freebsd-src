@@ -841,12 +841,7 @@ svc_rdma_accept(struct rdma_cm_id *id)
 	mtx_unlock(&svc_rdma_conns_lock);
 
 	/*
-	 * max_qp_wr and max_sge are signed in the FreeBSD ib_device_attr, so
-	 * clamp to at least 1; mlx rejects a zero-entry QP or CQ.  The SQ
-	 * carries reply SENDs, Read chains and Write chains with their header
-	 * SEND, so max_send_wr reserves one read and one write chain per recv
-	 * buffer.  These are local bounds, not peer counts; on a small-cap
-	 * device the clamp wins and an overflowing chain fails the post.
+	 * max_qp_wr and max_sge are signed; mlx5 rejects a zero-entry QP or CQ.
 	 */
 	max_wr = SVC_RDMA_FORWARD_CREDITS + reserve;
 	if (dev->attrs.max_qp_wr > 0 &&
@@ -923,12 +918,9 @@ svc_rdma_accept(struct rdma_cm_id *id)
 	qp_attr.cap.max_inline_data = 0;
 
 	/*
-	 * max_send_sge inflates the per-WQE size and mlx5 rounds the WQE buffer
-	 * to a power of two, so the SQ ceiling is not statically predictable.
-	 * Ask for the ideal size and halve on ENOMEM, down to a floor holding
-	 * one full chain; a smaller SQ only means the post can fill under load,
-	 * which every post path handles by closing.  The provider may write
-	 * granted caps back into qp_attr.cap, so sc_max_send_sge keeps ours.
+	 * mlx5 rounds WQE storage to a power of two, so the requested SQ may
+	 * not fit. Keep max_send_sge because the provider may overwrite
+	 * qp_attr.cap.
 	 */
 	{
 		u32 min_send_wr = max_wr +
@@ -954,12 +946,28 @@ svc_rdma_accept(struct rdma_cm_id *id)
 			goto fail;
 		}
 	}
+	/*
+	 * Reserve one maximum Read chain and one inline SEND per receive,
+	 * plus a drain entry. The CQ must fit all WRs flushed on error.
+	 */
+	max_send_wr = min_t(u32, qp_attr.cap.max_send_wr,
+	    conn->sc_scq->cqe - 1);
+	if (max_send_wr <= SVC_RDMA_MAX_WRITE_WRS + 2)
+		goto fail;
+	max_wr = min_t(u32, max_wr,
+	    (max_send_wr - (SVC_RDMA_MAX_WRITE_WRS + 2)) /
+	    (SVC_RDMA_MAX_READ_SEGS + 1));
 	/* Honour the provider's returned receive cap as well as our request. */
 	max_wr = min_t(u32, max_wr, qp_attr.cap.max_recv_wr);
 	if (max_wr <= reserve) {
 		printf("nfsrdma: receive queue cannot fit reserved buffers\n");
 		goto fail;
 	}
+	/* Forward credits do not bound replies awaiting local completion. */
+	conn->sc_write_limit = (max_send_wr - 1 -
+	    max_wr * (SVC_RDMA_MAX_READ_SEGS + 1)) /
+	    (SVC_RDMA_MAX_WRITE_WRS + 1);
+	KASSERT(conn->sc_write_limit > 0, ("nfsrdma: no reply SQ space"));
 	conn->sc_max_send_sge = max_send_sge;
 	if (bootverbose && ppsratecheck(&svc_rdma_log_last, &svc_rdma_log_pps, 1))
 		printf("nfsrdma: QP up: send-queue %u WRs, send-sge %u\n",

@@ -669,6 +669,24 @@ svc_rdma_send_locked(struct svc_rdma_xprt *xr,
 	}
 }
 
+static int
+svc_rdma_write_reserve_locked(struct svc_rdma_xprt *xr,
+    const struct svc_rdma_verbs_ops *vops, struct svc_rdma_write_state *ws)
+{
+	int error;
+
+	mtx_assert(&xr->xr_lock, MA_OWNED);
+	for (;;) {
+		if (xr->xr_conn == NULL || vops == NULL ||
+		    vops->svo_conn_write_reserve == NULL)
+			return (ENOTCONN);
+		error = vops->svo_conn_write_reserve(xr->xr_conn, ws);
+		if (error != EBUSY)
+			return (error);
+		(void)msleep(xr, &xr->xr_lock, 0, "svcrwrite", 1);
+	}
+}
+
 static bool_t
 svc_rdma_do_reply(SVCXPRT *xprt, struct rpc_msg *msg,
     struct sockaddr *addr, struct mbuf *m, uint32_t *seq,
@@ -873,9 +891,10 @@ svc_rdma_do_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 					src = NULL;
 
 				mtx_lock(&xr->xr_lock);
+				rc = svc_rdma_write_reserve_locked(xr, vops,
+				    ws);
 				conn = xr->xr_conn;
-				if (conn == NULL) {
-					rc = ENOTCONN;
+				if (rc != 0) {
 					if (npg == 0) {
 						if (src_pooled)
 							vops->svo_sink_put(src);
@@ -957,8 +976,9 @@ svc_rdma_do_reply(SVCXPRT *xprt, struct rpc_msg *msg,
 			}
 
 			mtx_lock(&xr->xr_lock);
+			rc = svc_rdma_write_reserve_locked(xr, vops, ws);
 			conn = xr->xr_conn;
-			if (conn != NULL) {
+			if (rc == 0) {
 				rc = vops->svo_conn_reply_chunk(conn,
 				    msg->rm_xid, &pend.rp_reply, ws, rlen);
 				ws = NULL;

@@ -200,6 +200,13 @@ int	svc_rdma_write_alloc(uint32_t nsegs, uint32_t reducedlen,
 void	svc_rdma_write_free(struct svc_rdma_write_state *ws);
 
 /*
+ * Hold the connection lock from reservation through posting. On EBUSY,
+ * drop the lock before sleeping and fetch the connection again on retry.
+ */
+int	svc_rdma_conn_write_reserve(struct svc_rdma_conn *conn,
+	    struct svc_rdma_write_state *ws);
+
+/*
  * Write an over-inline reply into the client's reply chunk, then SEND an
  * RDMA_NOMSG header with the length written (RFC 8166 4.3).  The ONC
  * RPC body is copied by svc_rdma_write_alloc() before this call.
@@ -300,6 +307,8 @@ struct svc_rdma_verbs_ops {
 		    const void *reply, uint32_t replylen,
 		    struct svc_rdma_write_state **wsp);
 	void	(*svo_write_free)(struct svc_rdma_write_state *ws);
+	int	(*svo_conn_write_reserve)(struct svc_rdma_conn *conn,
+		    struct svc_rdma_write_state *ws);
 };
 
 /*

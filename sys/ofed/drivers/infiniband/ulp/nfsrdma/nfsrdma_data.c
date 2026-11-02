@@ -977,6 +977,29 @@ svc_rdma_wc_rdma_read(struct ib_cq *cq, struct ib_wc *wc)
  * failed post never reclaims inline.
  */
 
+/* The reservation lasts until write-state cleanup completes. */
+int
+svc_rdma_conn_write_reserve(struct svc_rdma_conn *conn,
+    struct svc_rdma_write_state *ws)
+{
+	int error;
+
+	MPASS(!ws->ws_sq_reserved);
+	error = 0;
+	mtx_lock(&conn->sc_lock);
+	if (conn->sc_state != SC_UP)
+		error = ENOTCONN;
+	else if (conn->sc_write_used >= conn->sc_write_limit)
+		error = EBUSY;
+	else {
+		conn->sc_write_used++;
+		ws->ws_conn = conn;
+		ws->ws_sq_reserved = true;
+	}
+	mtx_unlock(&conn->sc_lock);
+	return (error);
+}
+
 /*
  * Release one outbound write state, using the mapped flags and buffer
  * pointers to unwind partial preparation.  The caller has already detached
@@ -1047,6 +1070,14 @@ svc_rdma_write_free(struct svc_rdma_write_state *ws)
 		ws->ws_keepm = NULL;
 	}
 	ws->ws_active = false;
+	if (ws->ws_sq_reserved) {
+		mtx_lock(&conn->sc_lock);
+		KASSERT(conn->sc_write_used > 0,
+		    ("nfsrdma: reply SQ reservation underflow"));
+		conn->sc_write_used--;
+		mtx_unlock(&conn->sc_lock);
+		ws->ws_sq_reserved = false;
+	}
 	free(ws, M_NFSRDMA);
 }
 
@@ -1079,6 +1110,7 @@ svc_rdma_write_alloc(uint32_t nsegs, uint32_t reducedlen, const void *reply,
 
 	ws = malloc(sizeof(*ws), M_NFSRDMA, M_WAITOK);
 	ws->ws_conn = NULL;
+	ws->ws_sq_reserved = false;
 	ws->ws_src = NULL;
 	ws->ws_src_mapped = false;
 	ws->ws_src_pooled = false;
@@ -1165,7 +1197,7 @@ svc_rdma_conn_reply_chunk(struct svc_rdma_conn *conn, uint32_t xid,
 	}
 
 	MPASS(ws->ws_src != NULL && ws->ws_srclen == len);
-	ws->ws_conn = conn;
+	MPASS(ws->ws_sq_reserved && ws->ws_conn == conn);
 	ws->ws_src_dma = ib_dma_map_single(dev, ws->ws_src, len, DMA_TO_DEVICE);
 	if (ib_dma_mapping_error(dev, ws->ws_src_dma)) {
 		svc_rdma_write_free(ws);
@@ -1506,7 +1538,7 @@ svc_rdma_conn_write_list(struct svc_rdma_conn *conn, uint32_t xid,
 	sendlen = hdrlen + reducedlen;
 
 	MPASS(ws->ws_src == NULL && ws->ws_hdrlen == sendlen);
-	ws->ws_conn = conn;
+	MPASS(ws->ws_sq_reserved && ws->ws_conn == conn);
 	ws->ws_src_pooled = src_pooled;
 
 	/*
@@ -1741,7 +1773,7 @@ svc_rdma_conn_write_list_pages(struct svc_rdma_conn *conn, uint32_t xid,
 	sendlen = hdrlen + reducedlen;
 
 	MPASS(ws->ws_src == NULL && ws->ws_hdrlen == sendlen);
-	ws->ws_conn = conn;
+	MPASS(ws->ws_sq_reserved && ws->ws_conn == conn);
 	ws->ws_srclen = datalen;
 	/*
 	 * The state owns mrep from here, so every later error path frees it

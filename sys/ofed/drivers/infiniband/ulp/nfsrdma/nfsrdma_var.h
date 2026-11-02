@@ -276,6 +276,7 @@ struct svc_rdma_write_state {
 	uint32_t		 ws_hdrlen;
 	u64			 ws_hdr_dma;
 	bool			 ws_hdr_mapped;
+	bool			 ws_sq_reserved;
 	bool			 ws_active;	/* completion one-shot guard (sc_lock) */
 	int			 ws_nwr;
 	/*
@@ -361,6 +362,8 @@ struct svc_rdma_conn {
 	struct ib_cq		*sc_scq;	/* send CQ */
 	struct ib_cq		*sc_rcq;	/* recv CQ */
 	struct svc_rdma_recv	*sc_recv;	/* sc_nrecv-element array */
+	u_int			 sc_write_limit; /* fixed at accept */
+	u_int			 sc_write_used; /* sc_lock */
 	int			 sc_nrecv;
 	u_int			 sc_bck_credits; /* fixed at accept */
 	struct svc_rdma_send	*sc_send;	/* sc_nsend-element reply-send pool */
