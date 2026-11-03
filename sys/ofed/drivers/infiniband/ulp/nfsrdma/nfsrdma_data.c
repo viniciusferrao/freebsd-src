@@ -892,7 +892,7 @@ svc_rdma_wc_rdma_read(struct ib_cq *cq, struct ib_wc *wc)
 		}
 		if (pos != 0)
 			m_copyback(mhead, 0, pos, rs->rs_head);
-		mhead->m_next = mext;
+		m_last(mhead)->m_next = mext;
 
 		/* head[pos,headlen): the post-splice tail, if any. */
 		if (rs->rs_headlen > pos) {
