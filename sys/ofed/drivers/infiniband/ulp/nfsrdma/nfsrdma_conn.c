@@ -75,7 +75,8 @@ int svc_rdma_listen_port;
 
 static int	svc_rdma_cm_event_handler(struct rdma_cm_id *id,
 	    struct rdma_cm_event *event);
-static int	svc_rdma_accept(struct rdma_cm_id *id);
+static int	svc_rdma_accept(struct rdma_cm_id *id,
+		    const struct rdma_conn_param *peer);
 static void	svc_rdma_conn_free_verbs(struct svc_rdma_conn *conn);
 static void	svc_rdma_conn_destroy(void *arg, int pending);
 static void	svc_rdma_wc_send(struct ib_cq *cq, struct ib_wc *wc);
@@ -248,7 +249,7 @@ svc_rdma_cm_event_handler(struct rdma_cm_id *id, struct rdma_cm_event *event)
 			free(buf, M_TEMP);
 		}
 
-		return (svc_rdma_accept(id));
+		return (svc_rdma_accept(id, &event->param.conn));
 
 	case RDMA_CM_EVENT_DEVICE_REMOVAL:
 		/*
@@ -789,7 +790,7 @@ svc_rdma_conn_destroy(void *arg, int pending __unused)
  * Always returns 0, so the CM core never destroys the id from under us.
  */
 static int
-svc_rdma_accept(struct rdma_cm_id *id)
+svc_rdma_accept(struct rdma_cm_id *id, const struct rdma_conn_param *peer)
 {
 	struct ib_qp_init_attr qp_attr;
 	struct rdma_conn_param conn_param;
@@ -1084,21 +1085,13 @@ svc_rdma_accept(struct rdma_cm_id *id)
 		}
 	}
 
-	/*
-	 * responder_resources comes from the device's read depth capped to the
-	 * u8 field, with a matching initiator depth: the server issues RDMA
-	 * Reads to pull WRITE data, so the client must allow them through
-	 * max_dest_rd_atomic.
-	 *
-	 * RNR retry 7 means retry forever.  The RQ momentarily drains under a
-	 * burst and the client's SEND takes an RNR NAK; with retry 0 the QP
-	 * would error on the first one and kill the connection.
-	 */
+	/* CM event depths are in the acceptor's direction. */
 	memset(&conn_param, 0, sizeof(conn_param));
 	conn_param.responder_resources =
-	    min_t(u32, U8_MAX, (u32)dev->attrs.max_qp_rd_atom);
+	    min_t(u32, peer->responder_resources, dev->attrs.max_qp_rd_atom);
 	conn_param.initiator_depth =
-	    min_t(u32, U8_MAX, (u32)dev->attrs.max_qp_init_rd_atom);
+	    min_t(u32, peer->initiator_depth,
+	    dev->attrs.max_qp_init_rd_atom);
 	conn_param.flow_control = 0;
 	conn_param.rnr_retry_count = 7;
 	conn_param.private_data = NULL;
