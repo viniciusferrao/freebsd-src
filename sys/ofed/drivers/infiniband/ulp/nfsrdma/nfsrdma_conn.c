@@ -342,11 +342,11 @@ svc_rdma_conn_send(struct svc_rdma_conn *conn, const void *buf, uint32_t len)
 	conn->sc_sends++;
 	mtx_unlock(&conn->sc_lock);
 
-	/*
-	 * Copy into the send buffer mapped at accept time; the post doorbell
-	 * orders the write before the device reads it.
-	 */
+	ib_dma_sync_single_for_cpu(conn->sc_id->device, ss->ss_dma,
+	    SVC_RDMA_INLINE, DMA_TO_DEVICE);
 	memcpy(ss->ss_buf, buf, len);
+	ib_dma_sync_single_for_device(conn->sc_id->device, ss->ss_dma,
+	    SVC_RDMA_INLINE, DMA_TO_DEVICE);
 
 	ss->ss_sge.addr = ss->ss_dma;
 	ss->ss_sge.length = len;
