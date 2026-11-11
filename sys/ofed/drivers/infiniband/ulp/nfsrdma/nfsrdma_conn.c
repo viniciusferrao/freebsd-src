@@ -842,9 +842,9 @@ svc_rdma_accept(struct rdma_cm_id *id)
 	 * max_qp_wr and max_sge are signed; mlx5 rejects a zero-entry QP or CQ.
 	 */
 	max_wr = SVC_RDMA_FORWARD_CREDITS + reserve;
-	if (dev->attrs.max_qp_wr > 0 &&
-	    (u32)dev->attrs.max_qp_wr < max_wr)
-		max_wr = dev->attrs.max_qp_wr;
+	if (dev->attrs.max_qp_wr <= 1)
+		goto fail;
+	max_wr = min_t(u32, max_wr, dev->attrs.max_qp_wr - 1);
 	max_send_wr = max_wr +
 	    max_wr * SVC_RDMA_MAX_READ_SEGS +
 	    max_wr * (SVC_RDMA_MAX_WRITE_WRS + 1);
@@ -910,7 +910,7 @@ svc_rdma_accept(struct rdma_cm_id *id)
 	qp_attr.sq_sig_type = IB_SIGNAL_REQ_WR;
 	qp_attr.qp_type = IB_QPT_RC;
 	qp_attr.cap.max_send_wr = max_send_wr;
-	qp_attr.cap.max_recv_wr = max_wr;
+	qp_attr.cap.max_recv_wr = max_wr + 1;
 	qp_attr.cap.max_send_sge = max_send_sge;
 	qp_attr.cap.max_recv_sge = max_sge;
 	qp_attr.cap.max_inline_data = 0;
@@ -955,8 +955,10 @@ svc_rdma_accept(struct rdma_cm_id *id)
 	max_wr = min_t(u32, max_wr,
 	    (max_send_wr - (SVC_RDMA_MAX_WRITE_WRS + 2)) /
 	    (SVC_RDMA_MAX_READ_SEGS + 1));
-	/* Honour the provider's returned receive cap as well as our request. */
-	max_wr = min_t(u32, max_wr, qp_attr.cap.max_recv_wr);
+	/* Keep one receive WR for ib_drain_qp(). */
+	if (qp_attr.cap.max_recv_wr <= 1)
+		goto fail;
+	max_wr = min_t(u32, max_wr, qp_attr.cap.max_recv_wr - 1);
 	if (max_wr <= reserve) {
 		printf("nfsrdma: receive queue cannot fit reserved buffers\n");
 		goto fail;
