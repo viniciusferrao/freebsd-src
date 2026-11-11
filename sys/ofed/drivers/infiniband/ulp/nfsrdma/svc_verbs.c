@@ -126,4 +126,6 @@ MODULE_VERSION(nfsrdma, 1);
 MODULE_DEPEND(nfsrdma, ibcore, 1, 1, 1);
 MODULE_DEPEND(nfsrdma, krpc, 1, 1, 1);
 MODULE_DEPEND(nfsrdma, nfsd, 1, 1, 1);
+MODULE_DEPEND(nfsrdma, nfscommon, 1, 1, 1);
+MODULE_DEPEND(nfsrdma, xdr, 1, 1, 1);
 MODULE_DEPEND(nfsrdma, linuxkpi, 1, 1, 1);
