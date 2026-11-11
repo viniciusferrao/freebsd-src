@@ -582,15 +582,13 @@ svc_rdma_wc_send(struct ib_cq *cq, struct ib_wc *wc)
 void
 svc_rdma_conn_close(struct svc_rdma_conn *conn)
 {
-	bool start;
 
 	mtx_lock(&conn->sc_lock);
-	start = (conn->sc_state != SC_CLOSING);
-	conn->sc_state = SC_CLOSING;
-	mtx_unlock(&conn->sc_lock);
-
-	if (start)
+	if (conn->sc_state != SC_CLOSING) {
+		conn->sc_state = SC_CLOSING;
 		taskqueue_enqueue(taskqueue_thread, &conn->sc_teardown);
+	}
+	mtx_unlock(&conn->sc_lock);
 }
 
 /*
